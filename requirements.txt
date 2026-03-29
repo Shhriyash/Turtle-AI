@@ -1,0 +1,33 @@
+﻿# Core
+pydantic-ai==1.67.0
+openai==2.26.0
+python-dotenv==1.2.2
+httpx==0.28.1
+
+# Google / Vertex AI
+google-genai==1.66.0
+google-auth==2.49.0
+
+# RAG / Embeddings
+cohere==5.20.7
+numpy==2.4.2
+faiss-cpu==1.13.2
+langchain-text-splitters==1.1.1
+
+# Web parsing
+beautifulsoup4==4.14.3
+lxml==6.0.2
+
+# Voice stack
+groq==1.0.0
+deepgram-sdk==6.0.1
+pyaudio==0.2.14
+pydub==0.25.1
+sounddevice==0.5.5
+scipy==1.17.1
+fastrtc==0.0.34
+keyboard==0.13.5
+
+# Observability
+logfire==4.27.0
+

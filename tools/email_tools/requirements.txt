@@ -1,0 +1,18 @@
+﻿# Email Tools Package Dependencies
+# Install with: python -m pip install -r requirements.txt
+
+# Environment variable management
+python-dotenv==1.2.2
+
+# For Pydantic AI integration
+pydantic-ai==1.67.0
+
+# Email functionality uses built-in Python libraries:
+# - smtplib (built-in)
+# - email.message (built-in)
+# - logging (built-in)
+# - re (built-in)
+# - os (built-in)
+
+# Note: No additional external dependencies required
+# All email functionality uses Python standard library

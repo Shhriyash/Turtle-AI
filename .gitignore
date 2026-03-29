@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Env / virtualenv
+.env
+.env.*
+*.env
+*.env.*
+venv/
+.venv/
+env/
+ENV/
+.venv.bak/
+venv.bak/
+**/venv/
+**/.venv/
+**/env/
+**/ENV/
+
+# Keep only root README in git
+**/README*
+**/readme*
+!README.md
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Runtime / data
+.temp/
+.gradio/
+temp_audio/
+temp_streaming/
+output/
+data/
+rag_data/
+vector_storage/
+*.log
+tempCodeRunnerFile.py
+
+# Secrets / keys
+aerobic-datum-478513-u9-3daa581fd336.json
