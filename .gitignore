@@ -26,9 +26,8 @@ venv.bak/
 **/env/
 **/ENV/
 
-# Keep only root README in git
-**/README*
-**/readme*
+# Markdown (keep only root README.md)
+**/*.md
 !README.md
 
 # IDE / OS
