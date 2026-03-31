@@ -1,4 +1,4 @@
-"""
+﻿"""
 FAISS Vector Storage for RAG System
 
 This module handles vector storage and retrieval using FAISS (Facebook AI Similarity Search).
@@ -111,31 +111,15 @@ class VectorStorage:
         if embeddings.shape[1] != self.embedding_dimension:
             raise ValueError(f"Embedding dimension ({embeddings.shape[1]}) must match expected ({self.embedding_dimension})")
         
-        existing_chunk_ids = {
-            metadata.get("chunk_id")
-            for metadata in self.chunk_metadata
-            if metadata.get("chunk_id") and not metadata.get("deleted", False)
-        }
-        filtered_pairs = [
-            (chunk, embeddings[i])
-            for i, chunk in enumerate(chunks)
-            if chunk.get("chunk_id") not in existing_chunk_ids
-        ]
-        if not filtered_pairs:
-            return
-
-        filtered_chunks = [chunk for chunk, _ in filtered_pairs]
-        filtered_embeddings = np.stack([embedding for _, embedding in filtered_pairs]).astype(np.float32)
-
         # Normalize embeddings for cosine similarity
-        normalized_embeddings = self._normalize_embeddings(filtered_embeddings)
+        normalized_embeddings = self._normalize_embeddings(embeddings)
         
         # Add to FAISS index
         self.faiss_index.add(normalized_embeddings)
         
         # Add metadata with vector indices
         start_idx = len(self.chunk_metadata)
-        for i, chunk in enumerate(filtered_chunks):
+        for i, chunk in enumerate(chunks):
             metadata = {
                 "vector_index": start_idx + i,
                 "chunk_id": chunk.get("chunk_id", f"chunk_{start_idx + i}"),
@@ -145,12 +129,7 @@ class VectorStorage:
                 "chunk_index": chunk.get("chunk_index", i),
                 "char_count": chunk.get("char_count", len(chunk.get("content", ""))),
                 "estimated_tokens": chunk.get("estimated_tokens", 0),
-                "added_timestamp": datetime.now().isoformat(),
-                "kind": chunk.get("kind", "turn_chunk"),
-                "timestamp_start": chunk.get("timestamp_start"),
-                "timestamp_end": chunk.get("timestamp_end"),
-                "turn_range": chunk.get("turn_range"),
-                "tags": chunk.get("tags", []),
+                "added_timestamp": datetime.now().isoformat()
             }
             self.chunk_metadata.append(metadata)
         

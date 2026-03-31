@@ -1,4 +1,4 @@
-import unittest
+﻿import unittest
 
 from core.web_search import SearchResult, format_search_results
 

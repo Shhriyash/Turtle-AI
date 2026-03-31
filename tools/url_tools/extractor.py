@@ -1,4 +1,4 @@
-"""
+﻿"""
 Core URL content extraction functionality.
 
 This module provides the main URL content fetching and analysis capabilities
@@ -114,7 +114,7 @@ async def fetch_url_content_async(
                 title="Dynamic Content Page", 
                 description="This page appears to use JavaScript for content loading", 
                 keywords=None, headings=[], 
-                content="Warning: This webpage appears to load content dynamically using JavaScript. "
+                content="Ã¢Å¡Â Ã¯Â¸Â This webpage appears to load content dynamically using JavaScript. "
                        "The page requires browser rendering to display its full content. "
                        "This could be a single-page application (SPA) or require user authentication.", 
                 links=[], url=url, success=True
@@ -177,7 +177,7 @@ async def fetch_url_content_async(
                 # Convert relative URLs to absolute
                 if link_url.startswith('/'):
                     link_url = f"{parsed.scheme}://{parsed.netloc}{link_url}"
-                links.append(f"- {link_text}: {link_url}")
+                links.append(f"Ã¢â‚¬Â¢ {link_text}: {link_url}")
         
         # Combine and clean all text
         all_text_parts = text_elements
@@ -195,12 +195,12 @@ async def fetch_url_content_async(
         if not cleaned_text or len(cleaned_text) < 50:
             # Very little content found - might be a dynamic site or access issue
             fallback_content = (
-                f"Warning: Limited content extracted from this page. "
+                f"Ã¢Å¡Â Ã¯Â¸Â Limited content extracted from this page. "
                 f"This could indicate:\n"
-                f"- The page requires JavaScript to load content\n"
-                f"- Authentication or cookies are required\n"
-                f"- The page is a redirect or landing page\n"
-                f"- Content is loaded via AJAX/API calls\n\n"
+                f"Ã¢â‚¬Â¢ The page requires JavaScript to load content\n"
+                f"Ã¢â‚¬Â¢ Authentication or cookies are required\n"
+                f"Ã¢â‚¬Â¢ The page is a redirect or landing page\n"
+                f"Ã¢â‚¬Â¢ Content is loaded via AJAX/API calls\n\n"
                 f"Raw HTML size: {len(response.content)} bytes\n"
                 f"Status: {response.status_code}\n"
                 f"Content-Type: {content_type}"

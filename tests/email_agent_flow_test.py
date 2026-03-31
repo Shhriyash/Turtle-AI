@@ -1,4 +1,4 @@
-import unittest
+﻿import unittest
 import uuid
 import shutil
 from pathlib import Path
@@ -13,7 +13,6 @@ from core.email_flow import (
     merge_email_details,
     missing_email_fields,
     normalize_spoken_email_text,
-    parse_email_extraction_response,
     send_email_now,
     validate_recipients,
     validate_send_email_args,
@@ -80,24 +79,6 @@ class EmailFlowTests(unittest.TestCase):
         self.assertEqual(merged["subject"], "hello")
         self.assertEqual(merged["content"], "how are you doing?")
         self.assertTrue(merged["send_intent"])
-
-    def test_plain_json_extraction_response_parses_cleanly(self) -> None:
-        parsed = parse_email_extraction_response(
-            '{"recipients":["user@example.com"],"subject":"hello","content":"world","send_intent":true}'
-        )
-        self.assertEqual(parsed.recipients, ["user@example.com"])
-        self.assertEqual(parsed.subject, "hello")
-        self.assertEqual(parsed.content, "world")
-        self.assertTrue(parsed.send_intent)
-
-    def test_fenced_json_extraction_response_parses_cleanly(self) -> None:
-        parsed = parse_email_extraction_response(
-            '```json\n{"recipients":["user@example.com"],"subject":"hello","content":"world","send_intent":false}\n```'
-        )
-        self.assertEqual(parsed.recipients, ["user@example.com"])
-        self.assertEqual(parsed.subject, "hello")
-        self.assertEqual(parsed.content, "world")
-        self.assertFalse(parsed.send_intent)
 
     def test_missing_field_prompt_only_requests_gaps(self) -> None:
         details = {

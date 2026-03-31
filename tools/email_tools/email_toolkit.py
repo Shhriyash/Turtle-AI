@@ -1,4 +1,4 @@
-"""
+﻿"""
 Email toolkit implementation for Pydantic AI.
 
 Based on the user's example EmailTool class with enhancements for better error handling,

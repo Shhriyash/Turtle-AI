@@ -1,7 +1,20 @@
-"""
+﻿"""
 FastRTC Voice Assistant with Real-time VAD
-Uses FastRTC's built-in Silero VAD for automatic speech detection
-"""
+Uses FastRTC's built-in Silero VAD for automatic speech detectio    def stream_text_to_speech(self, text):
+        \"\"\"Stream text to speech using sentence-level chunking for natural speech\"\"\"
+        try:
+            print(f\"Streaming TTS: {text[:50]}...\")
+            
+            # Split text into sentences for natural speech boundaries
+            sentences = self.chunk_by_sentence(text)
+            print(f\"Processing {len(sentences)} sentence(s)\")
+            
+            # Process each sentence with its own WebSocket connection
+            for i, sentence in enumerate(sentences):
+                print(f\"\\nÃ°Å¸Å½Âµ Speaking sentence {i+1}: {sentence[:40]}...\")
+                
+                # Create WebSocket connection for this sentence
+                dg_connection = deepgram_client.speak.websocket.v(\"1\")
 
 import os
 import sys
@@ -11,6 +24,7 @@ from pathlib import Path
 import tempfile
 from typing import Generator, Tuple
 import numpy as np
+import re
 
 
 from fastrtc import Stream, ReplyOnPause, AlgoOptions
@@ -19,30 +33,31 @@ from fastrtc import Stream, ReplyOnPause, AlgoOptions
 from groq import Groq
 
 # Deepgram for TTS (disabled)
-# from deepgram import DeepgramClient, SpeakOptions
+# from deepgram import DeepgramClient, SpeakOptions, SpeakWebSocketEvents
+# import sounddevice as sd
 
 # LLM
 from pydantic_ai import Agent
-
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-
-# Environment
-from core.env import load_env
-
-load_env()
-
-# Initialize clients
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY") or os.getenv("GROQ_API_KEY2"))
-# deepgram_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
 from core.llm_client import (
     get_openrouter_models,
     get_groq_fallback_model,
     run_agent_with_fallbacks,
 )
+from core.paths import TEMP_AUDIO_DIR, ensure_dirs
 from core.openrouter_tts import synthesize_speech
+from core.env import load_env
+
+# Environment
+load_env()
+ensure_dirs()
+
+# Initialize clients
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY2"))
+# deepgram_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
 # Configure LLM
 model_settings = {
@@ -52,7 +67,7 @@ model_settings = {
 
 openrouter_models = get_openrouter_models(settings=model_settings)
 if not openrouter_models:
-    raise RuntimeError("No Groq API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 or OPENROUTER_API_KEY in .env.")
+    raise RuntimeError("No OpenRouter API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 in .env.")
 
 primary_model = openrouter_models[0]
 openrouter_fallback_models = openrouter_models[1:]
@@ -82,8 +97,36 @@ if groq_fallback_model:
 
 class FastRTCVoiceAssistant:
     def __init__(self):
-        self.temp_dir = Path("temp_audio")
-        self.temp_dir.mkdir(exist_ok=True)
+        self.temp_dir = TEMP_AUDIO_DIR
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    def chunk_by_sentence(self, text):
+        """Split text at sentence boundaries for optimized streaming TTS"""
+        # Split text at sentence boundaries (periods, question marks, exclamation points)
+        # while preserving the punctuation
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        # Remove any empty chunks and strip whitespace
+        chunks = [sentence.strip() for sentence in sentences if sentence.strip()]
+        
+        # If no sentence boundaries found, split by length (fallback)
+        if len(chunks) <= 1 and len(text) > 100:
+            # Split long text into ~80 character chunks at word boundaries
+            words = text.split()
+            chunks = []
+            current_chunk = ""
+            
+            for word in words:
+                if len(current_chunk + " " + word) > 80 and current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = word
+                else:
+                    current_chunk += (" " if current_chunk else "") + word
+            
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+        
+        return chunks
         
     def transcribe_audio(self, audio_path):
         """Convert audio to text using Groq Whisper"""
@@ -109,14 +152,32 @@ class FastRTCVoiceAssistant:
             print(f"LLM error: {e}")
             return "Sorry, I couldn't process that."
     
-    def text_to_speech(self, text, filename="output.wav"):
-        """Convert text to speech using Groq"""
+    def stream_text_to_speech(self, text):
+        """Generate and play TTS audio using OpenRouter"""
         try:
-            speech_path = self.temp_dir / filename
-            return synthesize_speech(text, speech_path)
+            print(f"Generating TTS: {text[:50]}...")
+            speech_path = self.temp_dir / "output.mp3"
+            synthesize_speech(text, speech_path)
+
+            from pydub import AudioSegment
+            from pydub.playback import play
+
+            audio = AudioSegment.from_mp3(str(speech_path))
+            play(audio)
+
+            if speech_path.exists():
+                speech_path.unlink()
+            return True
         except Exception as e:
             print(f"TTS error: {e}")
-            return None
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def text_to_speech(self, text, filename="output.mp3"):
+        """TTS method for minimal latency"""
+        success = self.stream_text_to_speech(text)
+        return "streamed" if success else None
     
     def create_fastrtc_stream(self):
         """Create FastRTC stream with automatic VAD"""
@@ -158,23 +219,15 @@ class FastRTCVoiceAssistant:
                 response = asyncio.run(self.get_llm_response(transcription))
                 print(f"Assistant: {response}")
                 
-                # Generate TTS
-                speech_file = self.text_to_speech(response)
+                # Generate TTS using streaming (audio plays automatically)
+                success = self.stream_text_to_speech(response)
                 
-                if speech_file and Path(speech_file).exists():
-                    # Load and yield audio back to FastRTC
-                    import scipy.io.wavfile as wavfile
-                    tts_sample_rate, tts_audio_data = wavfile.read(speech_file)
-                    
-                    # Convert stereo to mono if needed
-                    if len(tts_audio_data.shape) > 1:
-                        tts_audio_data = tts_audio_data[:, 0]
-                    
-                    print(f"Yielding TTS audio: {len(tts_audio_data)} samples")
-                    yield (tts_sample_rate, tts_audio_data.astype(np.int16))
-                    
-                    # Cleanup
-                    Path(speech_file).unlink(missing_ok=True)
+                if success:
+                    print("TTS streaming completed")
+                    # Note: For FastRTC integration, we could collect audio chunks
+                    # and yield them back, but for now streaming plays directly
+                else:
+                    print("TTS streaming failed")
                     
             except Exception as e:
                 print(f"FastRTC processing error: {e}")
@@ -264,27 +317,17 @@ class FastRTCVoiceAssistant:
                 print(f"Assistant: {response}")
                 
                 print("Generating speech...")
-                speech_file = self.text_to_speech(response)
+                success = self.stream_text_to_speech(response)
                 
-                if speech_file:
-                    # Play audio
-                    try:
-                        from pydub import AudioSegment
-                        from pydub.playback import play
-                        
-                        audio = AudioSegment.from_wav(str(speech_file))
-                        play(audio)
-                        print("Audio played")
-                    except Exception as e:
-                        print(f"Could not play audio: {e}")
+                if not success:
+                    print("TTS streaming failed")
             else:
                 print("No speech detected")
             
             # Cleanup
             if audio_path.exists():
                 audio_path.unlink()
-            if speech_file and Path(speech_file).exists():
-                Path(speech_file).unlink()
+            # No TTS file cleanup needed - streaming doesn't create files
         
         print("Goodbye!")
         self.cleanup()
@@ -293,59 +336,15 @@ class FastRTCVoiceAssistant:
         """Async wrapper for console mode"""
         await self.run_console_mode()
     
-    def run_web_interface(self):
-        """Launch FastRTC web interface"""
-        print("FastRTC Voice Assistant - Web Interface")
-        print("Uses automatic VAD - no manual recording needed")
-        
-        stream = self.create_fastrtc_stream()
-        
-        try:
-            print("Launching FastRTC web interface...")
-            print("Access the voice interface in your browser")
-            print("Just speak naturally - FastRTC detects pauses automatically")
-            print("Press Ctrl+C to stop")
-            
-            # Launch web UI
-            stream.ui.launch(
-                server_name="0.0.0.0",
-                server_port=7860,
-                share=False,
-                show_error=True,
-                inbrowser=True
-            )
-            
-        except KeyboardInterrupt:
-            print("FastRTC stopped")
-        except Exception as e:
-            print(f"FastRTC error: {e}")
-            import traceback
-            traceback.print_exc()
+
     
-    def run_phone_interface(self):
-        """Launch FastRTC phone interface"""
-        print("FastRTC Voice Assistant - Phone Interface")
-        
-        stream = self.create_fastrtc_stream()
-        
-        try:
-            print("Launching FastRTC phone interface...")
-            print("A temporary phone number will be provided")
-            print("Press Ctrl+C to stop")
-            
-            # Launch phone interface
-            stream.fastphone()
-            
-        except KeyboardInterrupt:
-            print("FastRTC phone stopped")
-        except Exception as e:
-            print(f"FastRTC phone error: {e}")
+
     
     def cleanup(self):
         """Clean up resources"""
         for file in self.temp_dir.glob("*.wav"):
             file.unlink()
-        for file in self.temp_dir.glob("*.wav"):
+        for file in self.temp_dir.glob("*.mp3"):
             file.unlink()
 
 def main():

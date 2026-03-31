@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 from pathlib import Path
 from pydantic_ai import Agent, WebSearchTool
 
@@ -12,7 +12,6 @@ from core.llm_client import (
     run_agent_sync_with_fallbacks,
 )
 from core.env import load_env
-from core.system_prompts import load_prompt
 
 load_env(override=True)
 
@@ -20,11 +19,10 @@ model_settings = {
     "temperature": 0.2,
     "max_tokens": 1024,
 }
-AGENT_PROMPT = load_prompt("websearch_cli_agent")
 
 openrouter_models = get_openrouter_models(settings=model_settings)
 if not openrouter_models:
-    raise RuntimeError("No OpenRouter API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 or OPENROUTER_API_KEY in .env.")
+    raise RuntimeError("No OpenRouter API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 in .env.")
 
 model = openrouter_models[0]
 openrouter_fallback_models = openrouter_models[1:]
@@ -32,7 +30,10 @@ groq_fallback_model = get_groq_fallback_model(settings=model_settings)
 agent = Agent(
     model,
     builtin_tools=[WebSearchTool()],
-    system_prompt=AGENT_PROMPT,
+    system_prompt="""You are a helpful assistant with web search capabilities.
+
+Use web search for current information, news, or recent events.
+Answer general knowledge questions directly without search.""",
 )
 agent_fallbacks: list[Agent] = []
 for fallback_model in openrouter_fallback_models:
@@ -40,7 +41,10 @@ for fallback_model in openrouter_fallback_models:
         Agent(
             fallback_model,
             builtin_tools=[WebSearchTool()],
-            system_prompt=AGENT_PROMPT,
+            system_prompt="""You are a helpful assistant with web search capabilities.
+
+Use web search for current information, news, or recent events.
+Answer general knowledge questions directly without search.""",
         )
     )
 if groq_fallback_model:
@@ -48,7 +52,10 @@ if groq_fallback_model:
         Agent(
             groq_fallback_model,
             builtin_tools=[WebSearchTool()],
-            system_prompt=AGENT_PROMPT,
+            system_prompt="""You are a helpful assistant with web search capabilities.
+
+Use web search for current information, news, or recent events.
+Answer general knowledge questions directly without search.""",
         )
     )
 

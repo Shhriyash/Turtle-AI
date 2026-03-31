@@ -1,4 +1,4 @@
-"""
+﻿"""
 Configuration management for email tools.
 
 Handles environment variable loading and configuration validation

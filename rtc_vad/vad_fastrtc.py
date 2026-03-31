@@ -1,7 +1,20 @@
-"""
-FastRTC Voice Assistant with Real-time VAD.
-Uses FastRTC's built-in Silero VAD for automatic speech detection.
-"""
+﻿"""
+FastRTC Voice Assistant with Real-time VAD
+Uses FastRTC's built-in Silero VAD for automatic speech detectio    def stream_text_to_speech(self, text):
+        \"\"\"Stream text to speech using sentence-level chunking for natural speech\"\"\"
+        try:
+            print(f\"Streaming TTS: {text[:50]}...\")
+            
+            # Split text into sentences for natural speech boundaries
+            sentences = self.chunk_by_sentence(text)
+            print(f\"Processing {len(sentences)} sentence(s)\")
+            
+            # Process each sentence with its own WebSocket connection
+            for i, sentence in enumerate(sentences):
+                print(f\"\\nÃ°Å¸Å½Âµ Speaking sentence {i+1}: {sentence[:40]}...\")
+                
+                # Create WebSocket connection for this sentence
+                dg_connection = deepgram_client.speak.websocket.v(\"1\")
 
 import os
 import sys
@@ -19,7 +32,7 @@ from fastrtc import Stream, ReplyOnPause, AlgoOptions
 # Groq for STT
 from groq import Groq
 
-# Deepgram for TTS (primary via core/openrouter_tts.py)
+# Deepgram for TTS (disabled)
 # from deepgram import DeepgramClient, SpeakOptions, SpeakWebSocketEvents
 # import sounddevice as sd
 
@@ -37,14 +50,13 @@ from core.llm_client import (
 from core.paths import TEMP_AUDIO_DIR, ensure_dirs
 from core.openrouter_tts import synthesize_speech
 from core.env import load_env
-from core.system_prompts import load_prompt
 
 # Environment
 load_env()
 ensure_dirs()
 
 # Initialize clients
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY") or os.getenv("GROQ_API_KEY2"))
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY2"))
 # deepgram_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
 # Configure LLM
@@ -52,11 +64,10 @@ model_settings = {
     "temperature": 0.2,
     "max_tokens": 1024,
 }
-AGENT_PROMPT = load_prompt("vad_fastrtc_agent")
 
 openrouter_models = get_openrouter_models(settings=model_settings)
 if not openrouter_models:
-    raise RuntimeError("No OpenRouter API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 or OPENROUTER_API_KEY in .env.")
+    raise RuntimeError("No OpenRouter API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 in .env.")
 
 primary_model = openrouter_models[0]
 openrouter_fallback_models = openrouter_models[1:]
@@ -64,7 +75,7 @@ groq_fallback_model = get_groq_fallback_model(settings=model_settings)
 agent = Agent(
     primary_model,
     model_settings=model_settings,
-    system_prompt=AGENT_PROMPT
+    system_prompt="You are a helpful voice assistant. Keep responses concise and clear."
 )
 agent_fallbacks: list[Agent] = []
 for fallback_model in openrouter_fallback_models:
@@ -72,7 +83,7 @@ for fallback_model in openrouter_fallback_models:
         Agent(
             fallback_model,
             model_settings=model_settings,
-            system_prompt=AGENT_PROMPT,
+            system_prompt="You are a helpful voice assistant. Keep responses concise and clear.",
         )
     )
 if groq_fallback_model:
@@ -80,20 +91,9 @@ if groq_fallback_model:
         Agent(
             groq_fallback_model,
             model_settings=model_settings,
-            system_prompt=AGENT_PROMPT,
+            system_prompt="You are a helpful voice assistant. Keep responses concise and clear.",
         )
     )
-
-def run_coro_sync(coro):
-    """Run a coroutine from sync context, even if an event loop is already running."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(asyncio.run, coro)
-        return future.result()
 
 class FastRTCVoiceAssistant:
     def __init__(self):
@@ -153,38 +153,17 @@ class FastRTCVoiceAssistant:
             return "Sorry, I couldn't process that."
     
     def stream_text_to_speech(self, text):
-        """Generate and play TTS audio using Groq TTS"""
+        """Generate and play TTS audio using OpenRouter"""
         try:
             print(f"Generating TTS: {text[:50]}...")
-            speech_path = synthesize_speech(text, self.temp_dir / "output.wav")
+            speech_path = self.temp_dir / "output.mp3"
+            synthesize_speech(text, speech_path)
 
-            try:
-                from pydub import AudioSegment
-                from pydub.playback import play
+            from pydub import AudioSegment
+            from pydub.playback import play
 
-                audio = AudioSegment.from_file(str(speech_path))
-                # Add short silence padding to avoid clipped start/end
-                pad = AudioSegment.silent(duration=120)
-                audio = pad + audio + pad
-                audio = audio.fade_in(20).fade_out(40)
-                play(audio)
-            except Exception:
-                if speech_path.suffix.lower() == ".wav":
-                    import sounddevice as sd
-                    import scipy.io.wavfile as wavfile
-
-                    rate, data = wavfile.read(str(speech_path))
-                    pad_len = int(rate * 0.12)
-                    if data.ndim == 1:
-                        pad = np.zeros(pad_len, dtype=data.dtype)
-                        data = np.concatenate([pad, data, pad])
-                    else:
-                        pad = np.zeros((pad_len, data.shape[1]), dtype=data.dtype)
-                        data = np.concatenate([pad, data, pad])
-                    sd.play(data, rate)
-                    sd.wait()
-                else:
-                    raise
+            audio = AudioSegment.from_mp3(str(speech_path))
+            play(audio)
 
             if speech_path.exists():
                 speech_path.unlink()
@@ -195,7 +174,7 @@ class FastRTCVoiceAssistant:
             traceback.print_exc()
             return False
     
-    def text_to_speech(self, text, filename="output.wav"):
+    def text_to_speech(self, text, filename="output.mp3"):
         """TTS method for minimal latency"""
         success = self.stream_text_to_speech(text)
         return "streamed" if success else None
@@ -236,7 +215,8 @@ class FastRTCVoiceAssistant:
                 print(f"User: {transcription}")
                 
                 # Get LLM response
-                response = run_coro_sync(self.get_llm_response(transcription))
+                import asyncio
+                response = asyncio.run(self.get_llm_response(transcription))
                 print(f"Assistant: {response}")
                 
                 # Generate TTS using streaming (audio plays automatically)

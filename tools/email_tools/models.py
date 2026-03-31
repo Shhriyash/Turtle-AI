@@ -1,4 +1,4 @@
-"""
+﻿"""
 Data models for email tools package.
 """
 

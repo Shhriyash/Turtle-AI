@@ -4,17 +4,15 @@
 
 This document provides a comprehensive comparison of three different Voice Activity Detection implementations for voice assistants. Each implementation uses the same core AI stack but employs different strategies for audio recording, speech detection, and processing optimization.
 
-Note: TTS now uses Deepgram Aura `aura-2-orion-en` with Groq Orpheus fallback.
-
 ## Core AI Stack (Common to All Implementations)
 
 - **STT (Speech-to-Text)**: Groq Whisper (whisper-large-v3-turbo) - 0.3-0.6s response time
-- **LLM (Large Language Model)**: OpenRouter nemotron-3-nano-30b-a3b:free - 1.1-2.9s response time  
-- **TTS (Text-to-Speech)**: Deepgram Aura (aura-2-orion-en) with Groq fallback - Variable response time based on implementation approach
+- **LLM (Large Language Model)**: Google Gemini 2.5-flash with thinking configuration - 1.1-2.9s response time  
+- **TTS (Text-to-Speech)**: Deepgram (aura-2-draco-en) - Variable response time based on implementation approach
 
 ## Implementation Analysis
 
-### 1. rtc_vad/vad_simple.py - Energy-Based VAD Implementation
+### 1. VAD_simple.py - Energy-Based VAD Implementation
 
 #### FastRTC Usage: NO
 **Uses**: Custom energy-based Voice Activity Detection with RMS (Root Mean Square) calculation
@@ -22,7 +20,7 @@ Note: TTS now uses Deepgram Aura `aura-2-orion-en` with Groq Orpheus fallback.
 #### Key Technologies and Libraries:
 - **Audio Recording**: PyAudio for direct microphone access
 - **VAD Method**: Custom energy-based detection using numpy RMS calculations
-- **TTS Approach**: Simple WAV file generation and playback
+- **TTS Approach**: Simple MP3 file generation and playback
 - **Audio Playback**: pydub AudioSegment with immediate cleanup
 - **Async Handling**: Standard asyncio for LLM calls
 
@@ -46,9 +44,9 @@ if rms_energy > speech_energy_threshold:
     audio_started = True
 ```
 
-**3. Direct WAV TTS Pipeline**
+**3. Direct MP3 TTS Pipeline**
 - Bypasses complex audio format conversions
-- Uses Deepgram's native WAV encoding
+- Uses Deepgram's native MP3 encoding
 - Immediate file cleanup after playback
 
 **4. Minimal Processing Overhead**
@@ -77,7 +75,7 @@ if rms_energy > speech_energy_threshold:
 
 ---
 
-### 2. rtc_vad/vad_fastrtc.py - WebSocket Streaming Implementation
+### 2. VAD_fastrtc.py - WebSocket Streaming Implementation
 
 #### FastRTC Usage: PARTIAL
 **Uses**: FastRTC Stream structure but with manual recording triggers and WebSocket streaming TTS
@@ -116,7 +114,7 @@ for _ in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
 
 **4. Direct Linear16 Processing**
 - Uses linear16 encoding for lower latency
-- Eliminates WAV encoding/decoding overhead
+- Eliminates MP3 encoding/decoding overhead
 - Direct audio buffer manipulation
 
 #### Performance Characteristics:
@@ -146,7 +144,7 @@ for _ in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
 
 ---
 
-### 3. rtc_vad/fastrtc_real.py - Flexible Manual Recording with FastRTC Architecture
+### 3. fastrtc_real.py - Flexible Manual Recording with FastRTC Architecture
 
 #### FastRTC Usage: ARCHITECTURAL ONLY
 **Uses**: FastRTC Stream classes for structure but implements manual recording with keyboard controls
@@ -156,7 +154,7 @@ for _ in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
 - **Audio Recording**: PyAudio with dual recording modes
 - **User Interface**: keyboard module for real-time input detection
 - **VAD Method**: Manual triggers + optional silence detection
-- **TTS Approach**: Simple WAV generation (like rtc_vad/vad_simple.py)
+- **TTS Approach**: Simple MP3 generation (like VAD_simple)
 - **Error Handling**: Persistent event loop management
 
 #### Speed Optimization Techniques:
@@ -232,14 +230,14 @@ if response_gen:
 
 ## Performance Comparison Matrix
 
-| Metric | rtc_vad/vad_simple.py | rtc_vad/vad_fastrtc.py | rtc_vad/fastrtc_real.py |
+| Metric | VAD_simple.py | VAD_fastrtc.py | fastrtc_real.py |
 |--------|--------------|----------------|-----------------|
 | **FastRTC Usage** | None | Partial (Structure) | Architectural Only |
 | **VAD Method** | Energy-based RMS | Fixed duration | Manual + Silence |
 | **Recording Control** | Automatic (0.8-8s) | Fixed (5s) | User controlled |
 | **Average Total Time** | 2.3-8.4s | Variable | 2.3-11.3s |
 | **Memory Usage** | Low | Medium | Medium |
-| **TTS Latency** | Medium (WAV) | Lowest (Streaming) | Medium (WAV) |
+| **TTS Latency** | Medium (MP3) | Lowest (Streaming) | Medium (MP3) |
 | **Startup Time** | Fastest | Medium | Medium |
 | **User Interaction** | Simple (Enter key) | Simple (Enter key) | Advanced (Space key) |
 | **Audio Quality** | Standard (44.1kHz) | High (48kHz linear16) | Standard (16kHz) |
@@ -250,17 +248,17 @@ if response_gen:
 
 ### 1. Recording Strategy Impact
 
-**Dynamic Duration (rtc_vad/vad_simple.py)**:
+**Dynamic Duration (VAD_simple.py)**:
 - Optimal for short utterances (stops at 0.8s minimum)
 - Eliminates unnecessary recording time
 - Fastest for simple commands and queries
 
-**Fixed Duration (rtc_vad/vad_fastrtc.py)**:
+**Fixed Duration (VAD_fastrtc.py)**:
 - Consistent timing regardless of speech length
 - Higher overhead for short speech
 - Predictable performance characteristics
 
-**User Controlled (rtc_vad/fastrtc_real.py)**:
+**User Controlled (fastrtc_real.py)**:
 - Most efficient for interactive applications
 - Eliminates false starts and background noise
 - Variable performance based on user behavior
@@ -284,7 +282,7 @@ if response_gen:
 
 ### 3. TTS Strategy Comparison
 
-**WAV File Generation (rtc_vad/vad_simple.py, rtc_vad/fastrtc_real.py)**:
+**MP3 File Generation (VAD_simple.py, fastrtc_real.py)**:
 ```python
 # Simple, reliable, file-based approach
 response = deepgram_client.speak.rest.v("1").save(str(speech_path), text_payload, options)
@@ -292,7 +290,7 @@ response = deepgram_client.speak.rest.v("1").save(str(speech_path), text_payload
 # Cons: File I/O overhead, sequential processing
 ```
 
-**WebSocket Streaming (rtc_vad/vad_fastrtc.py)**:
+**WebSocket Streaming (VAD_fastrtc.py)**:
 ```python
 # Real-time streaming with immediate playback
 dg_connection.send_text(text)
@@ -309,7 +307,7 @@ if audio_path.exists():
     audio_path.unlink()
 ```
 
-**Event Loop Reuse (rtc_vad/fastrtc_real.py)**:
+**Event Loop Reuse (fastrtc_real.py)**:
 ```python
 # Prevents async overhead in repeated operations
 if self.loop is None or self.loop.is_closed():
@@ -318,21 +316,21 @@ if self.loop is None or self.loop.is_closed():
 
 ## Architectural Recommendations
 
-### Choose rtc_vad/vad_simple.py when:
+### Choose VAD_simple.py when:
 - Building quick prototypes or demos
 - Working with resource-constrained hardware
 - Need maximum reliability with minimal complexity
 - Developing simple voice command systems
 - Require fastest startup time
 
-### Choose rtc_vad/vad_fastrtc.py when:
+### Choose VAD_fastrtc.py when:
 - Audio quality is paramount
 - Building professional voice applications
 - Network connectivity is reliable
 - Need lowest possible TTS latency
 - Planning WebSocket-based architectures
 
-### Choose rtc_vad/fastrtc_real.py when:
+### Choose fastrtc_real.py when:
 - Building interactive voice applications
 - Need flexible user interaction models
 - Planning future FastRTC integration
@@ -343,22 +341,22 @@ if self.loop is None or self.loop.is_closed():
 
 ### Base Requirements (All Implementations)
 ```bash
-pip install pydantic-ai openai groq python-dotenv numpy pydub
+pip install groq pydantic-ai[google] google-genai deepgram-sdk python-dotenv numpy pydub
 ```
 
 ### Implementation-Specific Dependencies
 
-**rtc_vad/vad_simple.py Additional Requirements**:
+**VAD_simple.py Additional Requirements**:
 ```bash
 pip install pyaudio
 ```
 
-**rtc_vad/vad_fastrtc.py Additional Requirements**:
+**VAD_fastrtc.py Additional Requirements**:
 ```bash
 pip install fastrtc sounddevice scipy
 ```
 
-**rtc_vad/fastrtc_real.py Additional Requirements**:
+**fastrtc_real.py Additional Requirements**:
 ```bash
 pip install fastrtc keyboard pyaudio scipy
 ```
@@ -375,7 +373,7 @@ GOOGLE_API_KEY=your_google_api_key
 ## Performance Tuning Guidelines
 
 ### For Maximum Speed:
-1. Use rtc_vad/vad_simple.py with optimized thresholds:
+1. Use VAD_simple.py with optimized thresholds:
    ```python
    SILENCE_DURATION = 0.5  # Faster cutoff
    speech_energy_threshold = 30  # Lower threshold for sensitivity
@@ -387,7 +385,7 @@ GOOGLE_API_KEY=your_google_api_key
    ```
 
 ### For Best Audio Quality:
-1. Use rtc_vad/vad_fastrtc.py with high sample rates:
+1. Use VAD_fastrtc.py with high sample rates:
    ```python
    RATE = 48000  # Higher quality recording
    "sample_rate": 48000  # Match TTS sample rate
@@ -396,7 +394,7 @@ GOOGLE_API_KEY=your_google_api_key
 2. Implement noise reduction preprocessing
 
 ### For Best User Experience:
-1. Use rtc_vad/fastrtc_real.py with visual feedback
+1. Use fastrtc_real.py with visual feedback
 2. Implement status indicators for recording states
 3. Add configurable hotkeys for different functions
 
@@ -437,7 +435,3 @@ Each implementation represents a different approach to voice activity detection 
 - **Future Expansion Plans**: Architecture extensibility requirements
 
 All three implementations demonstrate that significant performance improvements can be achieved through careful selection of audio processing strategies, efficient resource management, and appropriate technology choices for the specific use case requirements.
-
-
-
-

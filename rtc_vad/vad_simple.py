@@ -1,4 +1,4 @@
-"""
+﻿"""
 Clean Voice Assistant with FastRTC VAD
 Minimal implementation with only essential features
 """
@@ -16,7 +16,7 @@ import wave
 import numpy as np
 # Groq for STT
 from groq import Groq
-# Deepgram for TTS (primary via core/openrouter_tts.py)
+# Deepgram for TTS (disabled)
 # from deepgram import DeepgramClient, SpeakOptions
 # LLM
 from pydantic_ai import Agent
@@ -32,14 +32,13 @@ from core.llm_client import (
 from core.paths import TEMP_AUDIO_DIR, ensure_dirs
 from core.openrouter_tts import synthesize_speech
 from core.env import load_env
-from core.system_prompts import load_prompt
 
 # Environment
 load_env()
 ensure_dirs()
 
 # Initialize clients
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY") or os.getenv("GROQ_API_KEY2"))
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY2"))
 # deepgram_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
 # Configure LLM
@@ -47,11 +46,10 @@ model_settings = {
     "temperature": 0.2,
     "max_tokens": 1024,
 }
-AGENT_PROMPT = load_prompt("vad_simple_agent")
 
 openrouter_models = get_openrouter_models(settings=model_settings)
 if not openrouter_models:
-    raise RuntimeError("No OpenRouter API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 or OPENROUTER_API_KEY in .env.")
+    raise RuntimeError("No OpenRouter API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 in .env.")
 
 primary_model = openrouter_models[0]
 openrouter_fallback_models = openrouter_models[1:]
@@ -59,7 +57,9 @@ groq_fallback_model = get_groq_fallback_model(settings=model_settings)
 agent = Agent(
     primary_model,
     model_settings=model_settings,
-    system_prompt=AGENT_PROMPT,   
+    system_prompt="""You are a helpful voice assistant. Keep responses concise and clear.
+                     Do not use asterisks (*) or other markdown formatting in your responses.
+                     Do no use emojis.""",   
 )
 agent_fallbacks: list[Agent] = []
 for fallback_model in openrouter_fallback_models:
@@ -67,7 +67,9 @@ for fallback_model in openrouter_fallback_models:
         Agent(
             fallback_model,
             model_settings=model_settings,
-            system_prompt=AGENT_PROMPT,
+            system_prompt="""You are a helpful voice assistant. Keep responses concise and clear.
+                     Do not use asterisks (*) or other markdown formatting in your responses.
+                     Do no use emojis.""",
         )
     )
 if groq_fallback_model:
@@ -75,7 +77,9 @@ if groq_fallback_model:
         Agent(
             groq_fallback_model,
             model_settings=model_settings,
-            system_prompt=AGENT_PROMPT,
+            system_prompt="""You are a helpful voice assistant. Keep responses concise and clear.
+                     Do not use asterisks (*) or other markdown formatting in your responses.
+                     Do no use emojis.""",
         )
     )
 
@@ -169,8 +173,8 @@ class VoiceAssistant:
             print(f"LLM error: {e}")
             return "Sorry, I couldn't process that."
     
-    def text_to_speech(self, text, filename="output.wav"):
-        """Convert text to speech using Groq TTS"""
+    def text_to_speech(self, text, filename="output.mp3"):
+        """Convert text to speech using OpenRouter TTS"""
         try:
             speech_path = self.temp_dir / filename
             return synthesize_speech(text, speech_path)
@@ -184,7 +188,10 @@ class VoiceAssistant:
             from pydub import AudioSegment
             from pydub.playback import play
             
-            audio = AudioSegment.from_file(str(audio_path))
+            if str(audio_path).endswith('.mp3'):
+                audio = AudioSegment.from_mp3(str(audio_path))
+            else:
+                audio = AudioSegment.from_wav(str(audio_path))
             
             play(audio)
             return True
@@ -234,7 +241,7 @@ class VoiceAssistant:
                 
                 # Generate and play TTS
                 tts_start = time.time()
-                speech_file = self.text_to_speech(response_text, f"output_{conversation_count}.wav")
+                speech_file = self.text_to_speech(response_text, f"output_{conversation_count}.mp3")
                 tts_time = time.time() - tts_start
                 
                 if speech_file:

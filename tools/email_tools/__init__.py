@@ -1,4 +1,4 @@
-"""
+﻿"""
 Email Tools Package
 
 A comprehensive package for email sending functionality using Gmail SMTP.

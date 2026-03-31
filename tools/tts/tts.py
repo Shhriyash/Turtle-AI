@@ -1,5 +1,4 @@
-import time
-import os
+﻿import time
 import queue
 import threading
 import numpy as np
@@ -11,7 +10,7 @@ from deepgram.speak.v1.types import SpeakV1Text
 from tools.tts.client import get_deepgram_client
 
 TTS_TEXT = "Hello, this is a streaming text to speech example using Deepgram."
-MODEL = "aura-2-apollo-en"
+MODEL = "aura-2-orion-en"
 SAMPLE_RATE = 48000
 ENCODING = "linear16"
 
@@ -24,55 +23,23 @@ def stream_tts(
     encoding: str = ENCODING,
     idle_timeout: float = 1.0,
     start_timeout: float = 3.0,
-    max_total_time: float | None = 8.0,
-    debug: bool = False,
 ) -> bool:
     audio_queue: queue.Queue[np.ndarray] = queue.Queue()
     done_event = threading.Event()
     started_audio = threading.Event()
     last_audio_time = {"t": 0.0}
 
-    def _enqueue_audio(raw: bytes) -> None:
-        if not raw:
-            return
-        array = np.frombuffer(raw, dtype=np.int16)
-        audio_queue.put(array)
-        last_audio_time["t"] = time.time()
-        if not started_audio.is_set():
-            print(f"Received audio chunk ({len(raw)} bytes)")
-        started_audio.set()
-
     def on_message(message) -> None:
         if isinstance(message, bytes):
-            _enqueue_audio(message)
-            return
-
-        msg_type = getattr(message, "type", "Unknown")
-        print(f"Received {msg_type} event")
-
-        data = None
-        if hasattr(message, "data"):
-            data = message.data
-        elif isinstance(message, dict):
-            data = message.get("data")
-
-        if isinstance(data, (bytes, bytearray)):
-            _enqueue_audio(bytes(data))
-            return
-        if isinstance(data, str):
-            try:
-                import base64
-                decoded = base64.b64decode(data)
-                _enqueue_audio(decoded)
-            except Exception:
-                pass
-
-        if debug:
-            try:
-                payload = message if isinstance(message, dict) else vars(message)
-                print(f"Debug message payload: {payload}")
-            except Exception:
-                print(f"Debug message repr: {message!r}")
+            if not message:
+                return
+            array = np.frombuffer(message, dtype=np.int16)
+            audio_queue.put(array)
+            last_audio_time["t"] = time.time()
+            started_audio.set()
+        else:
+            msg_type = getattr(message, "type", "Unknown")
+            print(f"Received {msg_type} event")
 
     def audio_callback(outdata, frames, _time, status):
         if status:
@@ -95,14 +62,10 @@ def stream_tts(
                 filled = frames
         outdata[:, 0] = samples
 
-    def idle_monitor(start_time: float):
+    def idle_monitor():
         while not done_event.is_set():
-            if max_total_time is not None and time.time() - start_time >= max_total_time:
-                print("Max TTS streaming time reached.")
-                done_event.set()
-                break
             if not started_audio.is_set():
-                if time.time() - start_time >= start_timeout:
+                if time.time() - last_audio_time["t"] >= start_timeout and last_audio_time["t"] > 0:
                     print("No audio received from Deepgram within timeout.")
                     done_event.set()
                     break
@@ -133,12 +96,11 @@ def stream_tts(
                 dg_connection.on(EventType.ERROR, lambda error: print(f"Error: {error}"))
 
                 dg_connection.start_listening()
-                start_time = time.time()
                 dg_connection.send_text(SpeakV1Text(text=text))
                 dg_connection.send_flush()
-                last_audio_time["t"] = start_time
+                last_audio_time["t"] = time.time()
 
-                monitor = threading.Thread(target=idle_monitor, args=(start_time,), daemon=True)
+                monitor = threading.Thread(target=idle_monitor, daemon=True)
                 monitor.start()
 
                 while not done_event.is_set():
@@ -153,10 +115,7 @@ def stream_tts(
 
 
 def main():
-    debug = os.getenv("DEEPGRAM_TTS_DEBUG") == "1"
-    max_total = os.getenv("DEEPGRAM_TTS_MAX_SECONDS")
-    max_total_time = float(max_total) if max_total else None
-    ok = stream_tts(TTS_TEXT, debug=debug, max_total_time=max_total_time)
+    ok = stream_tts(TTS_TEXT)
     if ok:
         print("TTS stream completed")
     else:

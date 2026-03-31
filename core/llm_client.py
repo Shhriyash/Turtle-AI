@@ -16,7 +16,6 @@ OPENROUTER_KEY_ENV_VARS = [
     "OPEN_ROUTER_API_KEY_1",
     "OPEN_ROUTER_API_KEY_2",
     "OPEN_ROUTER_API_KEY_3",
-    "OPENROUTER_API_KEY",
 ]
 
 
@@ -26,11 +25,17 @@ def get_openrouter_keys() -> list[str]:
         value = os.getenv(name)
         if value:
             keys.append(value)
+
+    # Optional single-key fallback for legacy setups.
+    single_key = os.getenv("OPENROUTER_API_KEY")
+    if single_key and single_key not in keys:
+        keys.append(single_key)
+
     return keys
 
 
 def get_openrouter_models(model_name: str | None = None, settings: ModelSettings | None = None) -> list[OpenRouterModel]:
-    model = model_name or os.getenv("OPEN_ROUTER_MODEL") or os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL)
+    model = model_name or os.getenv("OPEN_ROUTER_MODEL", os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL))
     app_url = os.getenv("OPENROUTER_APP_URL")
     app_title = os.getenv("OPENROUTER_APP_TITLE")
     models: list[OpenRouterModel] = []
@@ -46,7 +51,8 @@ def get_groq_model(model_name: str | None = None, settings: ModelSettings | None
     api_key = os.getenv("GROQ_API_KEY") or os.getenv("GROQ_API_KEY2")
     if not api_key:
         return None
-    return GroqModel(model_name or os.getenv("GROQ_PRIMARY_MODEL", GROQ_DEFAULT_PRIMARY_MODEL), settings=settings)
+    model = model_name or os.getenv("GROQ_PRIMARY_MODEL", GROQ_DEFAULT_PRIMARY_MODEL)
+    return GroqModel(model, settings=settings)
 
 
 def get_groq_fallback_model(model_name: str | None = None, settings: ModelSettings | None = None) -> GroqModel | None:
@@ -68,21 +74,16 @@ def is_rate_limit_error(exc: Exception) -> bool:
 
 def is_key_failure_error(exc: Exception) -> bool:
     if isinstance(exc, ModelHTTPError):
-        return exc.status_code in {401, 403, 429}
+        return exc.status_code in {401, 403, 404, 429}
     if isinstance(exc, ModelAPIError):
         message = str(exc).lower()
-        return any(
-            token in message
-            for token in ["rate limit", "rate_limit", "invalid api key", "unauthorized", "quota", "insufficient"]
-        )
+        return any(token in message for token in ["rate limit", "rate_limit", "invalid api key", "unauthorized", "tool_choice", "no endpoints found"])
     message = str(exc).lower()
-    return any(
-        token in message for token in ["rate limit", "rate_limit", "invalid api key", "unauthorized", "quota", "insufficient"]
-    )
+    return any(token in message for token in ["rate limit", "rate_limit", "invalid api key", "unauthorized", "tool_choice", "no endpoints found"])
 
 
 def _fallback_log() -> None:
-    print("LOG: OpenRouter key failed or rate limited, trying next key")
+    print("LOG: Model key failed or rate limited, trying next fallback")
 
 
 async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any], *args: Any, **kwargs: Any):

@@ -188,12 +188,6 @@ TURTLE_EMAIL_NAME="Your Name"
 TURTLE_EMAIL_ADDRESS="your_email@gmail.com"
 TURTLE_EMAIL_PASSKEY="your_app_password"
 
-# Startup interaction mode
-# voice = start directly in voice mode
-# text = start directly in text mode
-# ask = prompt at startup to choose
-TURTLE_INTERACTION_MODE=ask
-
 # Optional monitoring
 LOGFIRE_TOKEN=your_logfire_token
 
@@ -213,11 +207,6 @@ python -m pip install -r requirements.txt
 ```bash
 python apps/turtle_voice.py
 ```
-
-Startup behavior:
-- `TURTLE_INTERACTION_MODE=voice` starts the voice loop immediately
-- `TURTLE_INTERACTION_MODE=text` starts in text-only mode and skips voice initialization
-- `TURTLE_INTERACTION_MODE=ask` prompts you to choose `voice` or `text` after launch
 
 ### Other Entry Points
 ```bash
@@ -319,7 +308,7 @@ This repo includes three voice/VAD scripts in `rtc_vad/`. They share the same st
 
 ### Technique Details
 - `vad_simple.py` uses a simple RMS energy threshold and stops on silence. It is easy to tune but not robust to noisy environments.
-- `vad_fastrtc.py` integrates FastRTC’s Silero VAD in the handler, but the current console mode still records fixed chunks before STT.
+- `vad_fastrtc.py` integrates FastRTCâ€™s Silero VAD in the handler, but the current console mode still records fixed chunks before STT.
 - `fastrtc_real.py` exposes more VAD control and timing logs, and is the most suitable base for true low-latency streaming.
 
 ### Notes on Latency

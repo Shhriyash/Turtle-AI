@@ -1,4 +1,4 @@
-"""
+﻿"""
 Clean Voice Assistant with FastRTC VAD
 Minimal implementation with only essential features
 """
@@ -10,42 +10,36 @@ import time
 from pathlib import Path
 import tempfile
 from typing import Generator, Tuple
-
 # Audio recording
 import pyaudio
 import wave
 import numpy as np
-
-
-
 # Groq for STT
 from groq import Groq
-
 # Deepgram for TTS (disabled)
 # from deepgram import DeepgramClient, SpeakOptions
-
 # LLM
 from pydantic_ai import Agent
-
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-
-# Environment
-from core.env import load_env
-
-load_env()
-
-# Initialize clients
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY") or os.getenv("GROQ_API_KEY2"))
-# deepgram_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
 from core.llm_client import (
     get_openrouter_models,
     get_groq_fallback_model,
     run_agent_with_fallbacks,
 )
+from core.paths import TEMP_AUDIO_DIR, ensure_dirs
 from core.openrouter_tts import synthesize_speech
+from core.env import load_env
+
+# Environment
+load_env()
+ensure_dirs()
+
+# Initialize clients
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY2"))
+# deepgram_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
 # Configure LLM
 model_settings = {
@@ -55,7 +49,7 @@ model_settings = {
 
 openrouter_models = get_openrouter_models(settings=model_settings)
 if not openrouter_models:
-    raise RuntimeError("No Groq API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 or OPENROUTER_API_KEY in .env.")
+    raise RuntimeError("No OpenRouter API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 in .env.")
 
 primary_model = openrouter_models[0]
 openrouter_fallback_models = openrouter_models[1:]
@@ -100,8 +94,8 @@ SILENCE_DURATION = 0.8
 class VoiceAssistant:
     def __init__(self):
         self.audio = pyaudio.PyAudio()
-        self.temp_dir = Path("temp_audio")
-        self.temp_dir.mkdir(exist_ok=True)
+        self.temp_dir = TEMP_AUDIO_DIR
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         
     def record_audio(self, filename="input.wav"):
         """Record audio with VAD"""
@@ -179,8 +173,8 @@ class VoiceAssistant:
             print(f"LLM error: {e}")
             return "Sorry, I couldn't process that."
     
-    def text_to_speech(self, text, filename="output.wav"):
-        """Convert text to speech using Groq"""
+    def text_to_speech(self, text, filename="output.mp3"):
+        """Convert text to speech using OpenRouter TTS"""
         try:
             speech_path = self.temp_dir / filename
             return synthesize_speech(text, speech_path)
@@ -209,7 +203,6 @@ class VoiceAssistant:
     
     async def run_console_mode(self):
         """Run in console mode with manual recording"""
-        print("Voice Assistant - Console Mode")
         print("Commands: 'quit' to exit")
         
         conversation_count = 0
@@ -248,7 +241,7 @@ class VoiceAssistant:
                 
                 # Generate and play TTS
                 tts_start = time.time()
-                speech_file = self.text_to_speech(response_text, f"output_{conversation_count}.wav")
+                speech_file = self.text_to_speech(response_text, f"output_{conversation_count}.mp3")
                 tts_time = time.time() - tts_start
                 
                 if speech_file:
@@ -274,14 +267,12 @@ class VoiceAssistant:
         
         for file in self.temp_dir.glob("*.wav"):
             file.unlink()
-        for file in self.temp_dir.glob("*.wav"):
+        for file in self.temp_dir.glob("*.mp3"):
             file.unlink()
 
 async def main():
     """Main function"""
     print("Voice Assistant")
-    
-    print("Console Voice Assistant")
     
     assistant = VoiceAssistant()
     

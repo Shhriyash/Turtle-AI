@@ -1,4 +1,4 @@
-"""
+﻿"""
 Turtle - Personal Assistant with Web Search and URL Context Capabilities
 
 Enhanced assistant with real-time web search, URL analysis, and conversation memory.
@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 import json
 import numpy as np
-from pydantic_ai import Agent, RunContext, WebSearchTool
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, UserPromptPart
 from pydantic_ai.usage import UsageLimits, RunUsage
 import logfire
@@ -52,7 +52,17 @@ from core.email_flow import (
     validate_send_email_args,
 )
 from core.output_clean import clean_text_for_model, clean_text_for_tts
-from core.paths import TEMP_AUDIO_DIR, ensure_dirs
+from core.graph_store import GraphStore
+from core.memory_store import MemoryStore
+from core.paths import (
+    MEMORY_EPISODES_FILE,
+    MEMORY_EVENTS_FILE,
+    MEMORY_GRAPH_FILE,
+    MEMORY_PROFILE_FILE,
+    MEMORY_STATE_FILE,
+    TEMP_AUDIO_DIR,
+    ensure_dirs,
+)
 from core.session_store import SessionStore
 from core.system_prompts import load_prompt
 from core.openrouter_tts import synthesize_speech
@@ -69,7 +79,6 @@ except Exception as e:
     print(f"LOG: logfire disabled ({e})")
 ensure_dirs()
 
-WEB_SEARCH_PROMPT = load_prompt("web_search_agent")
 EMAIL_PROMPT = load_prompt("email_agent")
 MAIN_ASSISTANT_PROMPT = load_prompt("main_assistant")
 
@@ -82,7 +91,9 @@ class SharedState:
     """Shared state across all agents - now using UrlState for URL operations"""
     http_client: httpx.AsyncClient
     session_store: SessionStore
+    memory_store: MemoryStore
     search_cache: dict[str, str] = field(default_factory=dict)
+    turn_counter: int = 0
 
 
 class TurtleVoiceProcessor:
@@ -198,8 +209,12 @@ model_settings = {
 }
 OUTPUT_RETRIES = 3
 SESSION_RESTORE_MODE = os.getenv("SESSION_RESTORE_MODE", "strict_new")
-ACTIVE_HISTORY_MAX_TURNS = int(os.getenv("ACTIVE_HISTORY_MAX_TURNS", "12"))
+ACTIVE_HISTORY_MAX_TURNS = int(os.getenv("TURTLE_HISTORY_MAX_TURNS", os.getenv("ACTIVE_HISTORY_MAX_TURNS", "12")))
 ACTIVE_HISTORY_MAX_MESSAGES = int(os.getenv("ACTIVE_HISTORY_MAX_MESSAGES", "40"))
+ACTIVE_HISTORY_MAX_TOKENS = int(os.getenv("TURTLE_HISTORY_MAX_TOKENS", "12000"))
+MEMORY_FLUSH_TURNS = int(os.getenv("TURTLE_MEMORY_FLUSH_TURNS", "20"))
+MEMORY_FLUSH_TOKENS = int(os.getenv("TURTLE_MEMORY_FLUSH_TOKENS", "20000"))
+MEMORY_PROFILE_MAX_LINES = int(os.getenv("TURTLE_MEMORY_PROFILE_MAX_LINES", "6"))
 INTERACTION_MODE = os.getenv("TURTLE_INTERACTION_MODE", "ask").strip().lower()
 
 
@@ -211,7 +226,9 @@ def _is_user_turn_request(message: ModelMessage) -> bool:
 
 def _trim_history_for_context(history: list[ModelMessage]) -> list[ModelMessage]:
     if len(history) <= ACTIVE_HISTORY_MAX_MESSAGES:
-        return history
+        approx_tokens = sum(len(str(message)) // 4 for message in history)
+        if approx_tokens <= ACTIVE_HISTORY_MAX_TOKENS:
+            return history
 
     user_turns_seen = 0
     start_index = 0
@@ -226,10 +243,41 @@ def _trim_history_for_context(history: list[ModelMessage]) -> list[ModelMessage]
     if len(trimmed) > ACTIVE_HISTORY_MAX_MESSAGES:
         trimmed = trimmed[-ACTIVE_HISTORY_MAX_MESSAGES:]
 
+    while trimmed and sum(len(str(message)) // 4 for message in trimmed) > ACTIVE_HISTORY_MAX_TOKENS:
+        trimmed = trimmed[1:]
+
     while trimmed and isinstance(trimmed[0], ModelResponse):
         trimmed = trimmed[1:]
 
     return trimmed or history[-ACTIVE_HISTORY_MAX_MESSAGES:]
+
+
+def _detect_task_type(user_text: str) -> str:
+    lowered = user_text.lower()
+    if "email" in lowered or "mail" in lowered:
+        return "email"
+    if "http://" in lowered or "https://" in lowered:
+        return "url"
+    if any(token in lowered for token in ["search", "latest", "news", "top ", "price"]):
+        return "web"
+    return "general"
+
+
+def _compose_prompt_with_memory(user_text: str, memory_lines: list[str]) -> str:
+    if not memory_lines:
+        return user_text
+    context = "\n".join(memory_lines)
+    return (
+        "Relevant user memory:\n"
+        f"{context}\n\n"
+        "User request:\n"
+        f"{user_text}"
+    )
+
+
+def _new_turn_id(state: SharedState) -> str:
+    state.turn_counter += 1
+    return f"{state.session_store.session_id or 'session'}_turn_{state.turn_counter}"
 
 
 def _resolve_interaction_mode() -> str:
@@ -260,7 +308,6 @@ if not openrouter_models:
 primary_groq_model = get_groq_model(settings=model_settings)
 model = primary_groq_model or openrouter_models[0]  # Main assistant
 model2 = primary_groq_model or openrouter_models[0]  # Email agent
-web_search_model = openrouter_models[0]  # Web search agent stays on OpenRouter
 
 openrouter_fallback_models = openrouter_models[1:]
 delegator_fallback_models = openrouter_models if primary_groq_model else openrouter_fallback_models
@@ -269,43 +316,6 @@ usage_limits = UsageLimits(request_limit=30)
 
 # Global voice processor instance
 voice_processor = None
-
-
-# Web search agent with real-time information capabilities (thinking disabled)
-web_search_agent = Agent(
-    web_search_model,
-    deps_type=SharedState,
-    model_settings=model_settings,
-    output_retries=OUTPUT_RETRIES,
-    builtin_tools=[WebSearchTool()],
-    instructions=WEB_SEARCH_PROMPT,
-    history_processors=[_trim_history_for_context],
-)
-web_search_agent_fallbacks: list[Agent] = []
-for fallback_model in openrouter_fallback_models:
-    web_search_agent_fallbacks.append(
-        Agent(
-            fallback_model,
-            deps_type=SharedState,
-            model_settings=model_settings,
-            output_retries=OUTPUT_RETRIES,
-            builtin_tools=[WebSearchTool()],
-            instructions=WEB_SEARCH_PROMPT,
-            history_processors=[_trim_history_for_context],
-        )
-    )
-if groq_fallback_model:
-    web_search_agent_fallbacks.append(
-        Agent(
-            groq_fallback_model,
-            deps_type=SharedState,
-            model_settings=model_settings,
-            output_retries=OUTPUT_RETRIES,
-            builtin_tools=[WebSearchTool()],
-            instructions=WEB_SEARCH_PROMPT,
-            history_processors=[_trim_history_for_context],
-        )
-    )
 
 # Email specialist agent for handling email operations
 email_agent = Agent(
@@ -478,6 +488,14 @@ async def send_email_assistant(ctx: RunContext[SharedState], query: str) -> str:
         )
         send_result = send_email_now(merged)
     except Exception as e:
+        tool_turn_id = f"{ctx.deps.session_store.session_id or 'session'}_tool_{ctx.deps.turn_counter}"
+        ctx.deps.memory_store.record_task_outcome(
+            session_id=ctx.deps.session_store.session_id or "unknown_session",
+            turn_id=tool_turn_id,
+            task_type="email",
+            summary=str(e),
+            success=False,
+        )
         ctx.deps.session_store.set_pending_email(
             recipients=merged["recipients"],
             subject=merged["subject"],
@@ -485,6 +503,19 @@ async def send_email_assistant(ctx: RunContext[SharedState], query: str) -> str:
         )
         return clean_text_for_model(f"Failed to send email: {e}")
     if send_result.startswith("Email sent successfully!"):
+        tool_turn_id = f"{ctx.deps.session_store.session_id or 'session'}_tool_{ctx.deps.turn_counter}"
+        ctx.deps.memory_store.record_common_recipients(
+            session_id=ctx.deps.session_store.session_id or "unknown_session",
+            turn_id=tool_turn_id,
+            recipients=merged["recipients"],
+        )
+        ctx.deps.memory_store.record_task_outcome(
+            session_id=ctx.deps.session_store.session_id or "unknown_session",
+            turn_id=tool_turn_id,
+            task_type="email",
+            summary=f"Sent email to {', '.join(merged['recipients'])} with subject {merged['subject']}",
+            success=True,
+        )
         ctx.deps.session_store.clear_pending_email()
     else:
         ctx.deps.session_store.set_pending_email(
@@ -504,14 +535,7 @@ async def history_tool(ctx: RunContext[SharedState], query: str) -> str:
         if result == "cannot find in history":
             return "No relevant information found in our previous conversations."
         else:
-            return clean_text_for_model(result)
-            
-    except Exception as e:
-        return "Unable to access conversation history at the moment."
-
-
-async def text_chat(state: SharedState, rag_system, *, return_to_voice: bool = True):
-    """Text chat mode for interactive typing-based conversations"""
+     â€¦73 tokens truncatedâ€¦ng-based conversations"""
     print("\n" + "="*50)
     print("SWITCHED TO TEXT MODE")
     print("Type your messages and press Enter")
@@ -541,12 +565,17 @@ async def text_chat(state: SharedState, rag_system, *, return_to_voice: bool = T
                 
                 if not user_input:
                     continue
+
+                task_type = _detect_task_type(user_input)
+                memory_lines = state.memory_store.get_context_lines(task_type=task_type, query=user_input)
+                prompt_input = _compose_prompt_with_memory(user_input, memory_lines)
+                turn_id = _new_turn_id(state)
                 
                 # Run with complete message history for conversation continuity
                 response = await run_agent_with_fallbacks(
                     main_assistant,
                     main_assistant_fallbacks,
-                    user_input,
+                    prompt_input,
                     deps=state,
                     message_history=message_history,
                     usage=usage,
@@ -562,6 +591,13 @@ async def text_chat(state: SharedState, rag_system, *, return_to_voice: bool = T
                 
                 # Add conversation to RAG system for long-term memory
                 rag_system.add_conversation(user_input, final_output)
+                state.memory_store.record_turn(
+                    session_id=state.session_store.session_id or "unknown_session",
+                    turn_id=turn_id,
+                    user_text=user_input,
+                    assistant_text=final_output,
+                    task_type=task_type,
+                )
                 
                 # Show usage information periodically
                 if usage.requests % 5 == 0 and usage.requests > 0:
@@ -611,11 +647,16 @@ async def voice_response_handler(audio: Tuple[int, np.ndarray], state: SharedSta
     
     try:
         # Get response from main assistant
+        task_type = _detect_task_type(transcription)
+        memory_lines = state.memory_store.get_context_lines(task_type=task_type, query=transcription)
+        prompt_input = _compose_prompt_with_memory(transcription, memory_lines)
+        turn_id = _new_turn_id(state)
+
         llm_start_time = time.time()
         response = await run_agent_with_fallbacks(
             main_assistant,
             main_assistant_fallbacks,
-            transcription,
+            prompt_input,
             deps=state,
             message_history=state.session_store.message_history or None,
             usage=RunUsage()
@@ -629,6 +670,13 @@ async def voice_response_handler(audio: Tuple[int, np.ndarray], state: SharedSta
 
         # Add conversation to RAG system for memory
         rag_system.add_conversation(transcription, final_output)
+        state.memory_store.record_turn(
+            session_id=state.session_store.session_id or "unknown_session",
+            turn_id=turn_id,
+            user_text=transcription,
+            assistant_text=final_output,
+            task_type=task_type,
+        )
 
         # Generate and play TTS
         tts_start_time = time.time()
@@ -662,7 +710,18 @@ async def voice_chat():
     async with httpx.AsyncClient() as client:
         session_store = SessionStore()
         restore_result = session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
-        state = SharedState(http_client=client, session_store=session_store)
+        graph_store = GraphStore(graph_path=MEMORY_GRAPH_FILE)
+        memory_store = MemoryStore(
+            profile_path=MEMORY_PROFILE_FILE,
+            events_path=MEMORY_EVENTS_FILE,
+            episodes_path=MEMORY_EPISODES_FILE,
+            state_path=MEMORY_STATE_FILE,
+            graph_store=graph_store,
+            flush_turns=MEMORY_FLUSH_TURNS,
+            flush_tokens=MEMORY_FLUSH_TOKENS,
+            profile_max_lines=MEMORY_PROFILE_MAX_LINES,
+        )
+        state = SharedState(http_client=client, session_store=session_store, memory_store=memory_store)
         voice_processor = TurtleVoiceProcessor(state)
         
         # Initialize RAG system
@@ -805,6 +864,12 @@ async def voice_chat():
             if voice_processor:
                 voice_processor.cleanup()
 
+            if state.session_store.session_id:
+                state.memory_store.force_checkpoint(
+                    session_id=state.session_store.session_id,
+                    reason="session_end",
+                )
+
             session_id = state.session_store.session_id
             archive_path = state.session_store.archive_active(status="pending_finalization")
             if session_id and archive_path:
@@ -834,7 +899,18 @@ async def text_mode_chat():
     async with httpx.AsyncClient() as client:
         session_store = SessionStore()
         restore_result = session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
-        state = SharedState(http_client=client, session_store=session_store)
+        graph_store = GraphStore(graph_path=MEMORY_GRAPH_FILE)
+        memory_store = MemoryStore(
+            profile_path=MEMORY_PROFILE_FILE,
+            events_path=MEMORY_EVENTS_FILE,
+            episodes_path=MEMORY_EPISODES_FILE,
+            state_path=MEMORY_STATE_FILE,
+            graph_store=graph_store,
+            flush_turns=MEMORY_FLUSH_TURNS,
+            flush_tokens=MEMORY_FLUSH_TOKENS,
+            profile_max_lines=MEMORY_PROFILE_MAX_LINES,
+        )
+        state = SharedState(http_client=client, session_store=session_store, memory_store=memory_store)
 
         rag_system = get_rag_system()
         if restore_result.had_corrupt_active:
@@ -872,6 +948,11 @@ async def text_mode_chat():
         try:
             await text_chat(state, rag_system, return_to_voice=False)
         finally:
+            if state.session_store.session_id:
+                state.memory_store.force_checkpoint(
+                    session_id=state.session_store.session_id,
+                    reason="session_end",
+                )
             session_id = state.session_store.session_id
             archive_path = state.session_store.archive_active(status="pending_finalization")
             if session_id and archive_path:

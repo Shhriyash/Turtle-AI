@@ -1,4 +1,4 @@
-"""
+﻿"""
 Cohere Embedding Model for RAG System
 
 This module handles text embedding generation using Cohere's API.

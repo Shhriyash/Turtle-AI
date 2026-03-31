@@ -7,6 +7,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "data"
 OUTPUT_DIR = ROOT_DIR / "output"
 
+MEMORY_DIR = DATA_DIR / "memory"
+MEMORY_PROFILE_FILE = MEMORY_DIR / "profile.json"
+MEMORY_EVENTS_FILE = MEMORY_DIR / "events.jsonl"
+MEMORY_EPISODES_FILE = MEMORY_DIR / "episodes.jsonl"
+MEMORY_STATE_FILE = MEMORY_DIR / "state.json"
+MEMORY_GRAPH_FILE = MEMORY_DIR / "graph.json"
+
 RAG_DATA_DIR = DATA_DIR / "rag"
 RAG_VECTOR_DIR = RAG_DATA_DIR / "vector"
 RAG_SESSION_FILE = RAG_DATA_DIR / "current_session.json"
@@ -24,6 +31,7 @@ def ensure_dirs() -> None:
     for path in [
         DATA_DIR,
         OUTPUT_DIR,
+        MEMORY_DIR,
         RAG_DATA_DIR,
         RAG_VECTOR_DIR,
         SESSIONS_DIR,

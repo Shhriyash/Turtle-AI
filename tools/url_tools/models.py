@@ -1,4 +1,4 @@
-"""
+﻿"""
 Data models and types for URL tools package.
 """
 

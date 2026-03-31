@@ -1,7 +1,7 @@
-"""
+﻿"""
 FastRTC Voice Assistant - ACTUAL FastRTC Implementation
 Uses real FastRTC Stream with Silero VAD for automatic speech detection
-Keeps same STT (Groq Whisper), LLM (OpenRouter), TTS (Deepgram with Groq fallback) stack
+Keeps same STT (Groq Whisper), LLM (OpenRouter), TTS (Deepgram) stack
 """
 
 import os
@@ -9,6 +9,7 @@ import sys
 import asyncio
 import time
 from pathlib import Path
+import tempfile
 from typing import Generator, Tuple
 import numpy as np
 import re
@@ -20,7 +21,7 @@ from fastrtc import Stream, ReplyOnPause, AlgoOptions
 # Groq for STT
 from groq import Groq
 
-# Deepgram for TTS (primary via core/openrouter_tts.py)
+# Deepgram for TTS (disabled)
 # from deepgram import DeepgramClient, SpeakOptions
 
 # LLM
@@ -37,15 +38,13 @@ from core.llm_client import (
 from core.paths import TEMP_AUDIO_DIR, ensure_dirs
 from core.openrouter_tts import synthesize_speech
 from core.env import load_env
-from core.system_prompts import load_prompt
-from core.stt_fastrtc import FastRTCSTT
 
 # Environment
 load_env()
 ensure_dirs()
 
 # Initialize clients
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY") or os.getenv("GROQ_API_KEY2"))
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY2"))
 # deepgram_client = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
 
 # Configure LLM
@@ -53,11 +52,10 @@ model_settings = {
     "temperature": 0.2,
     "max_tokens": 1024,
 }
-AGENT_PROMPT = load_prompt("fastrtc_real_agent")
 
 openrouter_models = get_openrouter_models(settings=model_settings)
 if not openrouter_models:
-    raise RuntimeError("No OpenRouter API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 or OPENROUTER_API_KEY in .env.")
+    raise RuntimeError("No OpenRouter API keys found. Set OPEN_ROUTER_API_KEY_1/2/3 in .env.")
 
 primary_model = openrouter_models[0]
 openrouter_fallback_models = openrouter_models[1:]
@@ -65,7 +63,7 @@ groq_fallback_model = get_groq_fallback_model(settings=model_settings)
 agent = Agent(
     primary_model,
     model_settings=model_settings,
-    system_prompt=AGENT_PROMPT
+    system_prompt="You are a helpful voice assistant. Keep responses concise and clear."
 )
 agent_fallbacks: list[Agent] = []
 for fallback_model in openrouter_fallback_models:
@@ -73,7 +71,7 @@ for fallback_model in openrouter_fallback_models:
         Agent(
             fallback_model,
             model_settings=model_settings,
-            system_prompt=AGENT_PROMPT,
+            system_prompt="You are a helpful voice assistant. Keep responses concise and clear.",
         )
     )
 if groq_fallback_model:
@@ -81,28 +79,31 @@ if groq_fallback_model:
         Agent(
             groq_fallback_model,
             model_settings=model_settings,
-            system_prompt=AGENT_PROMPT,
+            system_prompt="You are a helpful voice assistant. Keep responses concise and clear.",
         )
     )
-
-def run_coro_sync(coro):
-    """Run a coroutine from sync context, even if an event loop is already running."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(asyncio.run, coro)
-        return future.result()
 
 class RealFastRTCVoiceAssistant:
     def __init__(self):
         self.temp_dir = TEMP_AUDIO_DIR
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.conversation_count = 0
-        self.stt = FastRTCSTT(groq_client=groq_client)
         
+    def transcribe_audio(self, audio_path):
+        """Convert audio to text using Groq Whisper"""
+        try:
+            with open(audio_path, "rb") as file:
+                filename = Path(audio_path).name
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(filename, file.read()),
+                    model="whisper-large-v3-turbo",
+                    response_format="verbose_json",
+                )
+            return transcription.text
+        except Exception as e:
+            print(f"STT error: {e}")
+            return None
+    
     async def get_llm_response(self, text):
         """Get response from the LLM"""
         try:
@@ -113,9 +114,9 @@ class RealFastRTCVoiceAssistant:
             return "Sorry, I couldn't process that."
     
     def text_to_speech(self, text):
-        """Convert text to speech using Groq TTS (WAV)"""
+        """Convert text to speech using OpenRouter (MP3)"""
         try:
-            audio_filename = f"tts_{uuid.uuid4().hex[:8]}.wav"
+            audio_filename = f"tts_{uuid.uuid4().hex[:8]}.mp3"
             speech_path = self.temp_dir / audio_filename
             return synthesize_speech(text, speech_path)
         except Exception as e:
@@ -123,41 +124,13 @@ class RealFastRTCVoiceAssistant:
             return None
     
     def play_audio(self, audio_path):
-        """Play audio file, preferring WAV playback without ffmpeg."""
+        """Play audio file using pydub"""
         try:
-            if audio_path.suffix.lower() == ".wav":
-                import sounddevice as sd
-                import scipy.io.wavfile as wavfile
-
-                with open(audio_path, "rb") as audio_file:
-                    header = audio_file.read(12)
-                if header[:4] == b"RIFF" and header[8:12] == b"WAVE":
-                    rate, data = wavfile.read(str(audio_path))
-                else:
-                    sample_rate = int(os.getenv("DEEPGRAM_TTS_SAMPLE_RATE", "24000"))
-                    raw = audio_path.read_bytes()
-                    data = np.frombuffer(raw, dtype=np.int16)
-                    rate = sample_rate
-
-                pad_len = int(rate * 0.12)
-                if data.ndim == 1:
-                    pad = np.zeros(pad_len, dtype=data.dtype)
-                    data = np.concatenate([pad, data, pad])
-                else:
-                    pad = np.zeros((pad_len, data.shape[1]), dtype=data.dtype)
-                    data = np.concatenate([pad, data, pad])
-                sd.play(data, rate)
-                sd.wait()
-            else:
-                from pydub import AudioSegment
-                from pydub.playback import play
-                
-                audio = AudioSegment.from_file(str(audio_path))
-                # Add short silence padding to avoid clipped start/end
-                pad = AudioSegment.silent(duration=120)
-                audio = pad + audio + pad
-                audio = audio.fade_in(20).fade_out(40)
-                play(audio)
+            from pydub import AudioSegment
+            from pydub.playback import play
+            
+            audio = AudioSegment.from_mp3(str(audio_path))
+            play(audio)
             
             # Cleanup immediately after playback
             if audio_path.exists():
@@ -181,12 +154,28 @@ class RealFastRTCVoiceAssistant:
                 print("LOG: Audio too short, skipping")
                 return
             
-            # Transcribe using Groq Whisper
-            stt_start_time = time.time()
-            transcription = self.stt.transcribe_from_audio(audio)
-            stt_time = time.time() - stt_start_time
+            # Save audio temporarily for Groq Whisper
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_path = Path(temp_file.name)
+            
+            import scipy.io.wavfile as wavfile
+            # Ensure sample rate is within valid range for WAV format
+            valid_sample_rate = max(8000, min(sample_rate, 48000))
+            
+            # Ensure audio data is properly formatted
+            audio_data = np.array(audio_array, dtype=np.int16)
+            wavfile.write(temp_path, valid_sample_rate, audio_data)
+            
             vad_time = time.time() - vad_start_time
             print(f"LOG: VAD processing completed in {vad_time:.2f}s")
+            
+            # Transcribe using Groq Whisper
+            stt_start_time = time.time()
+            transcription = self.transcribe_audio(temp_path)
+            stt_time = time.time() - stt_start_time
+            
+            # Cleanup temp file
+            temp_path.unlink(missing_ok=True)
             
             if not transcription or not transcription.strip():
                 print("LOG: No speech detected in transcription")
@@ -197,7 +186,7 @@ class RealFastRTCVoiceAssistant:
             
             # Get LLM response
             llm_start_time = time.time()
-            response_text = run_coro_sync(self.get_llm_response(transcription))
+            response_text = asyncio.run(self.get_llm_response(transcription))
             llm_time = time.time() - llm_start_time
             
             print(f"LOG: LLM response generated in {llm_time:.2f}s")
@@ -206,6 +195,7 @@ class RealFastRTCVoiceAssistant:
             # Generate and play TTS
             tts_start_time = time.time()
             speech_file = self.text_to_speech(response_text)
+            
             if speech_file and speech_file.exists():
                 tts_generation_time = time.time() - tts_start_time
                 print(f"LOG: TTS generation completed in {tts_generation_time:.2f}s")
@@ -228,7 +218,7 @@ class RealFastRTCVoiceAssistant:
                 print(f"  VAD Processing: {vad_time:.2f}s")
                 print(f"  Whisper STT: {stt_time:.2f}s")
                 print(f"  LLM: {llm_time:.2f}s")
-                print(f"  TTS Generation: {tts_generation_time:.2f}s")
+                print(f"  Deepgram TTS Generation: {tts_generation_time:.2f}s")
                 print(f"  Audio Playback: {playback_time:.2f}s")
                 print(f"  Total Processing Time: {total_processing_time:.2f}s")
                 print(f"  Total Time: {total_time:.2f}s")
