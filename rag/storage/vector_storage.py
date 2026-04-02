@@ -13,6 +13,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from pathlib import Path
 from datetime import datetime
 from core.paths import RAG_VECTOR_DIR, ensure_dirs
+from core.io_atomic import atomic_write_json
 
 
 class VectorStorage:
@@ -31,16 +32,21 @@ class VectorStorage:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
         self.embedding_dimension = embedding_dimension
+        self.index_mode = os.getenv("RAG_FAISS_INDEX_TYPE", "hnsw").strip().lower()
+        self.hnsw_m = max(8, int(os.getenv("RAG_FAISS_HNSW_M", "32")))
+        self.hnsw_ef_search = max(8, int(os.getenv("RAG_FAISS_HNSW_EF_SEARCH", "64")))
         self.faiss_index = None
         self.chunk_metadata = []
         
         # File paths
         self.index_path = self.storage_dir / "faiss_index.bin"
         self.metadata_path = self.storage_dir / "chunk_metadata.json"
+        self.txn_path = self.storage_dir / "write_txn.json"
         
         # Initialize or load FAISS index
         self._initialize_index()
         self._load_metadata()
+        self._reconcile_index_and_metadata()
     
     def _initialize_index(self):
         """Initialize FAISS index"""
@@ -48,6 +54,7 @@ class VectorStorage:
             try:
                 # Load existing index
                 self.faiss_index = faiss.read_index(str(self.index_path))
+                self._configure_search_parameters()
             except Exception as e:
                 self._create_new_index()
         else:
@@ -55,9 +62,20 @@ class VectorStorage:
     
     def _create_new_index(self):
         """Create a new FAISS index"""
-        # Using IndexFlatIP (Inner Product) for cosine similarity
-        # Normalize embeddings before adding for true cosine similarity
-        self.faiss_index = faiss.IndexFlatIP(self.embedding_dimension)
+        if self.index_mode == "hnsw":
+            index = faiss.IndexHNSWFlat(self.embedding_dimension, self.hnsw_m, faiss.METRIC_INNER_PRODUCT)
+            index.hnsw.efSearch = self.hnsw_ef_search
+            self.faiss_index = index
+        else:
+            # Using IndexFlatIP (Inner Product) for cosine similarity
+            # Normalize embeddings before adding for true cosine similarity
+            self.faiss_index = faiss.IndexFlatIP(self.embedding_dimension)
+
+    def _configure_search_parameters(self):
+        if self.faiss_index is None:
+            return
+        if hasattr(self.faiss_index, "hnsw") and hasattr(self.faiss_index.hnsw, "efSearch"):
+            self.faiss_index.hnsw.efSearch = self.hnsw_ef_search
     
     def _load_metadata(self):
         """Load chunk metadata from file"""
@@ -73,12 +91,56 @@ class VectorStorage:
     def _save_index(self):
         """Save FAISS index to disk"""
         if self.faiss_index:
-            faiss.write_index(self.faiss_index, str(self.index_path))
+            temp_path = self.storage_dir / f".{self.index_path.name}.tmp"
+            faiss.write_index(self.faiss_index, str(temp_path))
+            os.replace(temp_path, self.index_path)
     
     def _save_metadata(self):
         """Save chunk metadata to file"""
-        with open(self.metadata_path, 'w', encoding='utf-8') as f:
-            json.dump(self.chunk_metadata, f, indent=2, ensure_ascii=False)
+        atomic_write_json(self.metadata_path, self.chunk_metadata, indent=2, ensure_ascii=False)
+
+    def _save_transaction_state(self, state: str) -> None:
+        payload = {
+            "state": state,
+            "timestamp": datetime.now().isoformat(),
+            "index_ntotal": int(self.faiss_index.ntotal) if self.faiss_index is not None else 0,
+            "metadata_count": len(self.chunk_metadata),
+        }
+        atomic_write_json(self.txn_path, payload, indent=2, ensure_ascii=False)
+
+    def _reconcile_index_and_metadata(self):
+        if self.faiss_index is None:
+            self._create_new_index()
+        ntotal = int(self.faiss_index.ntotal) if self.faiss_index is not None else 0
+        metadata_count = len(self.chunk_metadata)
+        if ntotal == metadata_count:
+            return
+
+        if ntotal < metadata_count:
+            # Metadata has tail entries with no vectors (likely crash before index commit).
+            self.chunk_metadata = self.chunk_metadata[:ntotal]
+            self._save_metadata()
+            return
+
+        # Index has vectors without metadata (likely crash before metadata commit).
+        # Keep index and append deleted orphan placeholders to preserve index alignment.
+        for idx in range(metadata_count, ntotal):
+            self.chunk_metadata.append(
+                {
+                    "vector_index": idx,
+                    "chunk_id": f"orphan_vector_{idx}",
+                    "session_id": "unknown",
+                    "creation_time": datetime.now().isoformat(),
+                    "content": "",
+                    "chunk_index": idx,
+                    "char_count": 0,
+                    "estimated_tokens": 0,
+                    "added_timestamp": datetime.now().isoformat(),
+                    "deleted": True,
+                    "orphaned": True,
+                }
+            )
+        self._save_metadata()
     
     def _normalize_embeddings(self, embeddings: np.ndarray) -> np.ndarray:
         """
@@ -115,6 +177,7 @@ class VectorStorage:
         normalized_embeddings = self._normalize_embeddings(embeddings)
         
         # Add to FAISS index
+        self._save_transaction_state("in_progress")
         self.faiss_index.add(normalized_embeddings)
         
         # Add metadata with vector indices
@@ -136,6 +199,7 @@ class VectorStorage:
         # Save to disk
         self._save_index()
         self._save_metadata()
+        self._save_transaction_state("committed")
     
     def search_similar(self, query_embedding: np.ndarray, top_k: int = 5, threshold: float = 0.7) -> List[Dict[str, Any]]:
         """

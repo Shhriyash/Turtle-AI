@@ -3,6 +3,8 @@ Complete RAG System for Turtle History Management.
 """
 
 import json
+import contextvars
+import threading
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from pathlib import Path
@@ -45,6 +47,7 @@ class TurtleRAGSystem:
         self.embedder = get_embedding_model()
         self.chunker = get_chunker()
         self.vector_store = get_vector_storage()
+        self._vector_lock = threading.Lock()
         
         # Current session tracking
         self.current_session_id = None
@@ -85,8 +88,92 @@ class TurtleRAGSystem:
 
         chunk_contents = [chunk["content"] for chunk in chunks]
         embeddings = self.embedder.embed_for_storage(chunk_contents)
-        self.vector_store.add_chunks(chunks, embeddings)
+        with self._vector_lock:
+            self.vector_store.add_chunks(chunks, embeddings)
         return True
+
+    @staticmethod
+    def _fallback_chunk_turn_records(
+        *,
+        session_id: str,
+        turn_records: list[dict[str, Any]],
+        creation_time: str,
+        max_chunk_tokens: int = 200,
+        overlap_tokens: int = 80,
+    ) -> list[dict[str, Any]]:
+        if not turn_records:
+            return []
+
+        lines: list[str] = []
+        for record in turn_records:
+            kind = str(record.get("kind", "unknown")).strip().lower()
+            content = str(record.get("content", "")).strip()
+            if not content:
+                continue
+            tool_name = str(record.get("tool_name", "")).strip()
+            timestamp = str(record.get("timestamp", "")).strip()
+            prefix = f"[{kind}]"
+            if tool_name:
+                prefix = f"{prefix}[{tool_name}]"
+            if timestamp:
+                prefix = f"{prefix}[{timestamp}]"
+            lines.append(f"{prefix} {content}")
+
+        if not lines:
+            return []
+
+        chunks: list[dict[str, Any]] = []
+        buffer: list[str] = []
+        buffer_tokens = 0
+        chunk_index = 0
+
+        for line in lines:
+            tokens = max(1, len(line) // 4)
+            if buffer and (buffer_tokens + tokens > max_chunk_tokens):
+                chunk_text = "\n".join(buffer).strip()
+                if chunk_text:
+                    chunks.append(
+                        {
+                            "chunk_id": f"{session_id}_fallback_chunk_{chunk_index:03d}",
+                            "session_id": session_id,
+                            "creation_time": creation_time,
+                            "chunk_index": chunk_index,
+                            "content": chunk_text,
+                            "char_count": len(chunk_text),
+                            "estimated_tokens": max(1, len(chunk_text) // 4),
+                        }
+                    )
+                    chunk_index += 1
+
+                overlap: list[str] = []
+                overlap_count = 0
+                for existing in reversed(buffer):
+                    existing_tokens = max(1, len(existing) // 4)
+                    if overlap and overlap_count + existing_tokens > overlap_tokens:
+                        break
+                    overlap.insert(0, existing)
+                    overlap_count += existing_tokens
+                buffer = overlap
+                buffer_tokens = overlap_count
+
+            buffer.append(line)
+            buffer_tokens += tokens
+
+        if buffer:
+            chunk_text = "\n".join(buffer).strip()
+            if chunk_text:
+                chunks.append(
+                    {
+                        "chunk_id": f"{session_id}_fallback_chunk_{chunk_index:03d}",
+                        "session_id": session_id,
+                        "creation_time": creation_time,
+                        "chunk_index": chunk_index,
+                        "content": chunk_text,
+                        "char_count": len(chunk_text),
+                        "estimated_tokens": max(1, len(chunk_text) // 4),
+                    }
+                )
+        return chunks
 
     def _index_turn_records(
         self,
@@ -98,17 +185,31 @@ class TurtleRAGSystem:
         if not session_id or not turn_records:
             return True
 
-        chunks = self.chunker.chunk_turn_records(
-            session_id=session_id,
-            turn_records=turn_records,
-            creation_time=creation_time or datetime.now().isoformat(),
-        )
+        creation_timestamp = creation_time or datetime.now().isoformat()
+        try:
+            chunk_turn_records = getattr(self.chunker, "chunk_turn_records", None)
+            if not callable(chunk_turn_records):
+                raise AttributeError("chunk_turn_records is not implemented on active chunker")
+            chunks = chunk_turn_records(
+                session_id=session_id,
+                turn_records=turn_records,
+                creation_time=creation_timestamp,
+            )
+        except Exception as e:
+            print(f"LOG: Turn-record chunking unavailable, using fallback chunker for {session_id}: {e}")
+            chunks = self._fallback_chunk_turn_records(
+                session_id=session_id,
+                turn_records=turn_records,
+                creation_time=creation_timestamp,
+            )
+
         if not chunks:
-            return True
+            return False
 
         chunk_contents = [chunk["content"] for chunk in chunks]
         embeddings = self.embedder.embed_for_storage(chunk_contents)
-        self.vector_store.add_chunks(chunks, embeddings)
+        with self._vector_lock:
+            self.vector_store.add_chunks(chunks, embeddings)
         return True
 
     @staticmethod
@@ -243,11 +344,13 @@ class TurtleRAGSystem:
                 except Exception:
                     creation_time = None
 
-            self._index_turn_records(
+            indexed = self._index_turn_records(
                 session_id=session_id,
                 turn_records=turn_records,
                 creation_time=creation_time,
             )
+            if not indexed:
+                return False
             self._clear_temp_session_file(expected_session_id=session_id)
             return True
         except Exception as e:
@@ -335,11 +438,12 @@ class TurtleRAGSystem:
             query_embedding = self.embedder.embed_for_query(user_query)
             
             # Search vector database for top 5 similar chunks
-            similar_chunks = self.vector_store.search_similar(
-                query_embedding, 
-                top_k=5, 
-                threshold=0.3
-            )
+            with self._vector_lock:
+                similar_chunks = self.vector_store.search_similar(
+                    query_embedding,
+                    top_k=5,
+                    threshold=0.3
+                )
             
             if not similar_chunks:
                 return "cannot find in history"
@@ -410,15 +514,19 @@ class TurtleRAGSystem:
         }
 
 
-# Global RAG system instance
-turtle_rag = None
+# Context-local RAG instance to avoid cross-session mutable global sharing.
+_turtle_rag_ctx: contextvars.ContextVar[TurtleRAGSystem | None] = contextvars.ContextVar(
+    "turtle_rag",
+    default=None,
+)
 
 def get_rag_system() -> TurtleRAGSystem:
-    """Get global RAG system instance"""
-    global turtle_rag
-    if turtle_rag is None:
-        turtle_rag = TurtleRAGSystem()
-    return turtle_rag
+    """Get context-local RAG system instance (legacy convenience API)."""
+    rag = _turtle_rag_ctx.get()
+    if rag is None:
+        rag = TurtleRAGSystem()
+        _turtle_rag_ctx.set(rag)
+    return rag
 
 # Convenience functions for easy integration
 async def start_rag_session() -> str:

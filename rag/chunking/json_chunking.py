@@ -60,6 +60,110 @@ class ConversationChunker:
             all_chunks.extend(chunks)
         
         return all_chunks
+
+    def chunk_turn_records(
+        self,
+        *,
+        session_id: str,
+        turn_records: List[Dict[str, Any]],
+        creation_time: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Chunk detailed turn records (user/assistant/tool events) for archived-session indexing.
+
+        Args:
+            session_id: Session identifier
+            turn_records: Ordered turn records extracted from message history
+            creation_time: Session creation timestamp
+
+        Returns:
+            List of chunks with metadata suitable for vector storage
+        """
+        if not turn_records:
+            return []
+
+        normalized_records: List[str] = []
+        for record in turn_records:
+            kind = str(record.get("kind", "unknown")).strip().lower()
+            content = str(record.get("content", "")).strip()
+            if not content:
+                continue
+            tool_name = str(record.get("tool_name", "")).strip()
+            timestamp = str(record.get("timestamp", "")).strip()
+
+            prefix = f"[{kind}]"
+            if tool_name:
+                prefix = f"{prefix}[{tool_name}]"
+            if timestamp:
+                prefix = f"{prefix}[{timestamp}]"
+            normalized_records.append(f"{prefix} {content}")
+
+        if not normalized_records:
+            return []
+
+        chunks: List[Dict[str, Any]] = []
+        chunk_lines: List[str] = []
+        chunk_tokens = 0
+        chunk_start_record = 0
+        chunk_index = 0
+
+        for record_index, line in enumerate(normalized_records):
+            line_tokens = max(1, len(line) // 4)
+            exceeds_chunk = chunk_lines and (chunk_tokens + line_tokens > self.max_chunk_size)
+
+            if exceeds_chunk:
+                chunk_text = "\n".join(chunk_lines).strip()
+                if chunk_text:
+                    chunks.append(
+                        {
+                            "chunk_id": f"{session_id}_turn_chunk_{chunk_index:03d}",
+                            "session_id": session_id,
+                            "creation_time": creation_time,
+                            "chunk_index": chunk_index,
+                            "content": chunk_text,
+                            "char_count": len(chunk_text),
+                            "estimated_tokens": max(1, len(chunk_text) // 4),
+                            "start_record_index": chunk_start_record,
+                            "end_record_index": record_index - 1,
+                        }
+                    )
+                    chunk_index += 1
+
+                # Keep token-bounded overlap from previous chunk.
+                overlap_lines: List[str] = []
+                overlap_tokens = 0
+                for existing in reversed(chunk_lines):
+                    existing_tokens = max(1, len(existing) // 4)
+                    if overlap_tokens + existing_tokens > self.overlap_size and overlap_lines:
+                        break
+                    overlap_lines.insert(0, existing)
+                    overlap_tokens += existing_tokens
+
+                chunk_lines = overlap_lines
+                chunk_tokens = overlap_tokens
+                chunk_start_record = max(0, record_index - len(chunk_lines))
+
+            chunk_lines.append(line)
+            chunk_tokens += line_tokens
+
+        if chunk_lines:
+            chunk_text = "\n".join(chunk_lines).strip()
+            if chunk_text:
+                chunks.append(
+                    {
+                        "chunk_id": f"{session_id}_turn_chunk_{chunk_index:03d}",
+                        "session_id": session_id,
+                        "creation_time": creation_time,
+                        "chunk_index": chunk_index,
+                        "content": chunk_text,
+                        "char_count": len(chunk_text),
+                        "estimated_tokens": max(1, len(chunk_text) // 4),
+                        "start_record_index": chunk_start_record,
+                        "end_record_index": len(normalized_records) - 1,
+                    }
+                )
+
+        return chunks
     
     def _create_conversation_flow(self, conversations: List[Dict[str, str]]) -> str:
         """

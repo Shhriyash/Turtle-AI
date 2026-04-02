@@ -144,7 +144,18 @@ class MemoryStore:
         latest_assistant: str,
     ) -> MemoryCheckpointResult:
         events = self.load_events()
-        profile = self._reduce_profile(events)
+        state = self.load_state()
+        processed_count = int(state.get("last_processed_event_count", 0) or 0)
+
+        # If counters drift (file truncation/manual edits), fall back to full rebuild.
+        if processed_count < 0 or processed_count > len(events):
+            processed_count = 0
+
+        if processed_count == 0:
+            profile = self._reduce_profile(events)
+        else:
+            profile = self.load_profile()
+            profile = self._apply_events_incremental(profile, events[processed_count:])
         self.save_profile(profile)
 
         graph = self.graph_store.rebuild_from_profile(profile)
@@ -157,10 +168,10 @@ class MemoryStore:
             latest_assistant=latest_assistant,
         )
 
-        state = self.load_state()
         state["turns_since_flush"] = 0
         state["tokens_since_flush"] = 0
         state["last_checkpoint_at"] = _utc_now()
+        state["last_processed_event_count"] = len(events)
         self.save_state(state)
         return MemoryCheckpointResult(triggered=True, reason=reason, episode_id=episode_id)
 
@@ -320,7 +331,16 @@ class MemoryStore:
             )
 
         emails = self.EMAIL_REGEX.findall(text)
-        if emails and ("my email" in lower or "my mail" in lower):
+        identity_email_markers = [
+            "my email",
+            "my mail",
+            "email address",
+            "reach me at",
+            "contact me at",
+            "my email is",
+            "my mail is",
+        ]
+        if emails and any(marker in lower for marker in identity_email_markers):
             events.append(
                 self._make_event(
                     session_id=session_id,
@@ -347,7 +367,22 @@ class MemoryStore:
                 )
             )
 
-        if "concise" in lower or "brief" in lower or "short response" in lower:
+        concise_markers = [
+            "keep responses concise",
+            "be concise",
+            "keep it brief",
+            "short response",
+            "brief response",
+            "keep it short",
+        ]
+        detailed_markers = [
+            "be detailed",
+            "in detail",
+            "detailed response",
+            "more detailed",
+            "explain in detail",
+        ]
+        if any(marker in lower for marker in concise_markers):
             events.append(
                 self._make_event(
                     session_id=session_id,
@@ -359,7 +394,7 @@ class MemoryStore:
                     source="explicit",
                 )
             )
-        elif "detailed" in lower or "in detail" in lower:
+        elif any(marker in lower for marker in detailed_markers):
             events.append(
                 self._make_event(
                     session_id=session_id,
@@ -372,7 +407,9 @@ class MemoryStore:
                 )
             )
 
-        if "no humor" in lower or "less humor" in lower:
+        low_humor_markers = ["no humor", "less humor", "avoid humor"]
+        medium_humor_markers = ["more humor", "add humor", "increase humor"]
+        if any(marker in lower for marker in low_humor_markers):
             events.append(
                 self._make_event(
                     session_id=session_id,
@@ -384,7 +421,7 @@ class MemoryStore:
                     source="explicit",
                 )
             )
-        elif "more humor" in lower:
+        elif any(marker in lower for marker in medium_humor_markers):
             events.append(
                 self._make_event(
                     session_id=session_id,
@@ -458,10 +495,78 @@ class MemoryStore:
             elif key == "workflow.email_interaction":
                 email_interactions += int(value.get("count", 0) or 0)
 
-        if recipient_counter:
-            ordered = sorted(recipient_counter.items(), key=lambda item: item[1], reverse=True)
+        reliable_recipients = {recipient: count for recipient, count in recipient_counter.items() if count >= 2}
+        if reliable_recipients:
+            ordered = sorted(reliable_recipients.items(), key=lambda item: item[1], reverse=True)
             profile["workflow"]["common_recipients"] = [item[0] for item in ordered[:5]]
+        else:
+            profile["workflow"]["common_recipients"] = []
         profile["workflow"]["email_interactions"] = email_interactions
+        profile["meta"]["workflow_counters"] = {
+            "common_recipients": recipient_counter,
+            "email_interactions": email_interactions,
+        }
+        profile["meta"]["updated_at"] = _utc_now()
+        return profile
+
+    def _apply_events_incremental(
+        self,
+        profile: dict[str, Any],
+        new_events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        profile = self._normalize_profile_schema(profile)
+        counters = profile["meta"].get("workflow_counters", {})
+        recipient_counter_raw = counters.get("common_recipients", {})
+        if not isinstance(recipient_counter_raw, dict):
+            recipient_counter_raw = {}
+        recipient_counter: dict[str, int] = {
+            str(key).strip().lower(): int(value)
+            for key, value in recipient_counter_raw.items()
+            if str(key).strip()
+        }
+        email_interactions = int(counters.get("email_interactions", profile["workflow"].get("email_interactions", 0) or 0))
+
+        for event in new_events:
+            key = str(event.get("key", ""))
+            value = event.get("value", {})
+            if not isinstance(value, dict):
+                continue
+
+            if key == "identity.email":
+                emails = value.get("emails", [])
+                if isinstance(emails, list):
+                    profile["identity"]["emails"] = self._dedupe_list([str(item).strip() for item in emails if str(item).strip()])
+            elif key == "identity.name" and value.get("name"):
+                profile["identity"]["name"] = str(value["name"]).strip()
+            elif key == "preferences.response_style" and value.get("response_style"):
+                profile["preferences"]["response_style"] = str(value["response_style"]).strip()
+            elif key == "preferences.humor_level" and value.get("humor_level"):
+                profile["preferences"]["humor_level"] = str(value["humor_level"]).strip()
+            elif key == "preferences.email_tone" and value.get("email_tone"):
+                profile["preferences"]["email_tone"] = str(value["email_tone"]).strip()
+            elif key == "workflow.prefers_draft_before_send":
+                profile["workflow"]["prefers_draft_before_send"] = bool(value.get("prefers_draft_before_send"))
+            elif key == "tool_preferences.primary_llm" and value.get("primary_llm"):
+                profile["tool_preferences"]["primary_llm"] = str(value["primary_llm"]).strip()
+            elif key == "workflow.common_recipient" and value.get("recipient"):
+                recipient = str(value["recipient"]).strip().lower()
+                if recipient:
+                    recipient_counter[recipient] = recipient_counter.get(recipient, 0) + 1
+            elif key == "workflow.email_interaction":
+                email_interactions += int(value.get("count", 0) or 0)
+
+        reliable_recipients = {recipient: count for recipient, count in recipient_counter.items() if count >= 2}
+        if reliable_recipients:
+            ordered = sorted(reliable_recipients.items(), key=lambda item: item[1], reverse=True)
+            profile["workflow"]["common_recipients"] = [item[0] for item in ordered[:5]]
+        else:
+            profile["workflow"]["common_recipients"] = []
+        profile["workflow"]["email_interactions"] = email_interactions
+
+        profile["meta"]["workflow_counters"] = {
+            "common_recipients": recipient_counter,
+            "email_interactions": email_interactions,
+        }
         profile["meta"]["updated_at"] = _utc_now()
         return profile
 
@@ -507,7 +612,14 @@ class MemoryStore:
             "preferences": {"response_style": None, "humor_level": None, "email_tone": None},
             "workflow": {"prefers_draft_before_send": None, "common_recipients": [], "email_interactions": 0},
             "tool_preferences": {"primary_llm": None},
-            "meta": {"updated_at": _utc_now(), "version": 1},
+            "meta": {
+                "updated_at": _utc_now(),
+                "version": 1,
+                "workflow_counters": {
+                    "common_recipients": {},
+                    "email_interactions": 0,
+                },
+            },
         }
 
     @staticmethod
@@ -516,7 +628,31 @@ class MemoryStore:
             "turns_since_flush": 0,
             "tokens_since_flush": 0,
             "last_checkpoint_at": None,
+            "last_processed_event_count": 0,
         }
+
+    def _normalize_profile_schema(self, profile: dict[str, Any]) -> dict[str, Any]:
+        normalized = self._default_profile()
+        for section in ["identity", "preferences", "workflow", "tool_preferences", "meta"]:
+            incoming = profile.get(section, {})
+            if isinstance(incoming, dict):
+                normalized[section].update(incoming)
+
+        counters = normalized["meta"].get("workflow_counters", {})
+        if not isinstance(counters, dict):
+            counters = {}
+        recipient_counter = counters.get("common_recipients", {})
+        if not isinstance(recipient_counter, dict):
+            recipient_counter = {}
+        normalized["meta"]["workflow_counters"] = {
+            "common_recipients": {
+                str(key).strip().lower(): int(value)
+                for key, value in recipient_counter.items()
+                if str(key).strip()
+            },
+            "email_interactions": int(counters.get("email_interactions", normalized["workflow"].get("email_interactions", 0) or 0)),
+        }
+        return normalized
 
     @staticmethod
     def _dedupe_list(values: list[str]) -> list[str]:

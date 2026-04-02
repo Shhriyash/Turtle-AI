@@ -33,7 +33,7 @@ from groq import Groq
 from tools.url_tools import fetch_url_content_async
 # Email tools
 # RAG system for conversation memory
-from rag.system.complete_rag import get_rag_system
+from rag.system.complete_rag import TurtleRAGSystem
 from core.llm_client import (
     get_groq_model,
     get_openrouter_models,
@@ -92,6 +92,7 @@ class SharedState:
     http_client: httpx.AsyncClient
     session_store: SessionStore
     memory_store: MemoryStore
+    rag_system: TurtleRAGSystem
     search_cache: dict[str, str] = field(default_factory=dict)
     turn_counter: int = 0
 
@@ -529,13 +530,19 @@ async def send_email_assistant(ctx: RunContext[SharedState], query: str) -> str:
 async def history_tool(ctx: RunContext[SharedState], query: str) -> str:
     """Search conversation history for past discussions and information"""
     try:
-        rag_system = get_rag_system()
-        result = await rag_system.query_history(query)
+        result = await ctx.deps.rag_system.query_history(query)
         
         if result == "cannot find in history":
             return "No relevant information found in our previous conversations."
         else:
-     â€¦73 tokens truncatedâ€¦ng-based conversations"""
+            return result
+            
+    except Exception:
+        return "Unable to access conversation history at the moment."
+
+
+async def text_chat(state: SharedState, return_to_voice: bool = True):
+    """Text chat mode for interactive typing-based conversations"""
     print("\n" + "="*50)
     print("SWITCHED TO TEXT MODE")
     print("Type your messages and press Enter")
@@ -590,7 +597,7 @@ async def history_tool(ctx: RunContext[SharedState], query: str) -> str:
                 state.session_store.replace_messages(message_history)
                 
                 # Add conversation to RAG system for long-term memory
-                rag_system.add_conversation(user_input, final_output)
+                state.rag_system.add_conversation(user_input, final_output)
                 state.memory_store.record_turn(
                     session_id=state.session_store.session_id or "unknown_session",
                     turn_id=turn_id,
@@ -618,7 +625,7 @@ async def history_tool(ctx: RunContext[SharedState], query: str) -> str:
         print(f"Text mode error: {e}")
 
 
-async def voice_response_handler(audio: Tuple[int, np.ndarray], state: SharedState, rag_system) -> bool:
+async def voice_response_handler(audio: Tuple[int, np.ndarray], state: SharedState) -> bool:
     """Handle voice input and generate response using main assistant
     
     Returns:
@@ -669,7 +676,7 @@ async def voice_response_handler(audio: Tuple[int, np.ndarray], state: SharedSta
         state.session_store.replace_messages(response.all_messages())
 
         # Add conversation to RAG system for memory
-        rag_system.add_conversation(transcription, final_output)
+        state.rag_system.add_conversation(transcription, final_output)
         state.memory_store.record_turn(
             session_id=state.session_store.session_id or "unknown_session",
             turn_id=turn_id,
@@ -721,11 +728,9 @@ async def voice_chat():
             flush_tokens=MEMORY_FLUSH_TOKENS,
             profile_max_lines=MEMORY_PROFILE_MAX_LINES,
         )
-        state = SharedState(http_client=client, session_store=session_store, memory_store=memory_store)
+        rag_system = TurtleRAGSystem()
+        state = SharedState(http_client=client, session_store=session_store, memory_store=memory_store, rag_system=rag_system)
         voice_processor = TurtleVoiceProcessor(state)
-        
-        # Initialize RAG system
-        rag_system = get_rag_system()
         if restore_result.had_corrupt_active:
             print("LOG: Corrupt active session files were quarantined before starting a new session")
 
@@ -824,7 +829,7 @@ async def voice_chat():
                         audio_tuple = (RATE, audio_array)
                         
                         # Process the audio through our voice handler
-                        should_switch_to_text = await voice_response_handler(audio_tuple, state, rag_system)
+                        should_switch_to_text = await voice_response_handler(audio_tuple, state)
                         
                         # If mode switch is requested, enter text mode
                         if should_switch_to_text:
@@ -835,7 +840,7 @@ async def voice_chat():
                             print("LOG: Audio system paused for text mode")
                             
                             # Enter text mode
-                            await text_chat(state, rag_system)
+                            await text_chat(state)
                             
                             # Restart voice mode after text chat ends
                             print("\nReturning to voice mode...")
@@ -910,9 +915,8 @@ async def text_mode_chat():
             flush_tokens=MEMORY_FLUSH_TOKENS,
             profile_max_lines=MEMORY_PROFILE_MAX_LINES,
         )
-        state = SharedState(http_client=client, session_store=session_store, memory_store=memory_store)
-
-        rag_system = get_rag_system()
+        rag_system = TurtleRAGSystem()
+        state = SharedState(http_client=client, session_store=session_store, memory_store=memory_store, rag_system=rag_system)
         if restore_result.had_corrupt_active:
             print("LOG: Corrupt active session files were quarantined before starting a new session")
 
@@ -946,7 +950,7 @@ async def text_mode_chat():
             )
 
         try:
-            await text_chat(state, rag_system, return_to_voice=False)
+            await text_chat(state, return_to_voice=False)
         finally:
             if state.session_store.session_id:
                 state.memory_store.force_checkpoint(
