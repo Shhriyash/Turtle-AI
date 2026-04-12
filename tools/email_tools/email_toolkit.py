@@ -51,7 +51,15 @@ class EmailTool:
             smtp_port=smtp_port
         )
     
-    def send_email(self, receiver: str, subject: str, body: str, content_type: str = "plain") -> str:
+    def send_email(
+        self,
+        receiver: str,
+        subject: str,
+        body: str,
+        content_type: str = "plain",
+        cc: str = "",
+        bcc: str = "",
+    ) -> str:
         """
         Send an email to the specified recipient(s).
         
@@ -60,31 +68,43 @@ class EmailTool:
             subject: Email subject line
             body: Email content/body
             content_type: Content type - "plain" or "html"
+            cc: Optional CC recipient email(s) - comma-separated list
+            bcc: Optional BCC recipient email(s) - comma-separated list
             
         Returns:
             Success message or error description
         """
         try:
             # Parse multiple recipients
-            recipients = [email.strip() for email in receiver.split(',') if email.strip()]
+            recipients = EmailRequest.parse_recipients(receiver)
+            cc_recipients = EmailRequest.parse_recipients(cc)
+            bcc_recipients = EmailRequest.parse_recipients(bcc)
             
             if not recipients:
                 return "error: No valid recipient email addresses provided"
             
-            # Validate all recipients
-            invalid_emails = []
-            for email in recipients:
-                if not EmailRequest.is_valid_email(email):
-                    invalid_emails.append(email)
+            # Validate all recipient buckets
+            invalid_to = [email for email in recipients if not EmailRequest.is_valid_email(email)]
+            invalid_cc = [email for email in cc_recipients if not EmailRequest.is_valid_email(email)]
+            invalid_bcc = [email for email in bcc_recipients if not EmailRequest.is_valid_email(email)]
+            invalid_emails: list[str] = []
+            if invalid_to:
+                invalid_emails.append(f"to: {', '.join(invalid_to)}")
+            if invalid_cc:
+                invalid_emails.append(f"cc: {', '.join(invalid_cc)}")
+            if invalid_bcc:
+                invalid_emails.append(f"bcc: {', '.join(invalid_bcc)}")
             
             if invalid_emails:
-                return f"error: Invalid email addresses: {', '.join(invalid_emails)}"
+                return f"error: Invalid email addresses: {'; '.join(invalid_emails)}"
             
             # Create email request for validation
             email_request = EmailRequest(
-                receiver=recipients[0],  # Use first recipient for validation
+                receiver=",".join(recipients),
                 subject=subject,
                 body=body,
+                cc=",".join(cc_recipients),
+                bcc=",".join(bcc_recipients),
                 content_type=content_type
             )
             
@@ -97,7 +117,12 @@ class EmailTool:
                 return "error: No sender passkey configured"
             
             # Send email to all recipients
-            result = self._send_email_internal_multiple(recipients, email_request)
+            result = self._send_email_internal_multiple(
+                recipients,
+                cc_recipients,
+                bcc_recipients,
+                email_request,
+            )
             return result.to_string()
             
         except ValueError as e:
@@ -107,12 +132,20 @@ class EmailTool:
             logger.error(f"Unexpected error in send_email: {e}")
             return f"error: Unexpected error occurred: {e}"
     
-    def _send_email_internal_multiple(self, recipients: list[str], email_request: EmailRequest) -> EmailResult:
+    def _send_email_internal_multiple(
+        self,
+        recipients: list[str],
+        cc_recipients: list[str],
+        bcc_recipients: list[str],
+        email_request: EmailRequest,
+    ) -> EmailResult:
         """
         Internal method to handle email sending to multiple recipients.
         
         Args:
             recipients: List of recipient email addresses
+            cc_recipients: List of cc recipient email addresses
+            bcc_recipients: List of bcc recipient email addresses
             email_request: Validated email request object
             
         Returns:
@@ -123,7 +156,9 @@ class EmailTool:
             msg = EmailMessage()
             msg["Subject"] = email_request.subject
             msg["From"] = f"{self.config.sender_name} <{self.config.sender_email}>"
-            msg["To"] = ", ".join(recipients)  # Multiple recipients in To field
+            msg["To"] = ", ".join(recipients)
+            if cc_recipients:
+                msg["Cc"] = ", ".join(cc_recipients)
             
             # Set content based on type
             if email_request.content_type == "html":
@@ -131,20 +166,37 @@ class EmailTool:
             else:
                 msg.set_content(email_request.body)
             
-            logger.info(f"Attempting to send email to {len(recipients)} recipients: {', '.join(recipients)}")
+            all_recipients = recipients + cc_recipients + bcc_recipients
+            logger.info(
+                "Attempting to send email to %s recipients (to=%s, cc=%s, bcc=%s)",
+                len(all_recipients),
+                len(recipients),
+                len(cc_recipients),
+                len(bcc_recipients),
+            )
             
             # Send email via Gmail SMTP
             with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port) as smtp:
                 smtp.login(self.config.sender_email, self.config.sender_passkey)
-                smtp.send_message(msg)
+                smtp.send_message(msg, to_addrs=all_recipients)
             
-            logger.info(f"Email sent successfully to {len(recipients)} recipients")
+            logger.info(
+                "Email sent successfully to %s recipients (to=%s, cc=%s, bcc=%s)",
+                len(all_recipients),
+                len(recipients),
+                len(cc_recipients),
+                len(bcc_recipients),
+            )
             
-            recipient_list = ", ".join(recipients) if len(recipients) <= 3 else f"{', '.join(recipients[:3])} and {len(recipients)-3} more"
+            recipient_list = (
+                ", ".join(recipients)
+                if len(recipients) <= 3
+                else f"{', '.join(recipients[:3])} and {len(recipients)-3} more"
+            )
             
             return EmailResult(
                 success=True,
-                message=f"Email sent successfully to {len(recipients)} recipient(s)",
+                message=f"Email sent successfully to {len(all_recipients)} recipient(s)",
                 receiver=recipient_list,
                 subject=email_request.subject
             )
@@ -201,6 +253,10 @@ class EmailTool:
             msg["Subject"] = email_request.subject
             msg["From"] = f"{self.config.sender_name} <{self.config.sender_email}>"
             msg["To"] = email_request.receiver
+            cc_recipients = EmailRequest.parse_recipients(email_request.cc)
+            bcc_recipients = EmailRequest.parse_recipients(email_request.bcc)
+            if cc_recipients:
+                msg["Cc"] = ", ".join(cc_recipients)
             
             # Set content based on type
             if email_request.content_type == "html":
@@ -213,7 +269,10 @@ class EmailTool:
             # Send email via Gmail SMTP
             with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port) as smtp:
                 smtp.login(self.config.sender_email, self.config.sender_passkey)
-                smtp.send_message(msg)
+                smtp.send_message(
+                    msg,
+                    to_addrs=EmailRequest.parse_recipients(email_request.receiver) + cc_recipients + bcc_recipients,
+                )
             
             logger.info(f"Email sent successfully to {email_request.receiver}")
             

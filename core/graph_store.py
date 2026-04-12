@@ -19,7 +19,11 @@ class GraphContextQuery:
 
 
 class GraphStore:
-    """Derived personalization graph built from canonical profile/events."""
+    """DEPRECATED: legacy derived graph memory.
+
+    This store remains only for compatibility with the JSON fallback memory path.
+    Primary personalization now lives in Markdown personal memory files.
+    """
 
     def __init__(self, graph_path: Path):
         self.graph_path = graph_path

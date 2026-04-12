@@ -19,6 +19,18 @@ OPENROUTER_KEY_ENV_VARS = [
 ]
 
 
+def _flatten_exception_messages(exc: Exception) -> list[str]:
+    messages: list[str] = [str(exc).lower()]
+    nested = getattr(exc, "exceptions", None)
+    if isinstance(nested, tuple):
+        for child in nested:
+            if isinstance(child, Exception):
+                messages.extend(_flatten_exception_messages(child))
+            else:
+                messages.append(str(child).lower())
+    return messages
+
+
 def get_openrouter_keys() -> list[str]:
     keys: list[str] = []
     for name in OPENROUTER_KEY_ENV_VARS:
@@ -73,17 +85,57 @@ def is_rate_limit_error(exc: Exception) -> bool:
 
 
 def is_key_failure_error(exc: Exception) -> bool:
+    harmony_tool_render_tokens = [
+        "tools should have a name",
+        "failed to template request",
+        "render tokens with harmony",
+        "harmonyerror",
+        "encodingerror",
+    ]
     if isinstance(exc, ModelHTTPError):
-        return exc.status_code in {401, 403, 404, 429}
+        if exc.status_code in {401, 403, 404, 429}:
+            return True
+        if exc.status_code == 400:
+            # Providers occasionally return request-template / tool-render compatibility
+            # failures as HTTP 400 for a specific model. Treat as fallback-eligible.
+            message = str(exc).lower()
+            if any(token in message for token in harmony_tool_render_tokens):
+                return True
+            return True
+        return False
     if isinstance(exc, ModelAPIError):
-        message = str(exc).lower()
-        return any(token in message for token in ["rate limit", "rate_limit", "invalid api key", "unauthorized", "tool_choice", "no endpoints found"])
-    message = str(exc).lower()
-    return any(token in message for token in ["rate limit", "rate_limit", "invalid api key", "unauthorized", "tool_choice", "no endpoints found"])
+        messages = _flatten_exception_messages(exc)
+        return any(
+            token in message
+            for message in messages
+            for token in [
+                "rate limit",
+                "rate_limit",
+                "invalid api key",
+                "unauthorized",
+                "tool_choice",
+                "no endpoints found",
+                *harmony_tool_render_tokens,
+            ]
+        )
+    messages = _flatten_exception_messages(exc)
+    return any(
+        token in message
+        for message in messages
+        for token in [
+            "rate limit",
+            "rate_limit",
+            "invalid api key",
+            "unauthorized",
+            "tool_choice",
+            "no endpoints found",
+            *harmony_tool_render_tokens,
+        ]
+    )
 
 
-def _fallback_log() -> None:
-    print("LOG: Model key failed or rate limited, trying next fallback")
+def _fallback_log(exc: Exception) -> None:
+    print(f"LOG: Model failed ({exc.__class__.__name__}), trying next fallback")
 
 
 async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any], *args: Any, **kwargs: Any):
@@ -95,7 +147,7 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
         except Exception as exc:
             last_exc = exc
             if idx < len(agents) - 1 and is_key_failure_error(exc):
-                _fallback_log()
+                _fallback_log(exc)
                 continue
             raise
     if last_exc:
@@ -112,7 +164,7 @@ def run_agent_sync_with_fallbacks(primary_agent: Any, fallback_agents: list[Any]
         except Exception as exc:
             last_exc = exc
             if idx < len(agents) - 1 and is_key_failure_error(exc):
-                _fallback_log()
+                _fallback_log(exc)
                 continue
             raise
     if last_exc:

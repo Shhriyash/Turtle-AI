@@ -43,6 +43,7 @@ def _extract_name(user_text: str) -> str | None:
     patterns = [
         r"\bmy name is\s+([a-zA-Z][a-zA-Z\s'-]{1,40})",
         r"\bi am\s+([a-zA-Z][a-zA-Z\s'-]{1,40})",
+        r"\bi['’]?m\s+([a-zA-Z][a-zA-Z\s'-]{1,40})",
         r"\bcall me\s+([a-zA-Z][a-zA-Z\s'-]{1,40})",
         r"\bname\s*[:\-]\s*([a-zA-Z][a-zA-Z\s'-]{1,40})",
     ]
@@ -51,6 +52,12 @@ def _extract_name(user_text: str) -> str | None:
         if not match:
             continue
         candidate = match.group(1).strip(" .,!?:;")
+        candidate = re.split(
+            r"\b(?:and|but|because|email|mail|reach me|contact me|from)\b",
+            candidate,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip(" .,!?:;")
         candidate = " ".join(candidate.split())
         words = candidate.split()
         if not words or len(words) > 4:

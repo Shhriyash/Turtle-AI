@@ -1,10 +1,10 @@
-# Web Search Root Cause
+﻿# Web Search Root Cause
 
 ## Symptom
 
 The web search flow was repeatedly calling `search_web` for the same user request and often ended with:
 
-`I’m sorry, but I’m unable to retrieve that information at the moment.`
+`Iâ€™m sorry, but Iâ€™m unable to retrieve that information at the moment.`
 
 This consumed many requests and tokens without producing a useful answer.
 

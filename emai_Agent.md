@@ -1,4 +1,4 @@
-# Email Agent Architecture
+﻿# Email Agent Architecture
 
 ## Purpose
 
@@ -9,9 +9,9 @@ Main agent responsibilities:
 - delegate to `send_email_assistant`
 
 Email flow responsibilities:
-- extract recipients, subject, and content
+- extract recipients/cc/bcc/subject/content
 - keep partial state across turns
-- validate required fields locally
+- validate required fields
 - send immediately when complete
 - ask only for missing fields when incomplete
 
@@ -20,7 +20,7 @@ Email flow responsibilities:
 ### 1. Main delegator tool
 
 File:
-- `G:\dem\Turtle Voice\turtle\apps\turtle_voice.py`
+- [apps/turtle_voice.py](G:\dem\Turtle Voice\turtle\apps\turtle_voice.py)
 
 Function:
 - `send_email_assistant(ctx, query)`
@@ -29,52 +29,38 @@ Behavior:
 - receives user request from `main_assistant`
 - loads pending email state from `SessionStore`
 - runs deterministic extraction hints
-- calls `email_agent` for plain-text JSON extraction
-- parses and merges extraction with pending state
+- calls `email_agent` for structured extraction
+- merges extraction with pending state
 - validates recipients and required fields
-- sends email directly or asks for missing info
+- sends email or asks for missing info
 
 ### 2. Email extraction agent
 
 File:
-- `G:\dem\Turtle Voice\turtle\apps\turtle_voice.py`
+- [apps/turtle_voice.py](G:\dem\Turtle Voice\turtle\apps\turtle_voice.py)
 
 Object:
-- `email_agent = Agent(..., output_type=str, ...)`
+- `email_agent = Agent(..., output_type=EmailExtractionOutput, ...)`
 
 Prompt file:
-- `G:\dem\Turtle Voice\turtle\core\system_prompts\email_agent.txt`
+- [core/system_prompts/email_agent.txt](G:\dem\Turtle Voice\turtle\core\system_prompts\email_agent.txt)
 
 Role:
 - extraction only
-- returns JSON text only
 - no direct SMTP side effects
-- no final send ownership
 
-### 3. Extraction parser
-
-File:
-- `G:\dem\Turtle Voice\turtle\core\email_flow.py`
-
-Functions:
-- `parse_email_extraction_response(response_text)`
-- `EmailExtractionOutput`
-
-Behavior:
-- parses plain JSON output from the email extractor
-- tolerates fenced JSON or surrounding text
-- falls back to empty fields on malformed output
-
-### 4. Session-backed pending state
+### 3. Session-backed pending state
 
 File:
-- `G:\dem\Turtle Voice\turtle\core\session_store.py`
+- [core/session_store.py](G:\dem\Turtle Voice\turtle\core\session_store.py)
 
 State key:
 - `pending_email`
 
 Fields:
 - `recipients: list[str]`
+- `cc_recipients: list[str]`
+- `bcc_recipients: list[str]`
 - `subject: str`
 - `content: str`
 
@@ -87,31 +73,41 @@ Persistence:
 - stored in active session manifest
 - survives app restart while session is active
 
-### 5. Direct send path
+### 4. Email send agent
 
-Files:
-- `G:\dem\Turtle Voice\turtle\apps\turtle_voice.py`
-- `G:\dem\Turtle Voice\turtle\core\email_flow.py`
-- `G:\dem\Turtle Voice\turtle\tools\email_tools\email_toolkit.py`
+File:
+- [apps/turtle_voice.py](G:\dem\Turtle Voice\turtle\apps\turtle_voice.py)
 
-Functions:
-- `validate_send_email_args(recipients, subject, content)`
-- `send_email_now(details)`
+Object:
+- `email_send_agent = Agent(..., output_type=str, ...)`
+
+Prompt file:
+- [core/system_prompts/email_send_agent.txt](G:\dem\Turtle Voice\turtle\core\system_prompts\email_send_agent.txt)
 
 Role:
-- validate exact extracted fields in Python
-- call SMTP send directly without a second LLM or tool-calling hop
+- call the validated send tool with exact values
+- retry argument formatting if validation rejects the call
+
+### 5. Validated send path
+
+Files:
+- [apps/turtle_voice.py](G:\dem\Turtle Voice\turtle\apps\turtle_voice.py)
+- [tools/email_tools/email_toolkit.py](G:\dem\Turtle Voice\turtle\tools\email_tools\email_toolkit.py)
+
+Functions:
+- `send_email(ctx, recipients, subject, content)`
+- `_send_email_now(details)`
 
 Behavior:
-- reject missing recipient, subject, or body before send
-- reject invalid email formats before send
-- load SMTP config via `create_email_tool_from_env()`
-- send through `EmailTool.send_email(...)`
-- return success or failure text to the main agent
+- `send_email` is guarded by `args_validator`
+- validator raises `ModelRetry` for missing or invalid fields
+- loads SMTP config via `create_email_tool_from_env()`
+- sends through `EmailTool.send_email(...)`
+- returns success/failure message
 
 ## Input and output formats
 
-### Input into `send_email_assistant`
+## Input into `send_email_assistant`
 
 Type:
 - `query: str`
@@ -120,34 +116,39 @@ Example:
 - `"Send an email to shriyashbeohar1 at the rate gmail.com subject hello body world"`
 
 Context available:
-- full message history from main-agent run
+- full message history from main-agent run (`ctx.messages`)
 - pending email state from session store
 
-### Email agent output
+## Email agent structured output
 
-Type:
-- `str`
+Model:
+- `EmailExtractionOutput`
 
-Expected JSON shape:
-- `{"recipients": ["user@example.com"], "subject": "hello", "content": "world", "send_intent": true}`
+Schema:
+- `recipients: list[str]`
+- `cc_recipients: list[str]`
+- `bcc_recipients: list[str]`
+- `subject: str`
+- `content: str`
+- `send_intent: bool`
 
 Notes:
-- prompt requires JSON only
-- parser still tolerates fenced JSON or minor output noise
+- extraction prompt requires empty strings for missing fields
+- no free-form explanation in extraction output
 
-### Output from `send_email_assistant`
+## Output from `send_email_assistant`
 
 Type:
 - `str`
 
 Forms:
 - success:
-  - includes recipient list and subject
+  - includes to/cc/bcc (when present) and subject
 - missing fields:
-  - explicit prompt listing only missing items
-- invalid recipient format:
-  - asks user to provide recipient again
-- config or send failure:
+  - explicit prompt listing only missing required items (`to`, `subject`, `content`)
+- invalid email format:
+  - asks user to provide corrected address (to/cc/bcc)
+- config/send failure:
   - explicit failure message
 
 ## Runtime flow
@@ -155,23 +156,24 @@ Forms:
 1. Main agent calls `send_email_assistant`.
 2. Tool reads pending state.
 3. Deterministic parser extracts:
-- spoken email normalization (`at the rate`, `dot`)
-- email regex recipients
-- subject and content markers
-4. Email agent extracts JSON fields from latest request plus context.
-5. Tool parses JSON into `EmailExtractionOutput`.
-6. Tool merges:
-- pending state
-- deterministic extraction
-- LLM extraction
-7. Tool validates recipients.
-8. If missing required fields:
-- persist pending state
-- ask only for missing parts
-9. If complete:
-- run local validation
-- call `send_email_now(...)` directly
-- clear pending state on success
+   - spoken email normalization (`at the rate`, `dot`)
+   - email regex recipients
+   - labeled `cc` and `bcc` recipients
+   - subject/content markers
+4. Email agent extracts structured fields from latest request + context.
+5. Tool merges:
+   - pending state
+   - deterministic extraction
+   - LLM extraction
+6. Tool validates recipients.
+   - validates `to`, `cc`, and `bcc` formats
+7. If missing required fields:
+   - persist pending state
+   - ask only for missing parts
+8. If complete:
+   - call `email_send_agent`
+   - `email_send_agent` calls validated `send_email` tool
+   - clear pending state on success
 
 ## History access model
 
@@ -179,7 +181,7 @@ Main agent history:
 - maintained in `SessionStore.message_history`
 
 Delegated email history:
-- `send_email_assistant` passes current run context when calling `email_agent`
+- `send_email_assistant` passes `message_history=ctx.messages` when calling `email_agent`
 
 Implication:
 - email extraction can resolve short references using current conversation context
@@ -188,9 +190,9 @@ Implication:
 ## Reliability guards
 
 - deterministic recipient normalization before validation
-- no structured-output tool path in the extractor
-- plain JSON parsing under local control
+- deterministic cc/bcc normalization before validation
+- structured extraction output (`EmailExtractionOutput`)
 - pending state persisted per active session
 - missing-field gating before SMTP call
-- invalid-recipient gating before SMTP call
-- no second LLM hop for final send
+- invalid-address gating (to/cc/bcc) before SMTP call
+- `args_validator + ModelRetry` on the send tool path

@@ -29,7 +29,16 @@ class MemoryCheckpointResult:
 
 
 class MemoryStore:
-    """Canonical persistent memory built on JSON/JSONL files."""
+    """DEPRECATED runtime path: JSON/JSONL compatibility memory store.
+
+    The active architecture now uses:
+    - SessionStore for active task continuity
+    - Markdown personal memory for durable personalization
+    - TaskHistoryStore + RAG for episodic/task recall
+
+    This class is retained as a fallback/read-compatibility layer and should
+    be removed once migration is fully complete.
+    """
 
     EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
@@ -44,6 +53,7 @@ class MemoryStore:
         flush_turns: int,
         flush_tokens: int,
         profile_max_lines: int,
+        write_enabled: bool = True,
     ) -> None:
         self.profile_path = profile_path
         self.events_path = events_path
@@ -53,6 +63,7 @@ class MemoryStore:
         self.flush_turns = max(1, flush_turns)
         self.flush_tokens = max(1000, flush_tokens)
         self.profile_max_lines = max(1, profile_max_lines)
+        self.write_enabled = bool(write_enabled)
         self._ensure_files()
 
     def record_turn(
@@ -64,6 +75,8 @@ class MemoryStore:
         assistant_text: str,
         task_type: str,
     ) -> MemoryCheckpointResult:
+        if not self.write_enabled:
+            return MemoryCheckpointResult(triggered=False, reason="write_disabled")
         events = self._extract_events(
             session_id=session_id,
             turn_id=turn_id,
@@ -90,51 +103,6 @@ class MemoryStore:
             latest_assistant=assistant_text,
         )
 
-    def record_task_outcome(
-        self,
-        *,
-        session_id: str,
-        turn_id: str,
-        task_type: str,
-        summary: str,
-        success: bool,
-    ) -> MemoryCheckpointResult:
-        event = self._make_event(
-            session_id=session_id,
-            turn_id=turn_id,
-            kind="task_outcome",
-            key=f"task.{task_type}",
-            value={"success": success, "summary": summary[:280]},
-            confidence=1.0 if success else 0.6,
-            source="explicit",
-        )
-        self.append_events([event])
-        return self.checkpoint(
-            session_id=session_id,
-            reason=f"task_{task_type}_{'success' if success else 'failure'}",
-            latest_user="",
-            latest_assistant=summary,
-        )
-
-    def record_common_recipients(self, *, session_id: str, turn_id: str, recipients: list[str]) -> None:
-        events: list[dict[str, Any]] = []
-        for recipient in recipients:
-            normalized = str(recipient).strip().lower()
-            if not normalized:
-                continue
-            events.append(
-                self._make_event(
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    kind="behavior",
-                    key="workflow.common_recipient",
-                    value={"recipient": normalized},
-                    confidence=0.7,
-                    source="inferred",
-                )
-            )
-        self.append_events(events)
-
     def checkpoint(
         self,
         *,
@@ -143,6 +111,8 @@ class MemoryStore:
         latest_user: str,
         latest_assistant: str,
     ) -> MemoryCheckpointResult:
+        if not self.write_enabled:
+            return MemoryCheckpointResult(triggered=False, reason="write_disabled")
         events = self.load_events()
         state = self.load_state()
         processed_count = int(state.get("last_processed_event_count", 0) or 0)
@@ -179,6 +149,7 @@ class MemoryStore:
         return self.checkpoint(session_id=session_id, reason=reason, latest_user="", latest_assistant="")
 
     def get_context_lines(self, *, task_type: str, query: str) -> list[str]:
+        """Legacy fallback context builder (includes deprecated graph context)."""
         profile = self.load_profile()
         lines: list[str] = []
         identity = profile.get("identity", {})
@@ -232,6 +203,8 @@ class MemoryStore:
         return self._default_profile()
 
     def save_profile(self, profile: dict[str, Any]) -> None:
+        if not self.write_enabled:
+            return
         profile["meta"] = profile.get("meta", {})
         profile["meta"]["updated_at"] = _utc_now()
         profile["meta"]["version"] = 1
@@ -255,6 +228,8 @@ class MemoryStore:
         return events
 
     def append_events(self, events: list[dict[str, Any]]) -> None:
+        if not self.write_enabled:
+            return
         if not events:
             return
         self.events_path.parent.mkdir(parents=True, exist_ok=True)
@@ -276,6 +251,8 @@ class MemoryStore:
         return self._default_state()
 
     def save_state(self, state: dict[str, Any]) -> None:
+        if not self.write_enabled:
+            return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
@@ -301,6 +278,8 @@ class MemoryStore:
             "tags": [reason],
             "created_at": _utc_now(),
         }
+        if not self.write_enabled:
+            return episode_id
         with self.episodes_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(payload, ensure_ascii=False) + "\n")
         return episode_id
@@ -316,19 +295,6 @@ class MemoryStore:
         text = user_text.strip()
         lower = text.lower()
         events: list[dict[str, Any]] = []
-
-        if task_type == "email":
-            events.append(
-                self._make_event(
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    kind="behavior",
-                    key="workflow.email_interaction",
-                    value={"count": 1},
-                    confidence=0.5,
-                    source="inferred",
-                )
-            )
 
         emails = self.EMAIL_REGEX.findall(text)
         identity_email_markers = [
@@ -594,6 +560,8 @@ class MemoryStore:
         }
 
     def _ensure_files(self) -> None:
+        if not self.write_enabled:
+            return
         self.profile_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.profile_path.exists():
             self.save_profile(self._default_profile())

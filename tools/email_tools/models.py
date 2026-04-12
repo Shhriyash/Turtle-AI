@@ -23,18 +23,34 @@ class EmailRequest:
     receiver: str
     subject: str
     body: str
+    cc: str = ""
+    bcc: str = ""
     content_type: Literal["plain", "html"] = "plain"
     
     def __post_init__(self):
         """Validate email request data"""
         if not self.receiver:
             raise ValueError("Receiver email is required")
-        if not self.is_valid_email(self.receiver):
-            raise ValueError(f"Invalid receiver email format: {self.receiver}")
+        receivers = self.parse_recipients(self.receiver)
+        if not receivers:
+            raise ValueError("Receiver email is required")
+        invalid_receivers = [email for email in receivers if not self.is_valid_email(email)]
+        if invalid_receivers:
+            raise ValueError(f"Invalid receiver email format: {', '.join(invalid_receivers)}")
+        invalid_cc = [email for email in self.parse_recipients(self.cc) if not self.is_valid_email(email)]
+        if invalid_cc:
+            raise ValueError(f"Invalid cc email format: {', '.join(invalid_cc)}")
+        invalid_bcc = [email for email in self.parse_recipients(self.bcc) if not self.is_valid_email(email)]
+        if invalid_bcc:
+            raise ValueError(f"Invalid bcc email format: {', '.join(invalid_bcc)}")
         if not self.subject:
             raise ValueError("Email subject is required")
         if not self.body:
             raise ValueError("Email body is required")
+
+    @staticmethod
+    def parse_recipients(recipients: str) -> list[str]:
+        return [email.strip() for email in recipients.split(",") if email.strip()]
     
     @staticmethod
     def is_valid_email(email: str) -> bool:

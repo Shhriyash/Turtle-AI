@@ -9,26 +9,26 @@ A multi-agent personal assistant with conversation memory, web search, URL analy
 - **URL Analysis**: Custom content extraction from web pages
 - **Email Integration**: Automated email sending with professional formatting
 - **Multi-Agent Architecture**: Specialized agents for different tasks
-- **LLM Fallback**: OpenRouter primary with API key rotation (1 -> 2 -> 3 on rate limit), optional Groq fallback
+- **LLM Fallback**: OpenRouter key rotation plus optional Groq primary/fallback models
 
 ## Architecture
 
 ### Core Components
 
 ```
-Main Assistant (OpenRouter nemotron-3-nano-30b-a3b:free)
-|-- Web Search Agent (OpenRouter + WebSearchTool)
-|-- Email Agent (OpenRouter)
+Main Assistant (Pydantic AI + core/llm_client model selection)
+|-- Web Search Tool (DuckDuckGo HTML + parser)
+|-- Email Specialist Agent
 |-- Custom URL Tools (BeautifulSoup + httpx)
 `-- RAG Memory System (FAISS + Cohere embeddings)
 ```
 
 ### Agent Specialization
 
-- **Main Assistant**: Delegates tasks and maintains conversation flow
-- **Web Search Agent**: Handles real-time information queries
-- **Email Agent**: Manages email composition and sending
+- **Main Assistant**: Handles routing, tools, and conversation flow
+- **Email Specialist Agent**: Extracts/merges email intent and sends via SMTP tool
 - **RAG System**: Provides conversation memory across sessions
+- **Tool Layer**: Web search and URL extraction are implemented as tools, not separate LLM agents
 
 ## Conversation Memory System
 
@@ -86,11 +86,11 @@ tools/url_tools/
 `-- __init__.py    # Clean interface
 ```
 
-#### 2. Specialized Agent Delegation
-**Instead of relying on single-agent tools:**
-- **Web Search Agent**: Dedicated OpenRouter model optimized for search (configurable)
+#### 2. Specialized Delegation
+**Current delegation model:**
 - **Email Agent**: Specialized for email composition and sending
-- **Context Preservation**: Each agent maintains conversation context
+- **Search/URL Tools**: Implemented directly as tools in main assistant
+- **Context Preservation**: Main assistant and delegated calls share session context
 
 #### 3. RAG Memory System
 **Replaced limited built-in memory with comprehensive solution:**
@@ -126,13 +126,9 @@ lxml              # XML parser
 ### Model Providers
 ```
 openai            # OpenRouter client dependency (installed via pydantic-ai)
-groq              # Fallback LLM + Whisper STT
-deepgram-sdk      # TTS (legacy/optional)
+groq              # Optional primary/fallback LLM + Whisper STT
+deepgram-sdk      # Primary TTS provider
 fastrtc           # RTC + VAD experiments
-
-# Legacy / optional
-google-genai      # Gemini models (Vertex AI)
-google-auth       # Vertex authentication
 ```
 
 ### Voice Stack
@@ -142,7 +138,7 @@ pydub             # Audio playback
 sounddevice       # Streaming audio playback
 scipy             # Audio I/O utilities
 keyboard          # Hotkey recording control
-groq TTS          # canopylabs/orpheus-v1-english (default)
+groq TTS          # fallback voice synthesis
 ```
 
 ## Environment Setup
@@ -161,9 +157,12 @@ OPENROUTER_APP_URL="your_app_url"   # optional
 OPENROUTER_APP_TITLE="your_app_title"  # optional
 
 # OpenRouter key rotation is used for LLM (key 1 -> 2 -> 3 on rate limit).
+# Current runtime expects at least one OpenRouter key to initialize the model chain.
 
 # Fallback LLM + STT (Groq Whisper)
-# Leave GROQ_API_KEY* empty to disable fallback LLM usage
+# GROQ_PRIMARY_MODEL is used when GROQ_API_KEY/GROQ_API_KEY2 is available.
+# Leave GROQ_API_KEY* empty to disable Groq model usage.
+GROQ_PRIMARY_MODEL=openai/gpt-oss-120b
 GROQ_FALLBACK_MODEL=llama-3.1-8b-instant
 GROQ_API_KEY2="your_groq_api_key"
 GROQ_API_KEY="your_groq_api_key"
@@ -190,10 +189,6 @@ TURTLE_EMAIL_PASSKEY="your_app_password"
 
 # Optional monitoring
 LOGFIRE_TOKEN=your_logfire_token
-
-# Legacy / unused (Vertex AI)
-GOOGLE_CLOUD_PROJECT=your_gcp_project_id
-GOOGLE_CLOUD_LOCATION=global
 ```
 
 ### Installation
@@ -215,7 +210,6 @@ python rtc_vad/vad_simple.py
 python rtc_vad/vad_fastrtc.py
 python rtc_vad/fastrtc_real.py
 python tools/tts/tts.py
-python tests/rag_agent_test.py
 ```
 
 ### Example Conversations
@@ -267,15 +261,16 @@ turtle/
 |-- tools/
 |   |-- url_tools/               # Custom URL extraction
 |   |-- email_tools/             # Email configuration + SMTP
-|   `-- tts/                     # TTS utilities (Deepgram streaming)
+|   `-- tts/                     # TTS utilities (Deepgram + Groq fallback)
 |       |-- client.py
 |       `-- tts.py
 |-- core/
 |   |-- env.py                   # .env loader (shared)
-|   |-- llm_client.py            # OpenRouter + Groq fallback models
+|   |-- llm_client.py            # Model selection + fallback chain
 |   |-- system_prompts/          # System prompt references
-|   |   `-- turtle_system_prompt.txt
-|   |-- vertex_genai_client.py   # Legacy Vertex/Gemini client (optional)
+|   |   |-- main_assistant.txt
+|   |   |-- email_agent.txt
+|   |   `-- rag_agent.txt
 |   `-- paths.py                 # Standard data/output paths
 |-- data/
 |   `-- rag/                     # Vector storage directory
@@ -285,7 +280,7 @@ turtle/
 |           `-- chunk_metadata.json
 |-- output/                      # Runtime outputs (audio, logs, exports)
 |-- tests/
-|   `-- rag_agent_test.py        # RAG test agent
+|   `-- *.py                     # Unit/integration test modules
 |-- VAD_COMPARISON.md
 |-- requirements.txt
 `-- README.md
@@ -308,7 +303,7 @@ This repo includes three voice/VAD scripts in `rtc_vad/`. They share the same st
 
 ### Technique Details
 - `vad_simple.py` uses a simple RMS energy threshold and stops on silence. It is easy to tune but not robust to noisy environments.
-- `vad_fastrtc.py` integrates FastRTCâ€™s Silero VAD in the handler, but the current console mode still records fixed chunks before STT.
+- `vad_fastrtc.py` integrates FastRTC's Silero VAD in the handler, but the current console mode still records fixed chunks before STT.
 - `fastrtc_real.py` exposes more VAD control and timing logs, and is the most suitable base for true low-latency streaming.
 
 ### Notes on Latency

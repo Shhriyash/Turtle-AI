@@ -9,7 +9,7 @@ import os
 import json
 import numpy as np
 import faiss
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
 from core.paths import RAG_VECTOR_DIR, ensure_dirs
@@ -82,11 +82,81 @@ class VectorStorage:
         if self.metadata_path.exists():
             try:
                 with open(self.metadata_path, 'r', encoding='utf-8') as f:
-                    self.chunk_metadata = json.load(f)
+                    raw_metadata = json.load(f)
+                if not isinstance(raw_metadata, list):
+                    self.chunk_metadata = []
+                    self._save_metadata()
+                    return
+
+                normalized: list[Dict[str, Any]] = []
+                dirty = False
+                for idx, entry in enumerate(raw_metadata):
+                    normalized_entry = self._normalize_metadata_entry(entry, fallback_vector_index=idx)
+                    if normalized_entry != entry:
+                        dirty = True
+                    normalized.append(normalized_entry)
+
+                self.chunk_metadata = normalized
+                if self._realign_vector_indices():
+                    dirty = True
+                if dirty:
+                    self._save_metadata()
             except Exception as e:
                 self.chunk_metadata = []
         else:
             self.chunk_metadata = []
+
+    def _normalize_metadata_entry(self, entry: Any, *, fallback_vector_index: int) -> Dict[str, Any]:
+        if not isinstance(entry, dict):
+            entry = {}
+
+        vector_index = entry.get("vector_index", fallback_vector_index)
+        try:
+            vector_index = int(vector_index)
+        except Exception:
+            vector_index = fallback_vector_index
+
+        session_id = str(entry.get("session_id", "unknown")).strip() or "unknown"
+        content = entry.get("content", "")
+        if not isinstance(content, str):
+            content = str(content)
+
+        normalized: Dict[str, Any] = {
+            "vector_index": vector_index,
+            "session_id": session_id,
+            "content": content,
+        }
+        if bool(entry.get("deleted", False)):
+            normalized["deleted"] = True
+        if bool(entry.get("orphaned", False)):
+            normalized["orphaned"] = True
+        return normalized
+
+    def _realign_vector_indices(self) -> bool:
+        changed = False
+        for idx, metadata in enumerate(self.chunk_metadata):
+            if metadata.get("vector_index") != idx:
+                metadata["vector_index"] = idx
+                changed = True
+        return changed
+
+    @staticmethod
+    def _build_metadata_entry(chunk: Dict[str, Any], *, vector_index: int) -> Dict[str, Any]:
+        session_id = str(chunk.get("session_id", "unknown")).strip() or "unknown"
+        content = chunk.get("content", "")
+        if not isinstance(content, str):
+            content = str(content)
+
+        entry: Dict[str, Any] = {
+            "vector_index": vector_index,
+            "session_id": session_id,
+            "content": content,
+        }
+        if bool(chunk.get("deleted", False)):
+            entry["deleted"] = True
+        if bool(chunk.get("orphaned", False)):
+            entry["orphaned"] = True
+        return entry
     
     def _save_index(self):
         """Save FAISS index to disk"""
@@ -128,18 +198,13 @@ class VectorStorage:
             self.chunk_metadata.append(
                 {
                     "vector_index": idx,
-                    "chunk_id": f"orphan_vector_{idx}",
                     "session_id": "unknown",
-                    "creation_time": datetime.now().isoformat(),
                     "content": "",
-                    "chunk_index": idx,
-                    "char_count": 0,
-                    "estimated_tokens": 0,
-                    "added_timestamp": datetime.now().isoformat(),
                     "deleted": True,
                     "orphaned": True,
                 }
             )
+        self._realign_vector_indices()
         self._save_metadata()
     
     def _normalize_embeddings(self, embeddings: np.ndarray) -> np.ndarray:
@@ -183,17 +248,7 @@ class VectorStorage:
         # Add metadata with vector indices
         start_idx = len(self.chunk_metadata)
         for i, chunk in enumerate(chunks):
-            metadata = {
-                "vector_index": start_idx + i,
-                "chunk_id": chunk.get("chunk_id", f"chunk_{start_idx + i}"),
-                "session_id": chunk.get("session_id", "unknown"),
-                "creation_time": chunk.get("creation_time", datetime.now().isoformat()),
-                "content": chunk.get("content", ""),
-                "chunk_index": chunk.get("chunk_index", i),
-                "char_count": chunk.get("char_count", len(chunk.get("content", ""))),
-                "estimated_tokens": chunk.get("estimated_tokens", 0),
-                "added_timestamp": datetime.now().isoformat()
-            }
+            metadata = self._build_metadata_entry(chunk, vector_index=start_idx + i)
             self.chunk_metadata.append(metadata)
         
         # Save to disk
@@ -240,8 +295,8 @@ class VectorStorage:
     
     def get_chunk_by_id(self, chunk_id: str) -> Optional[Dict[str, Any]]:
         """
-        Get chunk metadata by chunk ID
-        
+        Get chunk metadata by chunk ID.
+
         Args:
             chunk_id: Chunk identifier
             
@@ -251,6 +306,16 @@ class VectorStorage:
         for metadata in self.chunk_metadata:
             if metadata.get("chunk_id") == chunk_id:
                 return metadata
+
+        # Backward-compatible fallback for generated chunk ids (`chunk_<index>`).
+        if isinstance(chunk_id, str) and chunk_id.startswith("chunk_"):
+            raw_index = chunk_id.replace("chunk_", "", 1)
+            try:
+                index = int(raw_index)
+            except Exception:
+                return None
+            if 0 <= index < len(self.chunk_metadata):
+                return self.chunk_metadata[index]
         return None
     
     def get_chunks_by_session(self, session_id: str) -> List[Dict[str, Any]]:
@@ -284,7 +349,6 @@ class VectorStorage:
         for metadata in self.chunk_metadata:
             if metadata.get("session_id") == session_id:
                 metadata["deleted"] = True
-                metadata["deleted_timestamp"] = datetime.now().isoformat()
                 deleted_count += 1
         
         if deleted_count > 0:

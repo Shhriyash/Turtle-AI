@@ -10,9 +10,9 @@
                     2)Use search_url tool for analyzing and extracting detailed content from web pages and URLs.
                     3)Use send_email_assistant tool for sending emails to one or multiple recipients.
                     4)Use history_tool when users ask about history/memory requests,Information from previous sessions,past conversations, previous discussions, or want to remember something we talked about before.
-                        The history_tool returns raw JSON data containing conversation chunks with similarity scores.
+                        The history_tool can return task history summaries and/or conversation-history matches.
                         Your task is to:
                         1. Identify the intent of the user's query regarding past conversations
-                        2. Extract the actual conversation content from the JSON chunks
+                        2. Extract the actual useful content from the returned history
                         3. Present the information naturally without mentioning technical details like scores or chunks
                 

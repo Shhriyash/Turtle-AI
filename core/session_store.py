@@ -176,6 +176,8 @@ class SessionStore:
     def get_pending_email(self) -> dict[str, Any]:
         return {
             "recipients": list(self.pending_email.get("recipients", [])),
+            "cc_recipients": list(self.pending_email.get("cc_recipients", [])),
+            "bcc_recipients": list(self.pending_email.get("bcc_recipients", [])),
             "subject": self.pending_email.get("subject", ""),
             "content": self.pending_email.get("content", ""),
         }
@@ -184,6 +186,8 @@ class SessionStore:
         self,
         *,
         recipients: list[str] | None = None,
+        cc_recipients: list[str] | None = None,
+        bcc_recipients: list[str] | None = None,
         subject: str | None = None,
         content: str | None = None,
     ) -> None:
@@ -191,6 +195,10 @@ class SessionStore:
             self._require_active_session()
             if recipients is not None:
                 self.pending_email["recipients"] = list(recipients)
+            if cc_recipients is not None:
+                self.pending_email["cc_recipients"] = list(cc_recipients)
+            if bcc_recipients is not None:
+                self.pending_email["bcc_recipients"] = list(bcc_recipients)
             if subject is not None:
                 self.pending_email["subject"] = subject
             if content is not None:
@@ -272,16 +280,18 @@ class SessionStore:
         if target_path is None:
             raise RuntimeError("Session manifest path is not initialized")
         target_path.parent.mkdir(parents=True, exist_ok=True)
+        pending_email = self.get_pending_email()
         payload = {
             "session_id": self.session_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at or _utc_now(),
             "status": status,
             "message_count": len(self.message_history),
-            "pending_email": self.get_pending_email(),
             "storage_mode": "snapshot_delta" if (not self._legacy_layout and target is None) else "snapshot",
             "delta_count": self._delta_count if target is None else 0,
         }
+        if self._has_pending_email_payload(pending_email):
+            payload["pending_email"] = pending_email
         self.current_status = status
         atomic_write_json(target_path, payload, indent=2, ensure_ascii=False)
 
@@ -491,9 +501,28 @@ class SessionStore:
     def _default_pending_email() -> dict[str, Any]:
         return {
             "recipients": [],
+            "cc_recipients": [],
+            "bcc_recipients": [],
             "subject": "",
             "content": "",
         }
+
+    @staticmethod
+    def _has_pending_email_payload(payload: dict[str, Any]) -> bool:
+        recipients = payload.get("recipients", [])
+        if isinstance(recipients, list) and any(str(item).strip() for item in recipients):
+            return True
+        cc_recipients = payload.get("cc_recipients", [])
+        if isinstance(cc_recipients, list) and any(str(item).strip() for item in cc_recipients):
+            return True
+        bcc_recipients = payload.get("bcc_recipients", [])
+        if isinstance(bcc_recipients, list) and any(str(item).strip() for item in bcc_recipients):
+            return True
+        if str(payload.get("subject", "")).strip():
+            return True
+        if str(payload.get("content", "")).strip():
+            return True
+        return False
 
     def _normalize_pending_email(self, payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -502,10 +531,20 @@ class SessionStore:
         if not isinstance(recipients, list):
             recipients = []
         normalized_recipients = [str(item).strip() for item in recipients if str(item).strip()]
+        cc_recipients = payload.get("cc_recipients", [])
+        if not isinstance(cc_recipients, list):
+            cc_recipients = []
+        normalized_cc_recipients = [str(item).strip() for item in cc_recipients if str(item).strip()]
+        bcc_recipients = payload.get("bcc_recipients", [])
+        if not isinstance(bcc_recipients, list):
+            bcc_recipients = []
+        normalized_bcc_recipients = [str(item).strip() for item in bcc_recipients if str(item).strip()]
         subject = str(payload.get("subject", "")).strip()
         content = str(payload.get("content", "")).strip()
         return {
             "recipients": normalized_recipients,
+            "cc_recipients": normalized_cc_recipients,
+            "bcc_recipients": normalized_bcc_recipients,
             "subject": subject,
             "content": content,
         }

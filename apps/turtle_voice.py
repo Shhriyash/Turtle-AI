@@ -9,12 +9,13 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Optional, Generator, Tuple
+from urllib.parse import urlsplit, urlunsplit
 import httpx
 import time
 from pathlib import Path
 import json
 import numpy as np
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, RunContext, ModelMessagesTypeAdapter
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, UserPromptPart
 from pydantic_ai.usage import UsageLimits, RunUsage
 import logfire
@@ -41,12 +42,12 @@ from core.llm_client import (
     run_agent_with_fallbacks,
 )
 from core.email_flow import (
+    combine_extracted_email_details,
     extract_deterministic_email_details,
     format_missing_email_prompt,
     merge_email_details,
     missing_email_fields,
     parse_email_extraction_response,
-    sanitize_email_details,
     send_email_now,
     validate_recipients,
     validate_send_email_args,
@@ -54,12 +55,18 @@ from core.email_flow import (
 from core.output_clean import clean_text_for_model, clean_text_for_tts
 from core.graph_store import GraphStore
 from core.memory_store import MemoryStore
+from core.personal_memory_extract import extract_memory_candidates_from_messages
+from core.personal_memory_merge import merge_personal_memory_candidates
+from core.personal_memory_prompt import PersonalMemoryPromptBuilder, PersonalMemoryPromptConfig
+from core.personal_memory_store import PersonalMemoryStore
+from core.task_history import TaskHistoryStore
 from core.paths import (
     MEMORY_EPISODES_FILE,
     MEMORY_EVENTS_FILE,
     MEMORY_GRAPH_FILE,
     MEMORY_PROFILE_FILE,
     MEMORY_STATE_FILE,
+    TASK_HISTORY_FILE,
     TEMP_AUDIO_DIR,
     ensure_dirs,
 )
@@ -92,6 +99,9 @@ class SharedState:
     http_client: httpx.AsyncClient
     session_store: SessionStore
     memory_store: MemoryStore
+    personal_memory_store: PersonalMemoryStore
+    personal_memory_prompt: PersonalMemoryPromptBuilder
+    task_history_store: TaskHistoryStore
     rag_system: TurtleRAGSystem
     search_cache: dict[str, str] = field(default_factory=dict)
     turn_counter: int = 0
@@ -216,7 +226,11 @@ ACTIVE_HISTORY_MAX_TOKENS = int(os.getenv("TURTLE_HISTORY_MAX_TOKENS", "12000"))
 MEMORY_FLUSH_TURNS = int(os.getenv("TURTLE_MEMORY_FLUSH_TURNS", "20"))
 MEMORY_FLUSH_TOKENS = int(os.getenv("TURTLE_MEMORY_FLUSH_TOKENS", "20000"))
 MEMORY_PROFILE_MAX_LINES = int(os.getenv("TURTLE_MEMORY_PROFILE_MAX_LINES", "6"))
+PERSONAL_MEMORY_ENABLED = os.getenv("TURTLE_PERSONAL_MEMORY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+PERSONAL_MEMORY_MAX_BYTES = int(os.getenv("TURTLE_PERSONAL_MEMORY_MAX_BYTES", "2048"))
+PERSONAL_MEMORY_MAX_TOPIC_FILES = int(os.getenv("TURTLE_PERSONAL_MEMORY_MAX_TOPIC_FILES", "2"))
 INTERACTION_MODE = os.getenv("TURTLE_INTERACTION_MODE", "ask").strip().lower()
+TOOL_OUTPUT_MAX_CHARS = int(os.getenv("TURTLE_TOOL_OUTPUT_MAX_CHARS", "3500"))
 
 
 def _is_user_turn_request(message: ModelMessage) -> bool:
@@ -264,10 +278,14 @@ def _detect_task_type(user_text: str) -> str:
     return "general"
 
 
-def _compose_prompt_with_memory(user_text: str, memory_lines: list[str]) -> str:
-    if not memory_lines:
+def _compose_prompt_with_memory(user_text: str, memory_context: str | list[str]) -> str:
+    if isinstance(memory_context, list):
+        context = "\n".join(memory_context).strip()
+    else:
+        context = str(memory_context).strip()
+
+    if not context:
         return user_text
-    context = "\n".join(memory_lines)
     return (
         "Relevant user memory:\n"
         f"{context}\n\n"
@@ -276,9 +294,135 @@ def _compose_prompt_with_memory(user_text: str, memory_lines: list[str]) -> str:
     )
 
 
+def _resolve_memory_context(state: SharedState, *, task_type: str, user_text: str) -> str:
+    if PERSONAL_MEMORY_ENABLED:
+        try:
+            personal_block = state.personal_memory_prompt.build_memory_block(
+                task_type=task_type,
+                query=user_text,
+            )
+            if personal_block:
+                return personal_block
+        except Exception as e:
+            print(f"LOG: Personal memory prompt build failed, using compatibility fallback: {e}")
+
+    # Deprecated fallback path: JSON profile + graph-derived context.
+    fallback_lines = state.memory_store.get_context_lines(task_type=task_type, query=user_text)
+    return "\n".join(fallback_lines).strip()
+
+
+def _sync_personal_memory_from_messages(
+    state: SharedState,
+    *,
+    session_id: str | None,
+    message_history: list[ModelMessage],
+) -> None:
+    if not PERSONAL_MEMORY_ENABLED or not session_id or not message_history:
+        return
+
+    try:
+        profile = state.personal_memory_store.load_profile_snapshot()
+        candidates = extract_memory_candidates_from_messages(
+            message_history=message_history,
+            session_id=session_id,
+            profile=profile,
+        )
+        if not candidates:
+            return
+
+        result = merge_personal_memory_candidates(
+            store=state.personal_memory_store,
+            candidates=candidates,
+        )
+        if result.written_topics:
+            topics = ", ".join(result.written_topics)
+            state.personal_memory_store.append_daily_log(
+                f"Merged personal memory topics: {topics}",
+                session_id=session_id,
+            )
+            print(
+                f"LOG: Personal memory updated for {session_id} "
+                f"({result.written_candidate_count} candidate merges across {topics})"
+            )
+    except Exception as e:
+        print(f"LOG: Personal memory sync failed for {session_id}: {e}")
+
+
+def _sync_personal_memory_from_archive(
+    state: SharedState,
+    *,
+    session_id: str | None,
+    archive_path: Path,
+) -> None:
+    if not PERSONAL_MEMORY_ENABLED or not session_id:
+        return
+
+    messages_path = archive_path / "messages.json"
+    if not messages_path.exists():
+        return
+
+    try:
+        message_history = ModelMessagesTypeAdapter.validate_json(messages_path.read_bytes())
+    except Exception as e:
+        print(f"LOG: Unable to read archived messages for personal memory sync {session_id}: {e}")
+        return
+
+    _sync_personal_memory_from_messages(
+        state,
+        session_id=session_id,
+        message_history=message_history,
+    )
+
+
+def _record_task_history(
+    state: SharedState,
+    *,
+    turn_id: str,
+    task_type: str,
+    status: str,
+    query: str = "",
+    tool_used: str = "",
+    outcome: str = "",
+    payload: dict[str, object] | None = None,
+) -> None:
+    session_id = state.session_store.session_id or "unknown_session"
+    try:
+        state.task_history_store.record(
+            session_id=session_id,
+            turn_id=turn_id,
+            task_type=task_type,
+            status=status,
+            query=query,
+            tool_used=tool_used,
+            outcome=outcome,
+            payload=payload,
+        )
+    except Exception as e:
+        print(f"LOG: Task history write failed for {session_id}: {e}")
+
+
 def _new_turn_id(state: SharedState) -> str:
     state.turn_counter += 1
     return f"{state.session_store.session_id or 'session'}_turn_{state.turn_counter}"
+
+
+def _truncate_tool_output(text: str, *, label: str) -> str:
+    if len(text) <= TOOL_OUTPUT_MAX_CHARS:
+        return text
+    return (
+        f"{text[:TOOL_OUTPUT_MAX_CHARS]}\n\n"
+        f"[Output truncated: {label} was too long. Ask follow-up questions for specific details.]"
+    )
+
+
+def _normalize_url_for_cache(url: str) -> str:
+    raw = " ".join(url.split())
+    try:
+        parsed = urlsplit(raw)
+        normalized_path = parsed.path or "/"
+        return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), normalized_path, parsed.query, ""))
+    except Exception:
+        return raw
 
 
 def _resolve_interaction_mode() -> str:
@@ -311,6 +455,14 @@ model = primary_groq_model or openrouter_models[0]  # Main assistant
 model2 = primary_groq_model or openrouter_models[0]  # Email agent
 
 openrouter_fallback_models = openrouter_models[1:]
+if not openrouter_fallback_models:
+    emergency_fallback_model = os.getenv("OPENROUTER_TOOL_FALLBACK_MODEL", "nvidia/nemotron-3-nano-30b-a3b:free").strip()
+    if emergency_fallback_model:
+        emergency_models = get_openrouter_models(model_name=emergency_fallback_model, settings=model_settings)
+        # Use emergency models only when no key-index fallbacks exist.
+        if emergency_models:
+            openrouter_fallback_models = emergency_models
+
 delegator_fallback_models = openrouter_models if primary_groq_model else openrouter_fallback_models
 groq_fallback_model = get_groq_fallback_model(settings=model_settings)
 usage_limits = UsageLimits(request_limit=30)
@@ -389,7 +541,8 @@ async def search_web(ctx: RunContext[SharedState], query: str) -> str:
     """Search the web for current information."""
     print("\nSEARCHING: Web search for current information")
     normalized_query = " ".join(query.split())
-    cached = ctx.deps.search_cache.get(normalized_query)
+    cache_key = f"web::{normalized_query}"
+    cached = ctx.deps.search_cache.get(cache_key)
     if cached:
         return cached
 
@@ -403,19 +556,28 @@ async def search_web(ctx: RunContext[SharedState], query: str) -> str:
         )
 
     cleaned = clean_text_for_model(formatted)
-    ctx.deps.search_cache[normalized_query] = cleaned
-    return cleaned
+    trimmed = _truncate_tool_output(cleaned, label="web search results")
+    ctx.deps.search_cache[cache_key] = trimmed
+    return trimmed
 
 @main_assistant.tool
 async def search_url(ctx: RunContext[SharedState], url: str) -> str:
     """Analyze and extract detailed content from a URL using custom extraction tool"""
     print(f"\nANALYZING: URL content extraction from {url}")
+    normalized_url = _normalize_url_for_cache(url)
+    cache_key = f"url::{normalized_url}"
+    cached = ctx.deps.search_cache.get(cache_key)
+    if cached:
+        return cached
     
     # Use our custom URL extraction tool
-    result = await fetch_url_content_async(ctx.deps.http_client, url)
+    result = await fetch_url_content_async(ctx.deps.http_client, normalized_url)
     
     # Return formatted string representation
-    return clean_text_for_model(result.to_formatted_string())
+    cleaned = clean_text_for_model(result.to_formatted_string())
+    trimmed = _truncate_tool_output(cleaned, label="url analysis")
+    ctx.deps.search_cache[cache_key] = trimmed
+    return trimmed
 
 @main_assistant.tool
 async def send_email_assistant(ctx: RunContext[SharedState], query: str) -> str:
@@ -430,6 +592,8 @@ async def send_email_assistant(ctx: RunContext[SharedState], query: str) -> str:
         "Rules:\n"
         "- Do not invent values that are not present in latest message or clear context.\n"
         "- Return recipients as a list of email strings.\n"
+        "- Return cc_recipients as a list of email strings when user specifies cc.\n"
+        "- Return bcc_recipients as a list of email strings when user specifies bcc.\n"
         "- Return empty strings for missing subject/content.\n"
         "- send_intent should be true only when user asks to send now.\n\n"
         f"Current pending email state:\n{json.dumps(pending_email, ensure_ascii=False)}\n\n"
@@ -445,30 +609,36 @@ async def send_email_assistant(ctx: RunContext[SharedState], query: str) -> str:
         usage=ctx.usage,
     )
     llm_extraction = parse_email_extraction_response(extraction_result.output).model_dump()
-    latest_fields = sanitize_email_details(
-        {
-            "recipients": deterministic.get("recipients") or llm_extraction.get("recipients", []),
-            "subject": deterministic.get("subject") or llm_extraction.get("subject", ""),
-            "content": deterministic.get("content") or llm_extraction.get("content", ""),
-            "send_intent": bool(deterministic.get("send_intent") or llm_extraction.get("send_intent")),
-        }
-    )
+    latest_fields = combine_extracted_email_details(deterministic, llm_extraction)
     merged = merge_email_details(pending_email, latest_fields)
 
     valid_recipients, invalid_recipients = validate_recipients(merged["recipients"])
+    valid_cc_recipients, invalid_cc_recipients = validate_recipients(merged.get("cc_recipients", []))
+    valid_bcc_recipients, invalid_bcc_recipients = validate_recipients(merged.get("bcc_recipients", []))
     merged["recipients"] = valid_recipients
+    merged["cc_recipients"] = valid_cc_recipients
+    merged["bcc_recipients"] = valid_bcc_recipients
 
-    if invalid_recipients:
+    if invalid_recipients or invalid_cc_recipients or invalid_bcc_recipients:
         ctx.deps.session_store.set_pending_email(
             recipients=valid_recipients,
+            cc_recipients=valid_cc_recipients,
+            bcc_recipients=valid_bcc_recipients,
             subject=merged["subject"],
             content=merged["content"],
         )
-        invalid_text = ", ".join(invalid_recipients)
+        invalid_parts: list[str] = []
+        if invalid_recipients:
+            invalid_parts.append(f"to: {', '.join(invalid_recipients)}")
+        if invalid_cc_recipients:
+            invalid_parts.append(f"cc: {', '.join(invalid_cc_recipients)}")
+        if invalid_bcc_recipients:
+            invalid_parts.append(f"bcc: {', '.join(invalid_bcc_recipients)}")
+        invalid_text = "; ".join(invalid_parts)
         return clean_text_for_model(
             (
-            f"I found invalid recipient email format: {invalid_text}. "
-            "Please provide the recipient address again."
+            f"I found invalid email format: {invalid_text}. "
+            "Please provide the address again."
             )
         )
 
@@ -476,6 +646,8 @@ async def send_email_assistant(ctx: RunContext[SharedState], query: str) -> str:
     if missing:
         ctx.deps.session_store.set_pending_email(
             recipients=merged["recipients"],
+            cc_recipients=merged["cc_recipients"],
+            bcc_recipients=merged["bcc_recipients"],
             subject=merged["subject"],
             content=merged["content"],
         )
@@ -486,41 +658,55 @@ async def send_email_assistant(ctx: RunContext[SharedState], query: str) -> str:
             merged["recipients"],
             merged["subject"],
             merged["content"],
+            merged["cc_recipients"],
+            merged["bcc_recipients"],
         )
         send_result = send_email_now(merged)
     except Exception as e:
         tool_turn_id = f"{ctx.deps.session_store.session_id or 'session'}_tool_{ctx.deps.turn_counter}"
-        ctx.deps.memory_store.record_task_outcome(
-            session_id=ctx.deps.session_store.session_id or "unknown_session",
+        _record_task_history(
+            ctx.deps,
             turn_id=tool_turn_id,
             task_type="email",
-            summary=str(e),
-            success=False,
+            status="failed",
+            query=query,
+            tool_used="send_email_now",
+            outcome=str(e),
+            payload={
+                "recipients": merged["recipients"],
+                "subject": merged["subject"],
+            },
         )
         ctx.deps.session_store.set_pending_email(
             recipients=merged["recipients"],
+            cc_recipients=merged["cc_recipients"],
+            bcc_recipients=merged["bcc_recipients"],
             subject=merged["subject"],
             content=merged["content"],
         )
         return clean_text_for_model(f"Failed to send email: {e}")
     if send_result.startswith("Email sent successfully!"):
         tool_turn_id = f"{ctx.deps.session_store.session_id or 'session'}_tool_{ctx.deps.turn_counter}"
-        ctx.deps.memory_store.record_common_recipients(
-            session_id=ctx.deps.session_store.session_id or "unknown_session",
-            turn_id=tool_turn_id,
-            recipients=merged["recipients"],
-        )
-        ctx.deps.memory_store.record_task_outcome(
-            session_id=ctx.deps.session_store.session_id or "unknown_session",
+        _record_task_history(
+            ctx.deps,
             turn_id=tool_turn_id,
             task_type="email",
-            summary=f"Sent email to {', '.join(merged['recipients'])} with subject {merged['subject']}",
-            success=True,
+            status="completed",
+            query=query,
+            tool_used="send_email_now",
+            outcome=f"Sent email to {', '.join(merged['recipients'])} with subject {merged['subject']}",
+            payload={
+                "recipients": merged["recipients"],
+                "subject": merged["subject"],
+                "content_length": len(merged["content"]),
+            },
         )
         ctx.deps.session_store.clear_pending_email()
     else:
         ctx.deps.session_store.set_pending_email(
             recipients=merged["recipients"],
+            cc_recipients=merged["cc_recipients"],
+            bcc_recipients=merged["bcc_recipients"],
             subject=merged["subject"],
             content=merged["content"],
         )
@@ -530,12 +716,17 @@ async def send_email_assistant(ctx: RunContext[SharedState], query: str) -> str:
 async def history_tool(ctx: RunContext[SharedState], query: str) -> str:
     """Search conversation history for past discussions and information"""
     try:
+        task_history = ctx.deps.task_history_store.format_search_results(query, max_results=5)
         result = await ctx.deps.rag_system.query_history(query)
-        
-        if result == "cannot find in history":
-            return "No relevant information found in our previous conversations."
-        else:
-            return result
+        sections: list[str] = []
+        if task_history:
+            sections.append(task_history)
+        if result != "cannot find in history":
+            sections.append(result)
+
+        if not sections:
+            return "No relevant information found in task history or previous conversations."
+        return "\n\n".join(sections)
             
     except Exception:
         return "Unable to access conversation history at the moment."
@@ -574,8 +765,8 @@ async def text_chat(state: SharedState, return_to_voice: bool = True):
                     continue
 
                 task_type = _detect_task_type(user_input)
-                memory_lines = state.memory_store.get_context_lines(task_type=task_type, query=user_input)
-                prompt_input = _compose_prompt_with_memory(user_input, memory_lines)
+                memory_context = _resolve_memory_context(state, task_type=task_type, user_text=user_input)
+                prompt_input = _compose_prompt_with_memory(user_input, memory_context)
                 turn_id = _new_turn_id(state)
                 
                 # Run with complete message history for conversation continuity
@@ -655,8 +846,8 @@ async def voice_response_handler(audio: Tuple[int, np.ndarray], state: SharedSta
     try:
         # Get response from main assistant
         task_type = _detect_task_type(transcription)
-        memory_lines = state.memory_store.get_context_lines(task_type=task_type, query=transcription)
-        prompt_input = _compose_prompt_with_memory(transcription, memory_lines)
+        memory_context = _resolve_memory_context(state, task_type=task_type, user_text=transcription)
+        prompt_input = _compose_prompt_with_memory(transcription, memory_context)
         turn_id = _new_turn_id(state)
 
         llm_start_time = time.time()
@@ -717,6 +908,7 @@ async def voice_chat():
     async with httpx.AsyncClient() as client:
         session_store = SessionStore()
         restore_result = session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
+        # Deprecated graph dependency for legacy MemoryStore fallback only.
         graph_store = GraphStore(graph_path=MEMORY_GRAPH_FILE)
         memory_store = MemoryStore(
             profile_path=MEMORY_PROFILE_FILE,
@@ -727,15 +919,38 @@ async def voice_chat():
             flush_turns=MEMORY_FLUSH_TURNS,
             flush_tokens=MEMORY_FLUSH_TOKENS,
             profile_max_lines=MEMORY_PROFILE_MAX_LINES,
+            write_enabled=False,
         )
+        personal_memory_store = PersonalMemoryStore()
+        personal_memory_prompt = PersonalMemoryPromptBuilder(
+            personal_memory_store,
+            config=PersonalMemoryPromptConfig(
+                max_bytes=PERSONAL_MEMORY_MAX_BYTES,
+                max_topic_files=PERSONAL_MEMORY_MAX_TOPIC_FILES,
+            ),
+        )
+        task_history_store = TaskHistoryStore(TASK_HISTORY_FILE)
         rag_system = TurtleRAGSystem()
-        state = SharedState(http_client=client, session_store=session_store, memory_store=memory_store, rag_system=rag_system)
+        state = SharedState(
+            http_client=client,
+            session_store=session_store,
+            memory_store=memory_store,
+            personal_memory_store=personal_memory_store,
+            personal_memory_prompt=personal_memory_prompt,
+            task_history_store=task_history_store,
+            rag_system=rag_system,
+        )
         voice_processor = TurtleVoiceProcessor(state)
         if restore_result.had_corrupt_active:
             print("LOG: Corrupt active session files were quarantined before starting a new session")
 
         for pending_session_id, pending_archive_path in session_store.list_pending_finalization_archives():
             print(f"LOG: Finalizing archived session {pending_session_id}")
+            _sync_personal_memory_from_archive(
+                state,
+                session_id=pending_session_id,
+                archive_path=pending_archive_path,
+            )
             finalized_pending = await rag_system.finalize_archived_session(
                 session_id=pending_session_id,
                 archive_path=pending_archive_path,
@@ -878,6 +1093,11 @@ async def voice_chat():
             session_id = state.session_store.session_id
             archive_path = state.session_store.archive_active(status="pending_finalization")
             if session_id and archive_path:
+                _sync_personal_memory_from_archive(
+                    state,
+                    session_id=session_id,
+                    archive_path=archive_path,
+                )
                 rag_finalized = await rag_system.finalize_archived_session(
                     session_id=session_id,
                     archive_path=archive_path,
@@ -904,6 +1124,7 @@ async def text_mode_chat():
     async with httpx.AsyncClient() as client:
         session_store = SessionStore()
         restore_result = session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
+        # Deprecated graph dependency for legacy MemoryStore fallback only.
         graph_store = GraphStore(graph_path=MEMORY_GRAPH_FILE)
         memory_store = MemoryStore(
             profile_path=MEMORY_PROFILE_FILE,
@@ -914,14 +1135,37 @@ async def text_mode_chat():
             flush_turns=MEMORY_FLUSH_TURNS,
             flush_tokens=MEMORY_FLUSH_TOKENS,
             profile_max_lines=MEMORY_PROFILE_MAX_LINES,
+            write_enabled=False,
         )
+        personal_memory_store = PersonalMemoryStore()
+        personal_memory_prompt = PersonalMemoryPromptBuilder(
+            personal_memory_store,
+            config=PersonalMemoryPromptConfig(
+                max_bytes=PERSONAL_MEMORY_MAX_BYTES,
+                max_topic_files=PERSONAL_MEMORY_MAX_TOPIC_FILES,
+            ),
+        )
+        task_history_store = TaskHistoryStore(TASK_HISTORY_FILE)
         rag_system = TurtleRAGSystem()
-        state = SharedState(http_client=client, session_store=session_store, memory_store=memory_store, rag_system=rag_system)
+        state = SharedState(
+            http_client=client,
+            session_store=session_store,
+            memory_store=memory_store,
+            personal_memory_store=personal_memory_store,
+            personal_memory_prompt=personal_memory_prompt,
+            task_history_store=task_history_store,
+            rag_system=rag_system,
+        )
         if restore_result.had_corrupt_active:
             print("LOG: Corrupt active session files were quarantined before starting a new session")
 
         for pending_session_id, pending_archive_path in session_store.list_pending_finalization_archives():
             print(f"LOG: Finalizing archived session {pending_session_id}")
+            _sync_personal_memory_from_archive(
+                state,
+                session_id=pending_session_id,
+                archive_path=pending_archive_path,
+            )
             finalized_pending = await rag_system.finalize_archived_session(
                 session_id=pending_session_id,
                 archive_path=pending_archive_path,
@@ -960,6 +1204,11 @@ async def text_mode_chat():
             session_id = state.session_store.session_id
             archive_path = state.session_store.archive_active(status="pending_finalization")
             if session_id and archive_path:
+                _sync_personal_memory_from_archive(
+                    state,
+                    session_id=session_id,
+                    archive_path=archive_path,
+                )
                 rag_finalized = await rag_system.finalize_archived_session(
                     session_id=session_id,
                     archive_path=archive_path,

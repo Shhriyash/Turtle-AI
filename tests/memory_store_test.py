@@ -106,6 +106,35 @@ class MemoryStoreTests(unittest.TestCase):
         finally:
             shutil.rmtree(base, ignore_errors=True)
 
+    def test_write_disabled_mode_does_not_create_legacy_artifacts(self) -> None:
+        base = Path("tests") / "_tmp" / f"memory_store_{uuid.uuid4().hex}"
+        base.mkdir(parents=True, exist_ok=True)
+        try:
+            store = MemoryStore(
+                profile_path=base / "profile.json",
+                events_path=base / "events.jsonl",
+                episodes_path=base / "episodes.jsonl",
+                state_path=base / "state.json",
+                graph_store=GraphStore(graph_path=base / "graph.json"),
+                flush_turns=2,
+                flush_tokens=200,
+                profile_max_lines=6,
+                write_enabled=False,
+            )
+            result = store.record_turn(
+                session_id="s-disabled",
+                turn_id="t1",
+                user_text="My email is user@example.com",
+                assistant_text="Noted.",
+                task_type="general",
+            )
+            self.assertFalse(result.triggered)
+            self.assertFalse((base / "profile.json").exists())
+            self.assertFalse((base / "events.jsonl").exists())
+            self.assertFalse((base / "graph.json").exists())
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
