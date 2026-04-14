@@ -1,0 +1,53 @@
+/* ================================================================
+   DESIGN TOKENS — Single source of truth for all visual properties
+   ================================================================ */
+:root {
+    /* Palette */
+    --bg-primary:     #0a0e17;
+    --bg-secondary:   #111827;
+    --bg-tertiary:    #1a2236;
+    --bg-glass:       rgba(17, 24, 39, 0.65);
+    --bg-glass-hover: rgba(26, 34, 54, 0.80);
+    --surface:        rgba(30, 41, 66, 0.50);
+    --surface-hover:  rgba(40, 55, 85, 0.60);
+
+    --accent:         #22d3ee;
+    --accent-glow:    rgba(34, 211, 238, 0.25);
+    --accent-dim:     rgba(34, 211, 238, 0.10);
+    --accent-secondary: #a78bfa;
+    --accent-warm:    #f472b6;
+
+    --text-primary:   #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted:     #64748b;
+    --text-accent:    #22d3ee;
+
+    --border:         rgba(51, 65, 85, 0.50);
+    --border-accent:  rgba(34, 211, 238, 0.30);
+
+    --success:        #34d399;
+    --warning:        #fbbf24;
+    --error:          #f87171;
+
+    /* Sizing */
+    --radius-sm:   8px;
+    --radius-md:   12px;
+    --radius-lg:   16px;
+    --radius-xl:   20px;
+    --radius-full: 9999px;
+
+    /* Shadows */
+    --shadow-sm:   0 1px 3px rgba(0,0,0,0.3);
+    --shadow-md:   0 4px 16px rgba(0,0,0,0.4);
+    --shadow-lg:   0 8px 32px rgba(0,0,0,0.5);
+    --shadow-glow: 0 0 24px var(--accent-glow);
+
+    /* Transitions */
+    --ease-out:    cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+    /* Layout */
+    --sidebar-width: 380px;
+    --header-height: 64px;
+    --input-height:  72px;
+}

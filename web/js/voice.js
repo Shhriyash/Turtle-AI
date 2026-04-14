@@ -1,0 +1,131 @@
+/**
+ * voice.js — Audio recording (AudioWorklet) and playback (AudioContext)
+ *
+ * Recording uses a custom AudioWorklet processor that captures raw
+ * PCM16 at 16 kHz — exactly what Groq Whisper expects, zero conversion.
+ * Playback decodes WAV blobs received from the server.
+ */
+
+import AppState from './state.js';
+import { setStatus, showToast } from './utils.js';
+
+/** Path to the AudioWorklet processor script */
+const PROCESSOR_PATH = '/static/audio/pcm-processor.js';
+
+/**
+ * Start recording from the microphone.
+ * Creates AudioContext + AudioWorklet, captures PCM16 chunks.
+ */
+export async function startRecording() {
+    if (AppState.isRecording || !AppState.isConnected) return;
+    AppState.isRecording = true;
+    AppState.recordedChunks = [];
+    AppState.dom.btnMic.classList.add('recording');
+    setStatus('recording', 'Recording...');
+
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                sampleRate: 16000,
+                channelCount: 1,
+                echoCancellation: true,
+                noiseSuppression: true,
+            },
+        });
+
+        AppState.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 16000,
+        });
+
+        await AppState.audioContext.audioWorklet.addModule(PROCESSOR_PATH);
+
+        const source = AppState.audioContext.createMediaStreamSource(stream);
+        AppState.audioWorkletNode = new AudioWorkletNode(AppState.audioContext, 'pcm-processor');
+
+        AppState.audioWorkletNode.port.onmessage = (event) => {
+            AppState.recordedChunks.push(new Int16Array(event.data));
+        };
+
+        source.connect(AppState.audioWorkletNode);
+        AppState.audioWorkletNode.connect(AppState.audioContext.destination);
+
+        // Stash the stream handle for cleanup
+        AppState.audioWorkletNode._stream = stream;
+
+    } catch (err) {
+        console.error('Recording failed:', err);
+        showToast('Microphone access denied', true);
+        AppState.isRecording = false;
+        AppState.dom.btnMic.classList.remove('recording');
+        setStatus('ready', 'Ready');
+    }
+}
+
+/**
+ * Stop recording, merge captured chunks, and send to server
+ * as a single binary WebSocket frame.
+ */
+export function stopRecording() {
+    if (!AppState.isRecording) return;
+    AppState.isRecording = false;
+    AppState.dom.btnMic.classList.remove('recording');
+
+    try {
+        if (AppState.audioWorkletNode) {
+            if (AppState.audioWorkletNode._stream) {
+                AppState.audioWorkletNode._stream.getTracks().forEach(t => t.stop());
+            }
+            AppState.audioWorkletNode.disconnect();
+            AppState.audioWorkletNode = null;
+        }
+        if (AppState.audioContext) {
+            AppState.audioContext.close();
+            AppState.audioContext = null;
+        }
+
+        if (AppState.recordedChunks.length > 0) {
+            const totalLength = AppState.recordedChunks.reduce((sum, c) => sum + c.length, 0);
+            const merged = new Int16Array(totalLength);
+            let offset = 0;
+            for (const chunk of AppState.recordedChunks) {
+                merged.set(chunk, offset);
+                offset += chunk.length;
+            }
+
+            if (AppState.ws && AppState.ws.readyState === WebSocket.OPEN) {
+                AppState.ws.send(merged.buffer);
+                setStatus('transcribing', 'Transcribing...');
+            }
+        }
+
+        AppState.recordedChunks = [];
+
+    } catch (err) {
+        console.error('Stop recording error:', err);
+        setStatus('ready', 'Ready');
+    }
+}
+
+/**
+ * Play a WAV audio blob received from the server.
+ * Uses AudioContext.decodeAudioData for instant playback.
+ * @param {Blob} blob
+ */
+export async function playAudioBlob(blob) {
+    try {
+        const arrayBuffer = await blob.arrayBuffer();
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(ctx.destination);
+        source.start(0);
+        source.onended = () => {
+            ctx.close();
+            setStatus('ready', 'Ready');
+        };
+    } catch (e) {
+        console.error('Audio playback error:', e);
+        setStatus('ready', 'Ready');
+    }
+}

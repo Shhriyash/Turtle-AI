@@ -1,0 +1,62 @@
+/* ================================================================
+   COMPONENTS — Toast notifications, connection banner
+   ================================================================ */
+
+/* Connection error banner */
+.connection-banner {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 10px;
+    background: rgba(248, 113, 113, 0.12);
+    border-bottom: 1px solid rgba(248, 113, 113, 0.3);
+    color: var(--error);
+    font-size: 13px;
+    font-weight: 500;
+}
+
+.connection-banner.visible {
+    display: flex;
+    animation: fade-in 0.3s;
+}
+
+.reconnect-btn {
+    padding: 4px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--error);
+    background: transparent;
+    color: var(--error);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.reconnect-btn:hover {
+    background: rgba(248, 113, 113, 0.15);
+}
+
+/* Toast notification */
+.toast {
+    position: fixed;
+    bottom: 100px;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    padding: 12px 24px;
+    border-radius: var(--radius-md);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    font-size: 13px;
+    z-index: 1000;
+    opacity: 0;
+    transition: all 0.3s var(--ease-out);
+    pointer-events: none;
+    box-shadow: var(--shadow-lg);
+}
+
+.toast.visible {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+}

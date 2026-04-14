@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Turtle AI — Personal assistant with voice, chat, and dev mode">
+    <title>Turtle AI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Component stylesheets -->
+    <link rel="stylesheet" href="/static/css/tokens.css">
+    <link rel="stylesheet" href="/static/css/base.css">
+    <link rel="stylesheet" href="/static/css/header.css">
+    <link rel="stylesheet" href="/static/css/messages.css">
+    <link rel="stylesheet" href="/static/css/input.css">
+    <link rel="stylesheet" href="/static/css/devmode.css">
+    <link rel="stylesheet" href="/static/css/components.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Main Chat Container -->
+        <div class="chat-container">
+            <!-- Connection Banner -->
+            <div class="connection-banner" id="connection-banner">
+                <span>Disconnected from server</span>
+                <button class="reconnect-btn" id="btn-reconnect">Reconnect</button>
+            </div>
+
+            <!-- Header -->
+            <header class="chat-header">
+                <div class="header-left">
+                    <div class="turtle-logo" aria-hidden="true">&#x1F422;</div>
+                    <div class="header-title">
+                        Turtle AI
+                        <span id="session-label">Personal Assistant</span>
+                    </div>
+                </div>
+                <div class="header-right">
+                    <div class="status-indicator" id="status-indicator" data-status="connecting">
+                        <div class="status-dot"></div>
+                        <span id="status-text">Connecting...</span>
+                    </div>
+                    <button class="btn-icon" id="btn-dev-toggle" title="Dev Mode">&#x2699;</button>
+                </div>
+            </header>
+
+            <!-- Messages Area -->
+            <div class="messages-area" id="messages-area">
+                <!-- Welcome screen -->
+                <div class="welcome-screen" id="welcome-screen">
+                    <div class="welcome-logo" aria-hidden="true">&#x1F422;</div>
+                    <h2>Welcome to Turtle AI</h2>
+                    <p>Your personal assistant with web search, email, memory, and voice. Type a message or hold the mic button to talk.</p>
+                    <div class="welcome-chips">
+                        <div class="welcome-chip">&#x1F50D; Search the latest AI news</div>
+                        <div class="welcome-chip">&#x1F4E7; Send an email to my team</div>
+                        <div class="welcome-chip">&#x1F9E0; What do you remember about me?</div>
+                        <div class="welcome-chip">&#x1F310; Analyze a webpage for me</div>
+                    </div>
+                </div>
+
+                <!-- Messages scroll container -->
+                <div class="messages-scroll" id="messages-scroll" style="display:none;"></div>
+
+                <!-- Thinking indicator -->
+                <div class="thinking-indicator" id="thinking-indicator">
+                    <div class="thinking-dots">
+                        <span></span><span></span><span></span>
+                    </div>
+                    <span class="thinking-label" id="thinking-label">Turtle is thinking...</span>
+                </div>
+            </div>
+
+            <!-- Input Bar -->
+            <div class="input-bar">
+                <div class="input-wrapper">
+                    <button class="btn-mic" id="btn-mic" title="Hold to record voice">&#x1F3A4;</button>
+                    <div class="input-field-wrap">
+                        <textarea id="chat-input" rows="1" placeholder="Message Turtle AI..."></textarea>
+                    </div>
+                    <button class="btn-send" id="btn-send" disabled title="Send message">&#x27A4;</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Dev Mode Sidebar -->
+        <aside class="dev-sidebar" id="dev-sidebar">
+            <div class="dev-header">
+                <h3>&#x2699; Dev Mode <span class="dev-badge">Beta</span></h3>
+                <button class="btn-icon" id="btn-dev-close" title="Close">&#x2715;</button>
+            </div>
+            <div class="dev-content">
+                <!-- Models -->
+                <div class="dev-section">
+                    <div class="dev-section-title">&#x1F916; Models</div>
+                    <div class="dev-field">
+                        <label for="dev-openrouter-model">Main Agent (OpenRouter)</label>
+                        <select id="dev-openrouter-model"></select>
+                    </div>
+                    <div class="dev-field">
+                        <label for="dev-groq-model">Groq Primary Model</label>
+                        <select id="dev-groq-model"></select>
+                    </div>
+                    <div class="dev-field">
+                        <label for="dev-groq-fallback">Groq Fallback Model</label>
+                        <select id="dev-groq-fallback"></select>
+                    </div>
+                </div>
+
+                <!-- Voice -->
+                <div class="dev-section">
+                    <div class="dev-section-title">&#x1F399; Voice</div>
+                    <div class="dev-field">
+                        <label for="dev-deepgram-model">Deepgram TTS Model</label>
+                        <select id="dev-deepgram-model"></select>
+                    </div>
+                    <div class="dev-field">
+                        <label for="dev-groq-voice">Groq TTS Voice (fallback)</label>
+                        <select id="dev-groq-voice"></select>
+                    </div>
+                </div>
+
+                <!-- Parameters -->
+                <div class="dev-section">
+                    <div class="dev-section-title">&#x26A1; Parameters</div>
+                    <div class="dev-field">
+                        <label for="dev-temperature">Temperature</label>
+                        <input type="number" id="dev-temperature" min="0" max="2" step="0.1" value="0.2">
+                    </div>
+                    <div class="dev-field">
+                        <label for="dev-max-tokens">Max Tokens</label>
+                        <input type="number" id="dev-max-tokens" min="128" max="8192" step="128" value="1024">
+                    </div>
+                    <div class="dev-field">
+                        <label for="dev-history-turns">History Turns</label>
+                        <input type="number" id="dev-history-turns" min="2" max="50" step="1" value="12">
+                    </div>
+                    <div class="dev-field">
+                        <label for="dev-max-messages">Max History Messages</label>
+                        <input type="number" id="dev-max-messages" min="10" max="100" step="5" value="40">
+                    </div>
+                </div>
+
+                <!-- Timing -->
+                <div class="dev-section">
+                    <div class="dev-section-title">&#x23F1; Last Request Timing</div>
+                    <div class="timing-grid">
+                        <div class="timing-card">
+                            <div class="timing-value" id="timing-stt">&mdash;</div>
+                            <div class="timing-label">STT</div>
+                        </div>
+                        <div class="timing-card">
+                            <div class="timing-value" id="timing-llm">&mdash;</div>
+                            <div class="timing-label">LLM</div>
+                        </div>
+                        <div class="timing-card">
+                            <div class="timing-value" id="timing-tts">&mdash;</div>
+                            <div class="timing-label">TTS</div>
+                        </div>
+                        <div class="timing-card">
+                            <div class="timing-value" id="timing-total">&mdash;</div>
+                            <div class="timing-label">Total</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="dev-actions">
+                <button class="dev-btn" id="btn-reset-config">Reset Defaults</button>
+                <button class="dev-btn primary" id="btn-apply-config">Apply Changes</button>
+            </div>
+        </aside>
+    </div>
+
+    <!-- Toast notification -->
+    <div class="toast" id="toast"></div>
+
+    <!-- Application JS (ES modules) -->
+    <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

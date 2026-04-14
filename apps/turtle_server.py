@@ -109,7 +109,7 @@ ensure_dirs()
 # Configuration
 # ---------------------------------------------------------------------------
 CONFIG_PATH = ROOT_DIR / "config" / "turtle_config.json"
-STATIC_DIR = Path(__file__).resolve().parent / "static"
+STATIC_DIR = ROOT_DIR / "web"
 
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8765
@@ -547,7 +547,7 @@ agents_mgr = AgentManager()
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Turtle AI", docs_url=None, redoc_url=None)
 
-# Serve static files
+# Serve static files from web/ directory
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
