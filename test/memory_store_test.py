@@ -22,7 +22,7 @@ class MemoryStoreTests(unittest.TestCase):
         )
 
     def test_fact_and_preference_persist_to_profile(self) -> None:
-        base = Path("tests") / "_tmp" / f"memory_store_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"memory_store_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = self._make_store(base)
@@ -41,7 +41,7 @@ class MemoryStoreTests(unittest.TestCase):
             shutil.rmtree(base, ignore_errors=True)
 
     def test_threshold_checkpoint_triggers_episode(self) -> None:
-        base = Path("tests") / "_tmp" / f"memory_store_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"memory_store_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = self._make_store(base)
@@ -67,7 +67,7 @@ class MemoryStoreTests(unittest.TestCase):
             shutil.rmtree(base, ignore_errors=True)
 
     def test_checkpoint_tracks_incremental_event_offset(self) -> None:
-        base = Path("tests") / "_tmp" / f"memory_store_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"memory_store_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = self._make_store(base)
@@ -107,7 +107,7 @@ class MemoryStoreTests(unittest.TestCase):
             shutil.rmtree(base, ignore_errors=True)
 
     def test_write_disabled_mode_does_not_create_legacy_artifacts(self) -> None:
-        base = Path("tests") / "_tmp" / f"memory_store_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"memory_store_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = MemoryStore(

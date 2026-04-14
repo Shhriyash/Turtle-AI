@@ -47,5 +47,11 @@ vector_storage/
 *.log
 tempCodeRunnerFile.py
 
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+
 # Secrets / keys
 aerobic-datum-478513-u9-3daa581fd336.json

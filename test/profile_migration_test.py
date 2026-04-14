@@ -20,7 +20,7 @@ def _load_migration_module():
 class ProfileMigrationTests(unittest.TestCase):
     def test_migration_writes_topic_files_and_index(self) -> None:
         module = _load_migration_module()
-        base = Path("tests") / "_tmp" / f"profile_migration_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"profile_migration_{uuid.uuid4().hex}"
         source = base / "profile.json"
         target = base / "personal"
         base.mkdir(parents=True, exist_ok=True)

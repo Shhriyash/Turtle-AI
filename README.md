@@ -1,4 +1,4 @@
-﻿# Turtle Personal Assistant
+# Turtle Personal Assistant
 
 A multi-agent personal assistant with conversation memory, web search, URL analysis, and email capabilities built with Pydantic AI.
 
@@ -279,7 +279,7 @@ turtle/
 |           |-- faiss_index.bin
 |           `-- chunk_metadata.json
 |-- output/                      # Runtime outputs (audio, logs, exports)
-|-- tests/
+|-- test/
 |   `-- *.py                     # Unit/integration test modules
 |-- VAD_COMPARISON.md
 |-- requirements.txt

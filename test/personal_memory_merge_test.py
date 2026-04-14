@@ -26,7 +26,7 @@ class PersonalMemoryMergeTests(unittest.TestCase):
         )
 
     def test_merge_persists_explicit_facts_and_preferences(self) -> None:
-        base = Path("tests") / "_tmp" / f"personal_memory_merge_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"personal_memory_merge_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = self._make_store(base)
@@ -51,7 +51,7 @@ class PersonalMemoryMergeTests(unittest.TestCase):
             shutil.rmtree(base, ignore_errors=True)
 
     def test_merge_accepts_im_name_pattern(self) -> None:
-        base = Path("tests") / "_tmp" / f"personal_memory_merge_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"personal_memory_merge_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = self._make_store(base)
@@ -72,7 +72,7 @@ class PersonalMemoryMergeTests(unittest.TestCase):
             shutil.rmtree(base, ignore_errors=True)
 
     def test_weak_signals_are_not_persisted(self) -> None:
-        base = Path("tests") / "_tmp" / f"personal_memory_merge_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"personal_memory_merge_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = self._make_store(base)

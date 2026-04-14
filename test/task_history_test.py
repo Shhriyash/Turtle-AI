@@ -8,7 +8,7 @@ from core.task_history import TaskHistoryStore
 
 class TaskHistoryStoreTests(unittest.TestCase):
     def test_record_and_filter_by_session(self) -> None:
-        base = Path("tests") / "_tmp" / f"task_history_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"task_history_{uuid.uuid4().hex}"
         history_path = base / "history.jsonl"
         base.mkdir(parents=True, exist_ok=True)
         try:
@@ -43,7 +43,7 @@ class TaskHistoryStoreTests(unittest.TestCase):
             shutil.rmtree(base, ignore_errors=True)
 
     def test_search_and_format_results(self) -> None:
-        base = Path("tests") / "_tmp" / f"task_history_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"task_history_{uuid.uuid4().hex}"
         history_path = base / "history.jsonl"
         base.mkdir(parents=True, exist_ok=True)
         try:

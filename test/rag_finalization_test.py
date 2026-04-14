@@ -55,7 +55,7 @@ class RAGFinalizationTests(unittest.IsolatedAsyncioTestCase):
         return archive_path
 
     async def test_finalize_archived_session_indexes_turn_records(self):
-        base = Path("tests") / "_tmp" / f"rag_finalize_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"rag_finalize_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         session_id = "s_finalize_ok"
         try:
@@ -74,7 +74,7 @@ class RAGFinalizationTests(unittest.IsolatedAsyncioTestCase):
             shutil.rmtree(base, ignore_errors=True)
 
     async def test_finalize_archived_session_uses_fallback_chunking_when_missing_method(self):
-        base = Path("tests") / "_tmp" / f"rag_finalize_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"rag_finalize_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         session_id = "s_finalize_fallback"
         try:

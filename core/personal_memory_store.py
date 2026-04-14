@@ -8,6 +8,7 @@ from typing import Any
 from core.io_atomic import atomic_write_text
 from core.paths import (
     PERSONAL_MEMORY_CONTACTS_FILE,
+    PERSONAL_MEMORY_CORRECTIONS_FILE,
     PERSONAL_MEMORY_DIR,
     PERSONAL_MEMORY_IDENTITY_FILE,
     PERSONAL_MEMORY_INDEX_FILE,
@@ -42,6 +43,7 @@ class PersonalMemoryStore:
         "workflow": PERSONAL_MEMORY_WORKFLOW_FILE,
         "contacts": PERSONAL_MEMORY_CONTACTS_FILE,
         "projects": PERSONAL_MEMORY_PROJECTS_FILE,
+        "corrections": PERSONAL_MEMORY_CORRECTIONS_FILE,
     }
 
     def __init__(
@@ -258,7 +260,7 @@ class PersonalMemoryStore:
     @staticmethod
     def _topic_to_schema_type(topic_name: str) -> str:
         topic = topic_name
-        if topic.endswith("s") and topic[:-1] in {"preference", "contact", "project"}:
+        if topic.endswith("s") and topic[:-1] in {"preference", "contact", "project", "correction"}:
             return topic[:-1]
         return topic
 

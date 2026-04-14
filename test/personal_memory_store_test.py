@@ -22,7 +22,7 @@ class PersonalMemoryStoreTests(unittest.TestCase):
         )
 
     def test_write_topic_then_update_index(self) -> None:
-        base = Path("tests") / "_tmp" / f"personal_memory_store_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"personal_memory_store_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = self._make_store(base)
@@ -41,7 +41,7 @@ class PersonalMemoryStoreTests(unittest.TestCase):
             shutil.rmtree(base, ignore_errors=True)
 
     def test_append_daily_log_creates_nested_log_file(self) -> None:
-        base = Path("tests") / "_tmp" / f"personal_memory_log_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"personal_memory_log_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = self._make_store(base)

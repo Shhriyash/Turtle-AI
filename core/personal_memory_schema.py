@@ -11,6 +11,7 @@ ALLOWED_MEMORY_TYPES = frozenset(
         "workflow",
         "contact",
         "project",
+        "correction",
         "index",
         "log",
     }

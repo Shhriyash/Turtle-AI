@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from core.task_history_index import TaskHistoryIndex
 
 
 def _utc_now() -> str:
@@ -26,13 +27,23 @@ class TaskHistoryRecord:
 
 
 class TaskHistoryStore:
-    """Append-only operational task history, separate from personalization memory."""
+    """Append-only operational task history, separate from personalization memory.
+
+    JSONL on disk is the source of truth. A co-located SQLite FTS5 index
+    (``history.sqlite``) is a rebuildable cache used for search and
+    per-session lookups. If the index is missing, empty, or falls behind
+    the JSONL row count, it is rebuilt from the JSONL on init.
+    """
 
     def __init__(self, history_path: Path) -> None:
         self.history_path = history_path
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.history_path.exists():
             self.history_path.touch()
+
+        index_path = self.history_path.with_suffix(".sqlite")
+        self._index = TaskHistoryIndex(index_path)
+        self._sync_index_if_stale()
 
     def record(
         self,
@@ -58,8 +69,10 @@ class TaskHistoryStore:
             outcome=outcome,
             payload=dict(payload) if payload else None,
         )
+        payload_record = _record_to_payload(record)
         with self.history_path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(_record_to_payload(record), ensure_ascii=False) + "\n")
+            file.write(json.dumps(payload_record, ensure_ascii=False) + "\n")
+        self._index.insert_record(payload_record)
         return record
 
     def load_records(self) -> list[dict[str, Any]]:
@@ -81,39 +94,10 @@ class TaskHistoryStore:
 
     def list_by_session(self, session_id: str) -> list[dict[str, Any]]:
         target = str(session_id).strip()
-        return [record for record in self.load_records() if str(record.get("session_id", "")).strip() == target]
+        return self._index.list_by_session(target)
 
     def search(self, query: str, *, max_results: int = 5) -> list[dict[str, Any]]:
-        terms = _tokenize(query)
-        if not terms:
-            return []
-
-        scored: list[tuple[int, dict[str, Any]]] = []
-        for record in self.load_records():
-            haystack = " ".join(
-                [
-                    str(record.get("task_type", "")),
-                    str(record.get("status", "")),
-                    str(record.get("query", "")),
-                    str(record.get("tool_used", "")),
-                    str(record.get("outcome", "")),
-                    json.dumps(record.get("payload", {}), ensure_ascii=False) if record.get("payload") else "",
-                ]
-            ).lower()
-            haystack_terms = set(_tokenize(haystack))
-            score = sum(1 for term in terms if term in haystack_terms)
-            if score <= 0:
-                continue
-            scored.append((score, record))
-
-        scored.sort(
-            key=lambda item: (
-                item[0],
-                str(item[1].get("timestamp", "")),
-            ),
-            reverse=True,
-        )
-        return [record for _, record in scored[:max_results]]
+        return self._index.search(query, max_results=max_results)
 
     def format_search_results(self, query: str, *, max_results: int = 5) -> str:
         results = self.search(query, max_results=max_results)
@@ -140,6 +124,25 @@ class TaskHistoryStore:
 
         return "\n".join(lines)
 
+    def rebuild_index(self) -> int:
+        return self._index.rebuild(self.load_records())
+
+    def _sync_index_if_stale(self) -> None:
+        jsonl_count = self._count_jsonl_records()
+        index_count = self._index.row_count()
+        if index_count != jsonl_count:
+            self.rebuild_index()
+
+    def _count_jsonl_records(self) -> int:
+        if not self.history_path.exists():
+            return 0
+        count = 0
+        with self.history_path.open("r", encoding="utf-8") as file:
+            for line in file:
+                if line.strip():
+                    count += 1
+        return count
+
 
 def _record_to_payload(record: TaskHistoryRecord) -> dict[str, Any]:
     payload = {
@@ -155,7 +158,3 @@ def _record_to_payload(record: TaskHistoryRecord) -> dict[str, Any]:
     if record.payload:
         payload["payload"] = record.payload
     return payload
-
-
-def _tokenize(text: str) -> list[str]:
-    return [token for token in re.findall(r"[a-z0-9@._-]{3,}", str(text).lower())]

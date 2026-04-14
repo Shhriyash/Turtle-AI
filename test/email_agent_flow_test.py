@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 import uuid
 import shutil
 from pathlib import Path
@@ -239,7 +239,7 @@ class EmailFlowTests(unittest.TestCase):
         self.assertTrue(body.strip().endswith("Best regards,\nTurtleAI"))
 
     def test_session_store_persists_pending_email(self) -> None:
-        base = Path("tests") / "_tmp" / f"email_session_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"email_session_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             manifest = base / "session.json"

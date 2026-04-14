@@ -23,7 +23,7 @@ class PersonalMemoryPromptTests(unittest.TestCase):
         )
 
     def test_email_query_prefers_identity_and_contacts_topics(self) -> None:
-        base = Path("tests") / "_tmp" / f"personal_memory_prompt_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"personal_memory_prompt_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = self._make_store(base)
@@ -44,7 +44,7 @@ class PersonalMemoryPromptTests(unittest.TestCase):
             shutil.rmtree(base, ignore_errors=True)
 
     def test_prompt_block_respects_byte_cap(self) -> None:
-        base = Path("tests") / "_tmp" / f"personal_memory_prompt_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"personal_memory_prompt_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = self._make_store(base)

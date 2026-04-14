@@ -1,4 +1,4 @@
-﻿import shutil
+import shutil
 import unittest
 import uuid
 from pathlib import Path
@@ -8,7 +8,7 @@ from core.graph_store import GraphContextQuery, GraphStore
 
 class GraphStoreTests(unittest.TestCase):
     def test_rebuild_and_query_context(self) -> None:
-        base = Path("tests") / "_tmp" / f"graph_store_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"graph_store_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             graph_path = base / "graph.json"

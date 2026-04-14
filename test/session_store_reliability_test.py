@@ -11,7 +11,7 @@ from core.session_store import SessionStore
 
 class SessionStoreLayoutTests(unittest.TestCase):
     def test_default_layout_namespaces_active_session_by_session_id(self) -> None:
-        base = Path("tests") / "_tmp" / f"session_store_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"session_store_{uuid.uuid4().hex}"
         active_dir = base / "active"
         archive_dir = base / "archive"
         base.mkdir(parents=True, exist_ok=True)
@@ -54,7 +54,7 @@ class SessionStoreLayoutTests(unittest.TestCase):
             shutil.rmtree(base, ignore_errors=True)
 
     def test_append_only_updates_use_delta_log(self) -> None:
-        base = Path("tests") / "_tmp" / f"session_store_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"session_store_{uuid.uuid4().hex}"
         active_dir = base / "active"
         archive_dir = base / "archive"
         base.mkdir(parents=True, exist_ok=True)

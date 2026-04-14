@@ -22,7 +22,7 @@ class PersonalMemorySnapshotTests(unittest.TestCase):
         )
 
     def test_profile_snapshot_is_derived_from_markdown_topics(self) -> None:
-        base = Path("tests") / "_tmp" / f"personal_memory_snapshot_{uuid.uuid4().hex}"
+        base = Path("test") / "_tmp" / f"personal_memory_snapshot_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
             store = self._make_store(base)

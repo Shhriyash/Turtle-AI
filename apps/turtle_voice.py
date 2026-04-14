@@ -8,6 +8,8 @@ import asyncio
 import os
 import sys
 from dataclasses import dataclass, field
+import hashlib
+import re
 from typing import Optional, Generator, Tuple
 from urllib.parse import urlsplit, urlunsplit
 import httpx
@@ -55,8 +57,13 @@ from core.email_flow import (
 from core.output_clean import clean_text_for_model, clean_text_for_tts
 from core.graph_store import GraphStore
 from core.memory_store import MemoryStore
-from core.personal_memory_extract import extract_memory_candidates_from_messages
-from core.personal_memory_merge import merge_personal_memory_candidates
+from core.confirmation_gate import ConfirmationGate
+from core.dream_pass import DreamPass
+from core.memory_journal import JournalStore, make_event
+from core.retrieval_broker import RetrievalBroker
+from core.memory_extractor import extract_memory_event_specs
+from core.memory_replayer import replay
+from core.personal_memory_extract import PersonalMemoryCandidate, extract_memory_candidates_from_messages
 from core.personal_memory_prompt import PersonalMemoryPromptBuilder, PersonalMemoryPromptConfig
 from core.personal_memory_store import PersonalMemoryStore
 from core.task_history import TaskHistoryStore
@@ -64,6 +71,8 @@ from core.paths import (
     MEMORY_EPISODES_FILE,
     MEMORY_EVENTS_FILE,
     MEMORY_GRAPH_FILE,
+    PERSONAL_MEMORY_DIR,
+    PERSONAL_MEMORY_SNAPSHOTS_DIR,
     MEMORY_PROFILE_FILE,
     MEMORY_STATE_FILE,
     TASK_HISTORY_FILE,
@@ -101,10 +110,13 @@ class SharedState:
     memory_store: MemoryStore
     personal_memory_store: PersonalMemoryStore
     personal_memory_prompt: PersonalMemoryPromptBuilder
+    journal_store: JournalStore
+    confirmation_gate: ConfirmationGate
     task_history_store: TaskHistoryStore
     rag_system: TurtleRAGSystem
     search_cache: dict[str, str] = field(default_factory=dict)
     turn_counter: int = 0
+    retrieval_broker: RetrievalBroker | None = field(default=None)
 
 
 class TurtleVoiceProcessor:
@@ -229,6 +241,10 @@ MEMORY_PROFILE_MAX_LINES = int(os.getenv("TURTLE_MEMORY_PROFILE_MAX_LINES", "6")
 PERSONAL_MEMORY_ENABLED = os.getenv("TURTLE_PERSONAL_MEMORY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 PERSONAL_MEMORY_MAX_BYTES = int(os.getenv("TURTLE_PERSONAL_MEMORY_MAX_BYTES", "2048"))
 PERSONAL_MEMORY_MAX_TOPIC_FILES = int(os.getenv("TURTLE_PERSONAL_MEMORY_MAX_TOPIC_FILES", "2"))
+PERSONAL_MEMORY_STAGE_B_ENABLED = os.getenv("TURTLE_PERSONAL_MEMORY_STAGE_B_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+PERSONAL_MEMORY_STAGE_B_MAX_TURNS = int(os.getenv("TURTLE_PERSONAL_MEMORY_STAGE_B_MAX_TURNS", "60"))
+PERSONAL_MEMORY_STAGE_B_MAX_CANDIDATES = int(os.getenv("TURTLE_PERSONAL_MEMORY_STAGE_B_MAX_CANDIDATES", "8"))
+PERSONAL_MEMORY_DREAM_PASS_ENABLED = os.getenv("TURTLE_PERSONAL_MEMORY_DREAM_PASS_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 INTERACTION_MODE = os.getenv("TURTLE_INTERACTION_MODE", "ask").strip().lower()
 TOOL_OUTPUT_MAX_CHARS = int(os.getenv("TURTLE_TOOL_OUTPUT_MAX_CHARS", "3500"))
 
@@ -278,6 +294,289 @@ def _detect_task_type(user_text: str) -> str:
     return "general"
 
 
+def _parse_confirmation_answer(user_text: str) -> bool | None:
+    text = " ".join(str(user_text).strip().lower().split())
+    if not text:
+        return None
+
+    yes_prefixes = (
+        "yes",
+        "y",
+        "yeah",
+        "yep",
+        "sure",
+        "ok",
+        "okay",
+        "please do",
+        "go ahead",
+        "affirmative",
+    )
+    no_prefixes = (
+        "no",
+        "n",
+        "nope",
+        "nah",
+        "not now",
+        "don't",
+        "do not",
+        "skip",
+        "negative",
+    )
+
+    if any(text == token or text.startswith(f"{token} ") for token in yes_prefixes):
+        return True
+    if any(text == token or text.startswith(f"{token} ") for token in no_prefixes):
+        return False
+    return None
+
+
+def _maybe_handle_confirmation_turn(state: SharedState, user_text: str) -> str | None:
+    prompt = state.confirmation_gate.next_prompt()
+    if prompt is None:
+        return None
+
+    accepted = _parse_confirmation_answer(user_text)
+    if accepted is None:
+        return f"Quick check: {prompt.question} Please answer yes or no."
+
+    state.confirmation_gate.record_response(prompt.event_id, accepted=accepted)
+    if accepted:
+        return "Got it. I will remember that."
+    return "Understood. I will not store that preference."
+
+
+def _normalize_behavior_event_for_gate(event: dict[str, object]) -> tuple[str, str, dict[str, object]] | None:
+    key = str(event.get("key", "")).strip()
+    value = event.get("value", {})
+    if not key or not isinstance(value, dict):
+        return None
+
+    if key == "workflow.email_interaction":
+        try:
+            count = int(value.get("count", 1) or 1)
+        except Exception:
+            count = 1
+        return ("workflow", "workflow.email_interactions_recorded", {"count": count})
+
+    if key == "workflow.common_recipient":
+        recipient = str(value.get("recipient", "")).strip().lower()
+        if not recipient:
+            return None
+        try:
+            count = int(value.get("count", 1) or 1)
+        except Exception:
+            count = 1
+        return (
+            "contacts",
+            f"contacts.frequent_recipient.{recipient}",
+            {"email": recipient, "count": count},
+        )
+
+    return None
+
+
+def _queue_non_explicit_behavior_candidates(
+    state: SharedState,
+    *,
+    session_id: str,
+    turn_id: str,
+    user_text: str,
+    task_type: str,
+) -> int:
+    profile = state.personal_memory_store.load_profile_snapshot()
+    event_specs = extract_memory_event_specs(
+        user_text=user_text,
+        task_type=task_type,
+        profile=profile,
+        mode="deterministic",
+    )
+
+    queued = 0
+    for index, event in enumerate(event_specs):
+        kind = str(event.get("kind", "")).strip().lower()
+        source = str(event.get("source", "")).strip().lower()
+        if kind != "behavior" or source == "explicit":
+            continue
+
+        try:
+            confidence = float(event.get("confidence", 0.0) or 0.0)
+        except Exception:
+            confidence = 0.0
+        # Keep deterministic noise out of the queue; Stage B/C candidates are expected to be stronger.
+        if confidence < 0.7:
+            continue
+
+        normalized = _normalize_behavior_event_for_gate(event)
+        if normalized is None:
+            continue
+        topic, key, value = normalized
+
+        stable_input = (
+            f"{session_id}|{turn_id}|{key}|"
+            f"{json.dumps(value, ensure_ascii=False, sort_keys=True)}"
+        )
+        event_id = f"cand_{hashlib.sha1(stable_input.encode('utf-8')).hexdigest()[:20]}"
+        source_value = source if source in {"inferred", "synthesized"} else "inferred"
+
+        candidate = make_event(
+            event_id=event_id,
+            kind="behavior",
+            topic=topic,
+            key=key,
+            value=value,
+            confidence=confidence,
+            source=source_value,
+            extractor="deterministic",
+            session_id=session_id,
+            turn_id=f"{turn_id}_mem_{index}",
+            evidence={
+                "user_text": user_text,
+                "observation_count": 1,
+            },
+            applied=False,
+        )
+
+        if state.confirmation_gate.queue_candidate(candidate):
+            queued += 1
+
+    return queued
+
+
+def _kind_for_candidate(candidate: PersonalMemoryCandidate) -> str:
+    if candidate.topic in {"identity", "contacts", "projects"}:
+        return "fact"
+    if candidate.topic == "corrections":
+        return "correction"
+    return "preference"
+
+
+def _source_for_candidate(candidate: PersonalMemoryCandidate) -> str:
+    source = str(candidate.source).strip().lower()
+    if source in {"explicit", "inferred", "synthesized", "migration"}:
+        return source
+    return "inferred"
+
+
+def _extractor_for_candidate(candidate: PersonalMemoryCandidate) -> str:
+    extraction_source = str(candidate.extraction_source).strip().lower()
+    if "dream" in extraction_source:
+        return "dream_pass"
+    if "llm" in extraction_source:
+        return "llm_turn"
+    return "deterministic"
+
+
+def _confidence_for_candidate(candidate: PersonalMemoryCandidate) -> float:
+    if candidate.confidence == "confirmed":
+        return 1.0
+    if candidate.confidence == "inferred":
+        return 0.8
+    return 0.5
+
+
+def _should_auto_apply_event(*, kind: str, source: str, confidence: float) -> bool:
+    return kind == "fact" and source == "explicit" and confidence >= 0.95
+
+
+def _candidate_to_journal_event(
+    *,
+    candidate: PersonalMemoryCandidate,
+    session_id: str,
+    ordinal: int,
+) -> object | None:
+    topic = candidate.topic
+    key = candidate.key
+    value_text = str(candidate.value).strip()
+    value_lower = value_text.lower()
+    if not value_text:
+        return None
+
+    event_key = ""
+    event_value: dict[str, object] = {}
+
+    if topic == "identity" and key == "name":
+        event_key = "identity.name"
+        event_value = {"name": value_text}
+    elif topic == "identity" and key == "primary_email":
+        event_key = "identity.primary_email"
+        event_value = {"primary_email": value_lower}
+    elif topic == "identity" and key.startswith("known_email:"):
+        email = key.split(":", 1)[1].strip().lower() or value_lower
+        if not email:
+            return None
+        event_key = f"identity.known_email.{email}"
+        event_value = {"email": email}
+    elif topic == "preferences" and key == "response_style":
+        event_key = "preferences.response_style"
+        event_value = {"response_style": value_text}
+    elif topic == "preferences" and key == "humor_level":
+        event_key = "preferences.humor_level"
+        event_value = {"humor_level": value_text}
+    elif topic == "preferences" and key == "email_tone":
+        event_key = "preferences.email_tone"
+        event_value = {"email_tone": value_text}
+    elif topic == "workflow" and key == "prefers_draft_before_send":
+        event_key = "workflow.prefers_draft_before_send"
+        event_value = {
+            "prefers_draft_before_send": value_lower in {"true", "1", "yes", "y"}
+        }
+    elif topic == "workflow" and key == "primary_llm":
+        event_key = "workflow.primary_llm"
+        event_value = {"primary_llm": value_text}
+    elif topic == "contacts" and key.startswith("frequent_recipient:"):
+        email = key.split(":", 1)[1].strip().lower() or value_lower
+        if not email:
+            return None
+        event_key = f"contacts.frequent_recipient.{email}"
+        event_value = {"email": email}
+    elif topic == "projects" and key.startswith("project:"):
+        slug = key.split(":", 1)[1].strip().lower().replace(" ", "_")
+        if not slug:
+            return None
+        event_key = f"projects.project.{slug}"
+        event_value = {"name": value_text}
+    elif topic == "corrections":
+        slug = key.strip().replace(" ", "_") or "note"
+        event_key = f"corrections.{slug}"
+        event_value = {"summary": value_text}
+    else:
+        return None
+
+    stable_payload = {
+        "session": session_id,
+        "topic": topic,
+        "key": event_key,
+        "value": event_value,
+        "evidence": candidate.evidence,
+        "ord": ordinal,
+    }
+    digest = hashlib.sha1(
+        json.dumps(stable_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    kind = _kind_for_candidate(candidate)
+    source = _source_for_candidate(candidate)
+    confidence = _confidence_for_candidate(candidate)
+
+    return make_event(
+        event_id=f"sync_{digest[:22]}",
+        kind=kind,
+        topic=topic,
+        key=event_key,
+        value=event_value,
+        confidence=confidence,
+        source=source,
+        extractor=_extractor_for_candidate(candidate),
+        session_id=session_id,
+        turn_id=f"{session_id}_sync_{ordinal}",
+        evidence={
+            "user_text": candidate.evidence,
+            "observation_count": 1,
+        },
+        applied=_should_auto_apply_event(kind=kind, source=source, confidence=confidence),
+    )
+
+
 def _compose_prompt_with_memory(user_text: str, memory_context: str | list[str]) -> str:
     if isinstance(memory_context, list):
         context = "\n".join(memory_context).strip()
@@ -294,7 +593,20 @@ def _compose_prompt_with_memory(user_text: str, memory_context: str | list[str])
     )
 
 
-def _resolve_memory_context(state: SharedState, *, task_type: str, user_text: str) -> str:
+async def _resolve_memory_context(state: SharedState, *, task_type: str, user_text: str) -> str:
+    # Primary path: retrieval broker (Step 7 — token-budgeted, tier-ordered).
+    if PERSONAL_MEMORY_ENABLED and state.retrieval_broker is not None:
+        try:
+            block = await state.retrieval_broker.build_context(
+                task_type=task_type,
+                query=user_text,
+            )
+            if block:
+                return block
+        except Exception as e:
+            print(f"LOG: Retrieval broker failed, using prompt-builder fallback: {e}")
+
+    # First fallback: existing PersonalMemoryPromptBuilder (no episodic/task tiers).
     if PERSONAL_MEMORY_ENABLED:
         try:
             personal_block = state.personal_memory_prompt.build_memory_block(
@@ -306,7 +618,7 @@ def _resolve_memory_context(state: SharedState, *, task_type: str, user_text: st
         except Exception as e:
             print(f"LOG: Personal memory prompt build failed, using compatibility fallback: {e}")
 
-    # Deprecated fallback path: JSON profile + graph-derived context.
+    # Deprecated fallback: JSON profile + graph-derived context.
     fallback_lines = state.memory_store.get_context_lines(task_type=task_type, query=user_text)
     return "\n".join(fallback_lines).strip()
 
@@ -330,25 +642,267 @@ def _sync_personal_memory_from_messages(
         if not candidates:
             return
 
-        result = merge_personal_memory_candidates(
-            store=state.personal_memory_store,
-            candidates=candidates,
-        )
-        if result.written_topics:
-            topics = ", ".join(result.written_topics)
+        events = [
+            event
+            for index, candidate in enumerate(candidates)
+            for event in [_candidate_to_journal_event(candidate=candidate, session_id=session_id, ordinal=index)]
+            if event is not None
+        ]
+        if not events:
+            return
+
+        state.journal_store.append_many(events)
+
+        queued_candidates = 0
+        for event in events:
+            if event.applied:
+                continue
+            if event.source == "explicit":
+                continue
+            if state.confirmation_gate.queue_candidate(event):
+                queued_candidates += 1
+
+        replay_result = replay(state.journal_store.load_all(), store=state.personal_memory_store)
+
+        if replay_result.written_topics or replay_result.cleared_topics:
+            topics = ", ".join(replay_result.written_topics) if replay_result.written_topics else "none"
             state.personal_memory_store.append_daily_log(
-                f"Merged personal memory topics: {topics}",
+                f"Replayed personal memory topics: {topics}",
                 session_id=session_id,
             )
             print(
                 f"LOG: Personal memory updated for {session_id} "
-                f"({result.written_candidate_count} candidate merges across {topics})"
+                f"({len(events)} events -> {replay_result.resolved_event_count} resolved entries across {topics})"
             )
+            if queued_candidates:
+                print(
+                    f"LOG: Queued {queued_candidates} inferred memory candidate(s) for confirmation"
+                )
     except Exception as e:
         print(f"LOG: Personal memory sync failed for {session_id}: {e}")
 
 
-def _sync_personal_memory_from_archive(
+def _extract_stage_b_json_array(raw_text: str) -> list[dict[str, object]]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return []
+
+    candidates: list[str] = [text]
+
+    fenced = re.search(r"```(?:json)?\s*(\[.*\])\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidates.insert(0, fenced.group(1).strip())
+
+    bracketed = re.search(r"\[.*\]", text, flags=re.DOTALL)
+    if bracketed:
+        candidates.append(bracketed.group(0).strip())
+
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except Exception:
+            continue
+        if not isinstance(payload, list):
+            continue
+        normalized: list[dict[str, object]] = []
+        for item in payload:
+            if isinstance(item, dict):
+                normalized.append(item)
+        return normalized
+
+    return []
+
+
+def _stage_b_turns_from_messages(message_history: list[ModelMessage], max_turns: int) -> list[dict[str, str]]:
+    turns: list[dict[str, str]] = []
+    for message in message_history:
+        if isinstance(message, ModelRequest):
+            for part in message.parts:
+                if not isinstance(part, UserPromptPart):
+                    continue
+                text = str(part.content).strip()
+                if not text:
+                    continue
+                turns.append({"role": "user", "text": text})
+        elif isinstance(message, ModelResponse):
+            text = str(message.text or "").strip()
+            if text:
+                turns.append({"role": "assistant", "text": text})
+
+    if max_turns <= 0:
+        return turns
+    return turns[-max_turns:]
+
+
+async def _run_stage_b_session_extractor(
+    state: SharedState,
+    *,
+    session_id: str,
+    message_history: list[ModelMessage],
+) -> int:
+    if not PERSONAL_MEMORY_ENABLED or not PERSONAL_MEMORY_STAGE_B_ENABLED:
+        return 0
+    if not session_id or not message_history:
+        return 0
+
+    stage_b_model = get_groq_model(model_name="openai/gpt-oss-120b", settings=model_settings)
+    if stage_b_model is None:
+        print(f"LOG: Stage B skipped for {session_id} (Groq unavailable)")
+        return 0
+
+    turns = _stage_b_turns_from_messages(message_history, PERSONAL_MEMORY_STAGE_B_MAX_TURNS)
+    if not turns:
+        return 0
+
+    profile = state.personal_memory_store.load_profile_snapshot()
+    prompt = (
+        "Extract candidate personal-memory events from this session.\n"
+        "Return ONLY JSON array. No prose.\n"
+        "Each item must include: kind, topic, key, value, confidence, source, evidence.\n"
+        "Rules:\n"
+        "- source must be inferred or synthesized (never explicit).\n"
+        "- confidence in [0,1].\n"
+        "- topic in: identity, preferences, workflow, contacts, projects, corrections.\n"
+        "- key should be stable dotted path.\n"
+        "- value must be an object.\n"
+        "- Max candidates: "
+        f"{PERSONAL_MEMORY_STAGE_B_MAX_CANDIDATES}.\n\n"
+        f"Current profile snapshot:\n{json.dumps(profile, ensure_ascii=False, indent=2)}\n\n"
+        f"Session turns:\n{json.dumps(turns, ensure_ascii=False, indent=2)}"
+    )
+
+    extractor_agent = Agent(
+        stage_b_model,
+        deps_type=SharedState,
+        output_type=str,
+        output_retries=1,
+        instructions="Return only valid JSON array.",
+    )
+
+    try:
+        result = await extractor_agent.run(prompt, deps=state)
+    except Exception as e:
+        print(f"LOG: Stage B skipped for {session_id} (model unavailable: {e})")
+        return 0
+
+    raw_items = _extract_stage_b_json_array(result.output)
+    if not raw_items:
+        return 0
+
+    events = []
+    for index, item in enumerate(raw_items[:PERSONAL_MEMORY_STAGE_B_MAX_CANDIDATES]):
+        kind = str(item.get("kind", "")).strip().lower()
+        topic = str(item.get("topic", "")).strip().lower()
+        key = str(item.get("key", "")).strip()
+        value = item.get("value", {})
+        source = str(item.get("source", "inferred")).strip().lower()
+        evidence = item.get("evidence", {})
+        try:
+            confidence = float(item.get("confidence", 0.0) or 0.0)
+        except Exception:
+            confidence = 0.0
+
+        if kind not in {"fact", "preference", "behavior", "correction", "contradiction"}:
+            continue
+        if topic not in {"identity", "preferences", "workflow", "contacts", "projects", "corrections"}:
+            continue
+        if not key or not isinstance(value, dict):
+            continue
+        if source not in {"inferred", "synthesized"}:
+            source = "inferred"
+        confidence = max(0.0, min(1.0, confidence))
+        if not isinstance(evidence, dict):
+            evidence = {"note": str(evidence)}
+
+        payload_for_id = {
+            "session": session_id,
+            "kind": kind,
+            "topic": topic,
+            "key": key,
+            "value": value,
+            "idx": index,
+        }
+        digest = hashlib.sha1(
+            json.dumps(payload_for_id, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+        events.append(
+            make_event(
+                event_id=f"stageb_{digest[:20]}",
+                kind=kind,
+                topic=topic,
+                key=key,
+                value=value,
+                confidence=confidence,
+                source=source,
+                extractor="llm_turn",
+                session_id=session_id,
+                turn_id=f"{session_id}_stageb_{index}",
+                evidence=evidence,
+                applied=False,
+            )
+        )
+
+    if not events:
+        return 0
+
+    state.journal_store.append_many(events)
+    queued = 0
+    for event in events:
+        if state.confirmation_gate.queue_candidate(event):
+            queued += 1
+
+    state.personal_memory_store.append_daily_log(
+        f"Stage B candidates written: {len(events)} (queued: {queued})",
+        session_id=session_id,
+    )
+    print(f"LOG: Stage B wrote {len(events)} candidates for {session_id} (queued: {queued})")
+    return len(events)
+
+
+async def _run_dream_pass_if_needed(
+    state: SharedState,
+    *,
+    session_id: str,
+) -> None:
+    """Run Stage C (dream pass) at session end if trigger conditions are met.
+
+    Guards: PERSONAL_MEMORY_ENABLED + PERSONAL_MEMORY_DREAM_PASS_ENABLED flags.
+    If Groq is unavailable the pass is skipped silently.
+    """
+    if not PERSONAL_MEMORY_ENABLED or not PERSONAL_MEMORY_DREAM_PASS_ENABLED:
+        return
+    if not session_id:
+        return
+
+    dream_pass = DreamPass(
+        journal=state.journal_store,
+        store=state.personal_memory_store,
+        confirmation_gate=state.confirmation_gate,
+        state_path=PERSONAL_MEMORY_DIR / "dream_pass_state.json",
+        snapshots_dir=PERSONAL_MEMORY_SNAPSHOTS_DIR,
+    )
+
+    if not dream_pass.should_run():
+        print(f"LOG: Dream pass skipped for {session_id} (trigger not met)")
+        return
+
+    groq_model = get_groq_model(model_name="openai/gpt-oss-120b", settings=model_settings)
+    if groq_model is None:
+        print(f"LOG: Dream pass skipped for {session_id} (Groq unavailable)")
+        return
+
+    result = await dream_pass.run(session_id=session_id, model=groq_model)
+    if result.skipped_reason:
+        print(f"LOG: Dream pass skipped for {session_id}: {result.skipped_reason}")
+    if result.rolled_back:
+        print(
+            f"LOG: Dream pass rolled back for {session_id}: "
+            f"{result.sanity_failures}"
+        )
+
+
+async def _sync_personal_memory_from_archive(
     state: SharedState,
     *,
     session_id: str | None,
@@ -372,6 +926,18 @@ def _sync_personal_memory_from_archive(
         session_id=session_id,
         message_history=message_history,
     )
+    try:
+        await _run_stage_b_session_extractor(
+            state,
+            session_id=session_id,
+            message_history=message_history,
+        )
+    except Exception as e:
+        print(f"LOG: Stage B session extractor failed for {session_id}: {e}")
+    try:
+        await _run_dream_pass_if_needed(state, session_id=session_id)
+    except Exception as e:
+        print(f"LOG: Dream pass failed for {session_id}: {e}")
 
 
 def _record_task_history(
@@ -764,8 +1330,13 @@ async def text_chat(state: SharedState, return_to_voice: bool = True):
                 if not user_input:
                     continue
 
+                confirmation_reply = _maybe_handle_confirmation_turn(state, user_input)
+                if confirmation_reply:
+                    print(f"Turtle: {confirmation_reply}")
+                    continue
+
                 task_type = _detect_task_type(user_input)
-                memory_context = _resolve_memory_context(state, task_type=task_type, user_text=user_input)
+                memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=user_input)
                 prompt_input = _compose_prompt_with_memory(user_input, memory_context)
                 turn_id = _new_turn_id(state)
                 
@@ -796,6 +1367,15 @@ async def text_chat(state: SharedState, return_to_voice: bool = True):
                     assistant_text=final_output,
                     task_type=task_type,
                 )
+                queued = _queue_non_explicit_behavior_candidates(
+                    state,
+                    session_id=state.session_store.session_id or "unknown_session",
+                    turn_id=turn_id,
+                    user_text=user_input,
+                    task_type=task_type,
+                )
+                if queued:
+                    print(f"LOG: Queued {queued} memory confirmation candidate(s)")
                 
                 # Show usage information periodically
                 if usage.requests % 5 == 0 and usage.requests > 0:
@@ -844,9 +1424,17 @@ async def voice_response_handler(audio: Tuple[int, np.ndarray], state: SharedSta
             return True
     
     try:
+        confirmation_reply = _maybe_handle_confirmation_turn(state, transcription)
+        if confirmation_reply:
+            print(f"Turtle: {confirmation_reply}")
+            speech_file = voice_processor.text_to_speech(clean_text_for_tts(confirmation_reply))
+            if speech_file and speech_file.exists():
+                voice_processor.play_audio(speech_file)
+            return False
+
         # Get response from main assistant
         task_type = _detect_task_type(transcription)
-        memory_context = _resolve_memory_context(state, task_type=task_type, user_text=transcription)
+        memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=transcription)
         prompt_input = _compose_prompt_with_memory(transcription, memory_context)
         turn_id = _new_turn_id(state)
 
@@ -875,6 +1463,15 @@ async def voice_response_handler(audio: Tuple[int, np.ndarray], state: SharedSta
             assistant_text=final_output,
             task_type=task_type,
         )
+        queued = _queue_non_explicit_behavior_candidates(
+            state,
+            session_id=state.session_store.session_id or "unknown_session",
+            turn_id=turn_id,
+            user_text=transcription,
+            task_type=task_type,
+        )
+        if queued:
+            print(f"LOG: Queued {queued} memory confirmation candidate(s)")
 
         # Generate and play TTS
         tts_start_time = time.time()
@@ -922,6 +1519,12 @@ async def voice_chat():
             write_enabled=False,
         )
         personal_memory_store = PersonalMemoryStore()
+        journal_store = JournalStore()
+        confirmation_gate = ConfirmationGate(
+            journal=journal_store,
+            store=personal_memory_store,
+            state_path=PERSONAL_MEMORY_DIR / "confirmation_state.json",
+        )
         personal_memory_prompt = PersonalMemoryPromptBuilder(
             personal_memory_store,
             config=PersonalMemoryPromptConfig(
@@ -931,14 +1534,22 @@ async def voice_chat():
         )
         task_history_store = TaskHistoryStore(TASK_HISTORY_FILE)
         rag_system = TurtleRAGSystem()
+        retrieval_broker = RetrievalBroker(
+            store=personal_memory_store,
+            task_store=task_history_store,
+            rag_system=rag_system,
+        )
         state = SharedState(
             http_client=client,
             session_store=session_store,
             memory_store=memory_store,
             personal_memory_store=personal_memory_store,
             personal_memory_prompt=personal_memory_prompt,
+            journal_store=journal_store,
+            confirmation_gate=confirmation_gate,
             task_history_store=task_history_store,
             rag_system=rag_system,
+            retrieval_broker=retrieval_broker,
         )
         voice_processor = TurtleVoiceProcessor(state)
         if restore_result.had_corrupt_active:
@@ -946,7 +1557,7 @@ async def voice_chat():
 
         for pending_session_id, pending_archive_path in session_store.list_pending_finalization_archives():
             print(f"LOG: Finalizing archived session {pending_session_id}")
-            _sync_personal_memory_from_archive(
+            await _sync_personal_memory_from_archive(
                 state,
                 session_id=pending_session_id,
                 archive_path=pending_archive_path,
@@ -1093,7 +1704,7 @@ async def voice_chat():
             session_id = state.session_store.session_id
             archive_path = state.session_store.archive_active(status="pending_finalization")
             if session_id and archive_path:
-                _sync_personal_memory_from_archive(
+                await _sync_personal_memory_from_archive(
                     state,
                     session_id=session_id,
                     archive_path=archive_path,
@@ -1138,6 +1749,12 @@ async def text_mode_chat():
             write_enabled=False,
         )
         personal_memory_store = PersonalMemoryStore()
+        journal_store = JournalStore()
+        confirmation_gate = ConfirmationGate(
+            journal=journal_store,
+            store=personal_memory_store,
+            state_path=PERSONAL_MEMORY_DIR / "confirmation_state.json",
+        )
         personal_memory_prompt = PersonalMemoryPromptBuilder(
             personal_memory_store,
             config=PersonalMemoryPromptConfig(
@@ -1147,21 +1764,29 @@ async def text_mode_chat():
         )
         task_history_store = TaskHistoryStore(TASK_HISTORY_FILE)
         rag_system = TurtleRAGSystem()
+        retrieval_broker = RetrievalBroker(
+            store=personal_memory_store,
+            task_store=task_history_store,
+            rag_system=rag_system,
+        )
         state = SharedState(
             http_client=client,
             session_store=session_store,
             memory_store=memory_store,
             personal_memory_store=personal_memory_store,
             personal_memory_prompt=personal_memory_prompt,
+            journal_store=journal_store,
+            confirmation_gate=confirmation_gate,
             task_history_store=task_history_store,
             rag_system=rag_system,
+            retrieval_broker=retrieval_broker,
         )
         if restore_result.had_corrupt_active:
             print("LOG: Corrupt active session files were quarantined before starting a new session")
 
         for pending_session_id, pending_archive_path in session_store.list_pending_finalization_archives():
             print(f"LOG: Finalizing archived session {pending_session_id}")
-            _sync_personal_memory_from_archive(
+            await _sync_personal_memory_from_archive(
                 state,
                 session_id=pending_session_id,
                 archive_path=pending_archive_path,
@@ -1204,7 +1829,7 @@ async def text_mode_chat():
             session_id = state.session_store.session_id
             archive_path = state.session_store.archive_active(status="pending_finalization")
             if session_id and archive_path:
-                _sync_personal_memory_from_archive(
+                await _sync_personal_memory_from_archive(
                     state,
                     session_id=session_id,
                     archive_path=archive_path,
