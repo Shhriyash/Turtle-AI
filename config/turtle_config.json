@@ -1,4 +1,4 @@
-﻿{
+{
   "OPEN_ROUTER_MODEL": "nvidia/nemotron-3-nano-30b-a3b:free",
   "OPENROUTER_MODEL": "nvidia/nemotron-3-nano-30b-a3b:free",
   "OPENROUTER_APP_URL": "",
@@ -9,6 +9,7 @@
   "DEEPGRAM_TTS_ENCODING": "linear16",
   "DEEPGRAM_TTS_CONTAINER": "wav",
   "DEEPGRAM_TTS_SAMPLE_RATE": 24000,
+  "DEEPGRAM_TTS_VOICE": "orion",
   "GROQ_TTS_MODEL": "canopylabs/orpheus-v1-english",
   "GROQ_TTS_VOICE": "orion",
   "GROQ_TTS_FORMAT": "wav",
@@ -20,5 +21,9 @@
   "TURTLE_MEMORY_FLUSH_TURNS": 20,
   "TURTLE_MEMORY_FLUSH_TOKENS": 20000,
   "TURTLE_MEMORY_PROFILE_MAX_LINES": 6,
-  "TTS_DEBUG": false
+  "TTS_DEBUG": false,
+  "temperature": 0.2,
+  "max_tokens": 1024,
+  "SERVER_HOST": "127.0.0.1",
+  "SERVER_PORT": 8765
 }

@@ -1,4 +1,4 @@
-﻿# Core
+# Core
 pydantic-ai==1.67.0
 openai==2.26.0
 python-dotenv==1.2.2
@@ -27,6 +27,11 @@ sounddevice==0.5.5
 scipy==1.17.1
 fastrtc==0.0.34
 keyboard==0.13.5
+
+# Web server
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+websockets>=15.0
 
 # Observability
 logfire==4.27.0
