@@ -1,13 +1,10 @@
 /**
  * websocket.js — WebSocket connection, reconnect, message dispatch
- *
- * Handles connecting, auto-reconnect, keep-alive ping,
- * and dispatching incoming messages to the right handler.
  */
 
 import AppState from './state.js';
 import { setStatus, showBanner, hideBanner, showToast } from './utils.js';
-import { addMessage, showThinking, hideThinking } from './chat.js';
+import { addMessage, showThinking, hideThinking, setBubbleState } from './chat.js';
 import { playAudioBlob } from './voice.js';
 import { updateTimings } from './devmode.js';
 
@@ -25,6 +22,7 @@ export function connectWebSocket() {
     AppState.ws.onopen = () => {
         AppState.isConnected = true;
         setStatus('ready', 'Ready');
+        setBubbleState('idle');
         hideBanner();
         showToast('Connected to Turtle AI');
     };
@@ -32,6 +30,7 @@ export function connectWebSocket() {
     AppState.ws.onclose = () => {
         AppState.isConnected = false;
         setStatus('disconnected', 'Disconnected');
+        setBubbleState('idle');
         showBanner();
     };
 
@@ -42,92 +41,79 @@ export function connectWebSocket() {
     };
 
     AppState.ws.onmessage = (event) => {
-        // Binary frame → audio playback
         if (event.data instanceof Blob) {
             playAudioBlob(event.data);
             return;
         }
-
         try {
-            const msg = JSON.parse(event.data);
-            handleServerMessage(msg);
+            handleServerMessage(JSON.parse(event.data));
         } catch (e) {
             console.error('Failed to parse message:', e);
         }
     };
 }
 
-/** Dispatch a parsed server JSON message to the right handler */
 function handleServerMessage(msg) {
     switch (msg.type) {
         case 'status':
             handleStatusMessage(msg);
             break;
-
         case 'transcription':
             addMessage('user', msg.text);
             break;
-
         case 'done':
             hideThinking();
             addMessage('assistant', msg.content);
             setStatus('ready', 'Ready');
+            setBubbleState('idle');
             break;
-
         case 'timing':
             updateTimings(msg);
             break;
-
         case 'error':
             hideThinking();
             setStatus('ready', 'Ready');
+            setBubbleState('idle');
             showToast(msg.message, true);
             break;
-
         case 'pong':
             break;
-
         default:
-            console.log('Unknown message type:', msg);
+            console.log('Unknown:', msg);
     }
 }
 
-/** Map server status values to UI state */
 function handleStatusMessage(msg) {
     const labelMap = {
         ready:        'Ready',
-        thinking:     'Thinking...',
-        transcribing: 'Transcribing...',
-        speaking:     'Speaking...',
+        thinking:     'Thinking',
+        transcribing: 'Transcribing',
+        speaking:     'Speaking',
         restored:     'Session restored',
     };
 
     setStatus(msg.status, labelMap[msg.status] || msg.status);
+    setBubbleState(msg.status);
 
     if (msg.status === 'thinking') {
-        showThinking('Turtle is thinking...');
+        showThinking('Thinking');
     } else if (msg.status === 'transcribing') {
-        showThinking('Transcribing speech...');
+        showThinking('Transcribing');
     } else if (msg.status === 'speaking') {
-        showThinking('Generating speech...');
+        showThinking('Speaking');
     } else if (msg.status === 'ready' || msg.status === 'restored') {
         hideThinking();
     }
 }
 
-/** Start keep-alive ping and auto-reconnect intervals */
 export function startConnectionWatchdog() {
-    // Keep-alive ping every 30s
     setInterval(() => {
         if (AppState.ws && AppState.ws.readyState === WebSocket.OPEN) {
             AppState.ws.send(JSON.stringify({ type: 'ping' }));
         }
     }, 30000);
 
-    // Auto-reconnect every 5s when disconnected
     setInterval(() => {
-        if (!AppState.isConnected) {
-            connectWebSocket();
-        }
+        if (!AppState.isConnected) connectWebSocket();
     }, 5000);
 }

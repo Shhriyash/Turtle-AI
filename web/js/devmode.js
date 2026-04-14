@@ -119,23 +119,29 @@ export async function resetDevDefaults() {
     }
 }
 
-/** Update the timing cards from a server timing message */
+/** Update the timing displays from a server timing message */
 export function updateTimings(data) {
+    // Show the panel timing bar
+    const panelTiming = document.getElementById('panel-timing');
+    if (panelTiming) panelTiming.classList.add('visible');
+
     if (data.stt_ms !== undefined) {
-        document.getElementById('timing-stt').textContent = data.stt_ms + 'ms';
+        const el = document.getElementById('timing-stt');
+        if (el) el.textContent = data.stt_ms + 'ms';
     }
     if (data.llm_ms !== undefined) {
         const el = document.getElementById('timing-llm');
-        el.textContent = data.llm_ms > 1000
+        if (el) el.textContent = data.llm_ms > 1000
             ? (data.llm_ms / 1000).toFixed(1) + 's'
             : data.llm_ms + 'ms';
     }
     if (data.tts_ms !== undefined) {
-        document.getElementById('timing-tts').textContent = data.tts_ms + 'ms';
+        const el = document.getElementById('timing-tts');
+        if (el) el.textContent = data.tts_ms + 'ms';
     }
     if (data.total_ms !== undefined) {
         const el = document.getElementById('timing-total');
-        el.textContent = data.total_ms > 1000
+        if (el) el.textContent = data.total_ms > 1000
             ? (data.total_ms / 1000).toFixed(1) + 's'
             : data.total_ms + 'ms';
     }

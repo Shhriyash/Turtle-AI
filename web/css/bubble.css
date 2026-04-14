@@ -1,0 +1,228 @@
+/* ================================================================
+   BUBBLE — Central wobbling orb with neon glow (Shazam-style)
+   ================================================================ */
+
+/* Container centers the bubble in the available space */
+.bubble-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+    position: relative;
+    z-index: 1;
+}
+
+/* Outer glow rings — concentric pulses when active */
+.bubble-glow {
+    position: relative;
+    width: 220px;
+    height: 220px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.bubble-glow::before,
+.bubble-glow::after {
+    content: '';
+    position: absolute;
+    border-radius: 50%;
+    opacity: 0;
+    transition: opacity 0.6s ease;
+}
+
+.bubble-glow::before {
+    width: 280px;
+    height: 280px;
+    border: 1.5px solid rgba(34, 211, 238, 0.15);
+}
+
+.bubble-glow::after {
+    width: 340px;
+    height: 340px;
+    border: 1px solid rgba(167, 139, 250, 0.08);
+}
+
+/* When active (listening/thinking), show glow rings */
+.bubble-glow.active::before {
+    opacity: 1;
+    animation: ring-pulse 2.5s ease-in-out infinite;
+}
+
+.bubble-glow.active::after {
+    opacity: 1;
+    animation: ring-pulse 3s ease-in-out infinite 0.4s;
+}
+
+@keyframes ring-pulse {
+    0%, 100% { transform: scale(1); opacity: 0.5; }
+    50%      { transform: scale(1.08); opacity: 0.15; }
+}
+
+/* The main bubble — organic wobbling shape */
+.bubble-orb {
+    width: 200px;
+    height: 200px;
+    border-radius: 60% 40% 30% 70% / 60% 30% 70% 40%;
+    background: radial-gradient(
+        circle at 35% 35%,
+        rgba(34, 211, 238, 0.20) 0%,
+        rgba(167, 139, 250, 0.15) 30%,
+        rgba(10, 14, 23, 0.90) 70%
+    );
+    border: 1.5px solid rgba(34, 211, 238, 0.12);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    position: relative;
+    animation: wobble-idle 8s ease-in-out infinite;
+    transition: box-shadow 0.6s ease, border-color 0.6s ease;
+    box-shadow:
+        0 0 40px rgba(34, 211, 238, 0.06),
+        inset 0 0 40px rgba(34, 211, 238, 0.03);
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+/* Idle wobble — very subtle, organic */
+@keyframes wobble-idle {
+    0%   { border-radius: 60% 40% 30% 70% / 60% 30% 70% 40%; }
+    25%  { border-radius: 30% 60% 70% 40% / 50% 60% 30% 60%; }
+    50%  { border-radius: 50% 60% 30% 60% / 30% 40% 70% 60%; }
+    75%  { border-radius: 60% 40% 60% 40% / 70% 30% 50% 60%; }
+    100% { border-radius: 60% 40% 30% 70% / 60% 30% 70% 40%; }
+}
+
+/* Active state — stronger wobble + neon glow */
+.bubble-orb.listening {
+    animation: wobble-active 3s ease-in-out infinite;
+    border-color: rgba(248, 113, 113, 0.35);
+    box-shadow:
+        0 0 60px rgba(248, 113, 113, 0.15),
+        0 0 120px rgba(248, 113, 113, 0.06),
+        inset 0 0 40px rgba(248, 113, 113, 0.05);
+    background: radial-gradient(
+        circle at 35% 35%,
+        rgba(248, 113, 113, 0.18) 0%,
+        rgba(167, 139, 250, 0.12) 30%,
+        rgba(10, 14, 23, 0.90) 70%
+    );
+}
+
+.bubble-orb.thinking {
+    animation: wobble-think 4s ease-in-out infinite;
+    border-color: rgba(34, 211, 238, 0.30);
+    box-shadow:
+        0 0 60px rgba(34, 211, 238, 0.12),
+        0 0 120px rgba(167, 139, 250, 0.06),
+        inset 0 0 40px rgba(34, 211, 238, 0.05);
+    background: radial-gradient(
+        circle at 35% 35%,
+        rgba(34, 211, 238, 0.22) 0%,
+        rgba(167, 139, 250, 0.15) 30%,
+        rgba(10, 14, 23, 0.90) 70%
+    );
+}
+
+.bubble-orb.speaking {
+    animation: wobble-speak 2s ease-in-out infinite;
+    border-color: rgba(52, 211, 153, 0.30);
+    box-shadow:
+        0 0 60px rgba(52, 211, 153, 0.12),
+        0 0 120px rgba(34, 211, 238, 0.06),
+        inset 0 0 40px rgba(52, 211, 153, 0.05);
+}
+
+@keyframes wobble-active {
+    0%   { border-radius: 50% 50% 50% 50% / 50% 50% 50% 50%; transform: scale(1); }
+    15%  { border-radius: 42% 58% 55% 45% / 55% 45% 58% 42%; transform: scale(1.03); }
+    30%  { border-radius: 55% 45% 42% 58% / 42% 58% 45% 55%; transform: scale(0.98); }
+    45%  { border-radius: 48% 52% 58% 42% / 58% 42% 52% 48%; transform: scale(1.02); }
+    60%  { border-radius: 58% 42% 45% 55% / 45% 55% 42% 58%; transform: scale(0.99); }
+    75%  { border-radius: 45% 55% 52% 48% / 52% 48% 55% 45%; transform: scale(1.01); }
+    100% { border-radius: 50% 50% 50% 50% / 50% 50% 50% 50%; transform: scale(1); }
+}
+
+@keyframes wobble-think {
+    0%   { border-radius: 55% 45% 40% 60% / 55% 45% 60% 40%; transform: rotate(0deg); }
+    33%  { border-radius: 40% 60% 55% 45% / 45% 55% 40% 60%; transform: rotate(3deg); }
+    66%  { border-radius: 60% 40% 45% 55% / 60% 40% 55% 45%; transform: rotate(-3deg); }
+    100% { border-radius: 55% 45% 40% 60% / 55% 45% 60% 40%; transform: rotate(0deg); }
+}
+
+@keyframes wobble-speak {
+    0%, 100% { border-radius: 50% 50% 50% 50%; transform: scale(1); }
+    25% { border-radius: 46% 54% 52% 48%; transform: scale(1.02); }
+    50% { border-radius: 54% 46% 48% 52%; transform: scale(0.98); }
+    75% { border-radius: 48% 52% 54% 46%; transform: scale(1.01); }
+}
+
+/* Letter mark inside the bubble */
+.bubble-mark {
+    font-size: 56px;
+    font-weight: 700;
+    letter-spacing: -3px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    opacity: 0.7;
+    transition: opacity 0.4s;
+    pointer-events: none;
+}
+
+.bubble-orb.listening .bubble-mark,
+.bubble-orb.thinking .bubble-mark {
+    opacity: 1;
+}
+
+/* Status label beneath the bubble */
+.bubble-status {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    transition: color 0.3s;
+}
+
+.bubble-status.active {
+    color: var(--accent);
+}
+
+/* Ambient background particles (subtle depth) */
+.ambient-particle {
+    position: absolute;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0;
+    pointer-events: none;
+}
+
+.bubble-glow.active .ambient-particle {
+    animation: float-particle 6s ease-in-out infinite;
+}
+
+.ambient-particle:nth-child(1) {
+    width: 3px; height: 3px;
+    top: 15%; left: 20%;
+    animation-delay: 0s;
+}
+.ambient-particle:nth-child(2) {
+    width: 2px; height: 2px;
+    top: 70%; right: 15%;
+    animation-delay: 1.5s;
+}
+.ambient-particle:nth-child(3) {
+    width: 4px; height: 4px;
+    bottom: 20%; left: 35%;
+    animation-delay: 3s;
+}
+
+@keyframes float-particle {
+    0%, 100% { opacity: 0; transform: translateY(0); }
+    50%      { opacity: 0.3; transform: translateY(-20px); }
+}

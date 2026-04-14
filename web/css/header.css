@@ -1,5 +1,5 @@
 /* ================================================================
-   HEADER — Top bar with logo, title, status, dev toggle
+   HEADER — Minimal top bar, no emojis
    ================================================================ */
 .chat-header {
     height: var(--header-height);
@@ -21,29 +21,31 @@
     gap: 14px;
 }
 
-.turtle-logo {
-    width: 40px;
-    height: 40px;
-    border-radius: var(--radius-md);
+.turtle-logo-mark {
+    width: 36px;
+    height: 36px;
+    border-radius: var(--radius-sm);
     background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 22px;
-    animation: breathe 4s ease-in-out infinite;
-    box-shadow: var(--shadow-glow);
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--bg-primary);
+    letter-spacing: -1px;
 }
 
 .header-title {
-    font-size: 18px;
+    font-size: 16px;
     font-weight: 600;
     letter-spacing: -0.3px;
+    color: var(--text-primary);
 }
 
-.header-title span {
-    color: var(--text-secondary);
+.header-subtitle {
+    color: var(--text-muted);
     font-weight: 400;
-    font-size: 13px;
+    font-size: 12px;
     margin-left: 8px;
 }
 

@@ -1,27 +1,25 @@
 /**
  * voice.js — Audio recording (AudioWorklet) and playback (AudioContext)
  *
- * Recording uses a custom AudioWorklet processor that captures raw
- * PCM16 at 16 kHz — exactly what Groq Whisper expects, zero conversion.
- * Playback decodes WAV blobs received from the server.
+ * The central bubble is the push-to-talk trigger.
+ * Recording uses AudioWorklet for raw PCM16 at 16 kHz.
  */
 
 import AppState from './state.js';
 import { setStatus, showToast } from './utils.js';
+import { setBubbleState } from './chat.js';
 
-/** Path to the AudioWorklet processor script */
 const PROCESSOR_PATH = '/static/audio/pcm-processor.js';
 
 /**
  * Start recording from the microphone.
- * Creates AudioContext + AudioWorklet, captures PCM16 chunks.
  */
 export async function startRecording() {
     if (AppState.isRecording || !AppState.isConnected) return;
     AppState.isRecording = true;
     AppState.recordedChunks = [];
-    AppState.dom.btnMic.classList.add('recording');
-    setStatus('recording', 'Recording...');
+    setBubbleState('listening');
+    setStatus('recording', 'Recording');
 
     try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -48,27 +46,23 @@ export async function startRecording() {
 
         source.connect(AppState.audioWorkletNode);
         AppState.audioWorkletNode.connect(AppState.audioContext.destination);
-
-        // Stash the stream handle for cleanup
         AppState.audioWorkletNode._stream = stream;
 
     } catch (err) {
         console.error('Recording failed:', err);
         showToast('Microphone access denied', true);
         AppState.isRecording = false;
-        AppState.dom.btnMic.classList.remove('recording');
+        setBubbleState('idle');
         setStatus('ready', 'Ready');
     }
 }
 
 /**
- * Stop recording, merge captured chunks, and send to server
- * as a single binary WebSocket frame.
+ * Stop recording, merge chunks, send as binary WebSocket frame.
  */
 export function stopRecording() {
     if (!AppState.isRecording) return;
     AppState.isRecording = false;
-    AppState.dom.btnMic.classList.remove('recording');
 
     try {
         if (AppState.audioWorkletNode) {
@@ -94,22 +88,28 @@ export function stopRecording() {
 
             if (AppState.ws && AppState.ws.readyState === WebSocket.OPEN) {
                 AppState.ws.send(merged.buffer);
-                setStatus('transcribing', 'Transcribing...');
+                setBubbleState('transcribing');
+                setStatus('transcribing', 'Transcribing');
+            } else {
+                setBubbleState('idle');
+                setStatus('ready', 'Ready');
             }
+        } else {
+            setBubbleState('idle');
+            setStatus('ready', 'Ready');
         }
 
         AppState.recordedChunks = [];
 
     } catch (err) {
         console.error('Stop recording error:', err);
+        setBubbleState('idle');
         setStatus('ready', 'Ready');
     }
 }
 
 /**
- * Play a WAV audio blob received from the server.
- * Uses AudioContext.decodeAudioData for instant playback.
- * @param {Blob} blob
+ * Play a WAV audio blob from the server.
  */
 export async function playAudioBlob(blob) {
     try {
@@ -122,10 +122,12 @@ export async function playAudioBlob(blob) {
         source.start(0);
         source.onended = () => {
             ctx.close();
+            setBubbleState('idle');
             setStatus('ready', 'Ready');
         };
     } catch (e) {
         console.error('Audio playback error:', e);
+        setBubbleState('idle');
         setStatus('ready', 'Ready');
     }
 }

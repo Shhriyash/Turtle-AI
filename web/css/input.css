@@ -1,8 +1,8 @@
 /* ================================================================
-   INPUT BAR — Text input, mic button, send button
+   INPUT BAR — Text input + send, centered below bubble
    ================================================================ */
 .input-bar {
-    padding: 16px 24px;
+    padding: 16px 24px 20px;
     background: var(--bg-glass);
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
@@ -11,11 +11,11 @@
 }
 
 .input-wrapper {
-    max-width: 820px;
+    max-width: 640px;
     margin: 0 auto;
     display: flex;
     align-items: flex-end;
-    gap: 12px;
+    gap: 10px;
 }
 
 .input-field-wrap {
@@ -25,7 +25,7 @@
 
 #chat-input {
     width: 100%;
-    padding: 14px 18px;
+    padding: 13px 18px;
     border-radius: var(--radius-lg);
     border: 1px solid var(--border);
     background: var(--bg-tertiary);
@@ -34,8 +34,8 @@
     font-size: 14px;
     line-height: 1.5;
     resize: none;
-    min-height: 48px;
-    max-height: 160px;
+    min-height: 46px;
+    max-height: 120px;
     transition: border-color 0.2s;
     outline: none;
 }
@@ -49,15 +49,15 @@
     color: var(--text-muted);
 }
 
-/* Send button */
+/* Send button — subtle, no gradient */
 .btn-send {
-    width: 48px;
-    height: 48px;
+    width: 46px;
+    height: 46px;
     border-radius: var(--radius-md);
-    border: none;
-    background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
-    color: var(--bg-primary);
-    font-size: 20px;
+    border: 1px solid var(--border-accent);
+    background: rgba(34, 211, 238, 0.08);
+    color: var(--accent);
+    font-size: 16px;
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -67,8 +67,8 @@
 }
 
 .btn-send:hover {
-    transform: scale(1.05);
-    box-shadow: var(--shadow-glow);
+    background: rgba(34, 211, 238, 0.15);
+    box-shadow: 0 0 16px rgba(34, 211, 238, 0.10);
 }
 
 .btn-send:active {
@@ -76,42 +76,18 @@
 }
 
 .btn-send:disabled {
-    opacity: 0.4;
+    opacity: 0.3;
     cursor: not-allowed;
     transform: none;
 }
 
-/* Mic button */
-.btn-mic {
-    width: 48px;
-    height: 48px;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--text-secondary);
-    font-size: 20px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s var(--ease-out);
-    flex-shrink: 0;
-    position: relative;
-}
-
-.btn-mic:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-}
-
-.btn-mic.recording {
-    background: rgba(248, 113, 113, 0.15);
-    border-color: var(--error);
-    color: var(--error);
-    animation: mic-pulse 1.5s ease-in-out infinite;
-}
-
-@keyframes mic-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.3); }
-    50%      { box-shadow: 0 0 0 10px rgba(248, 113, 113, 0); }
+/* Send arrow SVG inside the button */
+.btn-send svg {
+    width: 18px;
+    height: 18px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
 }

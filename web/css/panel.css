@@ -1,0 +1,223 @@
+/* ================================================================
+   RESPONSE PANEL — Slide-in panel from right showing conversation
+   ================================================================ */
+.response-panel {
+    width: 0;
+    overflow: hidden;
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--border);
+    transition: width 0.45s var(--ease-out);
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    opacity: 0;
+}
+
+.response-panel.open {
+    width: 440px;
+    opacity: 1;
+    transition: width 0.45s var(--ease-out), opacity 0.3s ease 0.1s;
+}
+
+.response-panel-header {
+    height: var(--header-height);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 20px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+.response-panel-header h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    letter-spacing: 0.5px;
+}
+
+.response-panel-close {
+    width: 32px;
+    height: 32px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.2s;
+}
+
+.response-panel-close:hover {
+    color: var(--text-primary);
+    border-color: var(--text-secondary);
+}
+
+/* Messages scroll area inside the panel */
+.response-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+/* Message items in the panel */
+.panel-msg {
+    animation: panel-msg-in 0.35s var(--ease-out) forwards;
+    opacity: 0;
+    transform: translateX(16px);
+}
+
+@keyframes panel-msg-in {
+    to { opacity: 1; transform: translateX(0); }
+}
+
+.panel-msg-user {
+    align-self: flex-end;
+    max-width: 90%;
+}
+
+.panel-msg-assistant {
+    align-self: flex-start;
+    max-width: 90%;
+}
+
+.panel-msg-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.panel-msg-user .panel-msg-label {
+    color: var(--accent);
+    text-align: right;
+}
+
+.panel-msg-assistant .panel-msg-label {
+    color: var(--accent-secondary);
+}
+
+.panel-msg-content {
+    padding: 12px 16px;
+    border-radius: var(--radius-md);
+    font-size: 13.5px;
+    line-height: 1.6;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+
+.panel-msg-user .panel-msg-content {
+    background: linear-gradient(135deg, rgba(34, 211, 238, 0.10), rgba(167, 139, 250, 0.10));
+    border: 1px solid var(--border-accent);
+    color: var(--text-primary);
+}
+
+.panel-msg-assistant .panel-msg-content {
+    background: var(--bg-glass);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+
+.panel-msg-content p { margin-bottom: 8px; }
+.panel-msg-content p:last-child { margin-bottom: 0; }
+
+.panel-msg-content code {
+    background: rgba(0,0,0,0.3);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 12.5px;
+    font-family: 'Fira Code', 'Consolas', monospace;
+}
+
+.panel-msg-content pre {
+    background: rgba(0,0,0,0.35);
+    padding: 12px;
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+    margin: 8px 0;
+    font-size: 12.5px;
+}
+
+.panel-msg-content pre code {
+    background: transparent;
+    padding: 0;
+}
+
+/* Thinking dots inside panel */
+.panel-thinking {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 16px;
+}
+
+.panel-thinking.visible {
+    display: flex;
+    animation: fade-in 0.3s;
+}
+
+.panel-thinking-dots {
+    display: flex;
+    gap: 4px;
+}
+
+.panel-thinking-dots span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: thinking-bounce 1.2s infinite;
+}
+
+.panel-thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
+.panel-thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
+
+.panel-thinking-label {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+/* Timing bar at the bottom of the panel */
+.panel-timing {
+    display: none;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-muted);
+    gap: 16px;
+    flex-shrink: 0;
+}
+
+.panel-timing.visible {
+    display: flex;
+}
+
+.panel-timing-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.panel-timing-value {
+    color: var(--accent);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 768px) {
+    .response-panel.open {
+        position: fixed;
+        top: 0; right: 0; bottom: 0;
+        width: 100vw;
+        z-index: 100;
+    }
+}

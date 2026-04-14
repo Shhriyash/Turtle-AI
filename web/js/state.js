@@ -2,7 +2,6 @@
  * state.js — Global application state singleton
  *
  * All modules import from here instead of using globals.
- * Provides a clean interface for mutation and observation.
  */
 
 const AppState = {
@@ -24,23 +23,28 @@ const AppState = {
 
     /** UI state */
     devPanelOpen: false,
+    responsePanelOpen: false,
 
     /** DOM element cache (populated in app.js init) */
     dom: {
-        messagesScroll: null,
-        messagesArea: null,
-        welcomeScreen: null,
         chatInput: null,
         btnSend: null,
-        btnMic: null,
-        thinkingEl: null,
-        thinkingLabel: null,
         statusIndicator: null,
         statusText: null,
         connectionBanner: null,
         devSidebar: null,
         btnDevToggle: null,
         toast: null,
+        // Bubble
+        bubbleOrb: null,
+        bubbleGlow: null,
+        bubbleStatus: null,
+        // Response panel
+        responsePanel: null,
+        responseMessages: null,
+        panelThinking: null,
+        panelThinkingLabel: null,
+        panelTiming: null,
     },
 };
 

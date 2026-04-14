@@ -1,59 +1,119 @@
 /**
- * chat.js — Message rendering and text input handling
+ * chat.js — Message rendering in the response panel + bubble state
  *
- * Manages the chat message list, markdown formatting, thinking
- * indicator, and text sending via WebSocket.
+ * Messages appear in the right-side panel. The central bubble
+ * changes visual state based on system status.
  */
 
 import AppState from './state.js';
 import { escapeHtml, scrollToBottom } from './utils.js';
 
-/** Show the thinking indicator with a label */
+// ── Bubble state management ──────────────────────────────────
+
+/** Set the bubble to a named visual state */
+export function setBubbleState(state) {
+    const { bubbleOrb, bubbleGlow, bubbleStatus } = AppState.dom;
+    if (!bubbleOrb) return;
+
+    // Clear all state classes
+    bubbleOrb.classList.remove('listening', 'thinking', 'speaking');
+    bubbleGlow.classList.remove('active');
+
+    const labels = {
+        idle:         'Ready',
+        listening:    'Listening',
+        recording:    'Listening',
+        transcribing: 'Transcribing',
+        thinking:     'Thinking',
+        speaking:     'Speaking',
+        ready:        'Ready',
+    };
+
+    bubbleStatus.textContent = labels[state] || 'Ready';
+    bubbleStatus.classList.toggle('active', state !== 'idle' && state !== 'ready');
+
+    if (state === 'listening' || state === 'recording') {
+        bubbleOrb.classList.add('listening');
+        bubbleGlow.classList.add('active');
+    } else if (state === 'thinking' || state === 'transcribing') {
+        bubbleOrb.classList.add('thinking');
+        bubbleGlow.classList.add('active');
+    } else if (state === 'speaking') {
+        bubbleOrb.classList.add('speaking');
+        bubbleGlow.classList.add('active');
+    }
+}
+
+// ── Thinking indicator in the panel ──────────────────────────
+
 export function showThinking(label) {
     AppState.isThinking = true;
-    const { thinkingEl, thinkingLabel } = AppState.dom;
-    if (thinkingLabel) thinkingLabel.textContent = label || 'Turtle is thinking...';
-    if (thinkingEl) thinkingEl.classList.add('visible');
-    scrollToBottom();
+    const { panelThinking, panelThinkingLabel } = AppState.dom;
+    if (panelThinkingLabel) panelThinkingLabel.textContent = label || 'Thinking';
+    if (panelThinking) panelThinking.classList.add('visible');
+    openResponsePanel();
+    scrollPanelToBottom();
 }
 
-/** Hide the thinking indicator */
 export function hideThinking() {
     AppState.isThinking = false;
-    const { thinkingEl } = AppState.dom;
-    if (thinkingEl) thinkingEl.classList.remove('visible');
+    const { panelThinking } = AppState.dom;
+    if (panelThinking) panelThinking.classList.remove('visible');
 }
 
+// ── Response panel management ────────────────────────────────
+
+export function openResponsePanel() {
+    if (AppState.responsePanelOpen) return;
+    AppState.responsePanelOpen = true;
+    AppState.dom.responsePanel.classList.add('open');
+}
+
+export function closeResponsePanel() {
+    AppState.responsePanelOpen = false;
+    AppState.dom.responsePanel.classList.remove('open');
+}
+
+function scrollPanelToBottom() {
+    const el = AppState.dom.responseMessages;
+    if (el) {
+        requestAnimationFrame(() => {
+            el.scrollTop = el.scrollHeight;
+        });
+    }
+}
+
+// ── Message rendering ────────────────────────────────────────
+
 /**
- * Add a message bubble to the chat area.
+ * Add a message to the response panel.
  * @param {'user'|'assistant'} role
  * @param {string} text
  */
 export function addMessage(role, text) {
-    const { welcomeScreen, messagesScroll } = AppState.dom;
+    openResponsePanel();
 
-    // Hide welcome, show messages container
-    if (welcomeScreen) welcomeScreen.style.display = 'none';
-    if (messagesScroll) messagesScroll.style.display = 'flex';
+    const container = AppState.dom.responseMessages;
+    if (!container) return;
 
-    const msgDiv = document.createElement('div');
-    msgDiv.className = `message ${role}`;
+    const msg = document.createElement('div');
+    msg.className = `panel-msg panel-msg-${role}`;
 
-    const avatar = document.createElement('div');
-    avatar.className = 'message-avatar';
-    avatar.textContent = role === 'assistant' ? '\u{1F422}' : '\u{1F464}';
+    const label = document.createElement('div');
+    label.className = 'panel-msg-label';
+    label.textContent = role === 'user' ? 'You' : 'Turtle';
 
-    const bubble = document.createElement('div');
-    bubble.className = 'message-bubble';
-    bubble.innerHTML = formatMessage(text);
+    const content = document.createElement('div');
+    content.className = 'panel-msg-content';
+    content.innerHTML = formatMessage(text);
 
-    msgDiv.appendChild(avatar);
-    msgDiv.appendChild(bubble);
-    messagesScroll.appendChild(msgDiv);
-    scrollToBottom();
+    msg.appendChild(label);
+    msg.appendChild(content);
+    container.appendChild(msg);
+    scrollPanelToBottom();
 }
 
-/** Lightweight markdown-ish → HTML conversion */
+/** Lightweight markdown to HTML */
 export function formatMessage(text) {
     let html = escapeHtml(text);
     // Code blocks
@@ -68,7 +128,8 @@ export function formatMessage(text) {
     return html;
 }
 
-/** Send the current text input value as a chat message */
+// ── Text sending ─────────────────────────────────────────────
+
 export function sendMessage() {
     const { chatInput, btnSend } = AppState.dom;
     const text = chatInput.value.trim();
@@ -82,16 +143,6 @@ export function sendMessage() {
     AppState.ws.send(JSON.stringify({ type: 'text', content: text }));
 }
 
-/** Send a suggestion chip's text */
-export function sendSuggestion(el) {
-    const text = el.textContent.replace(/^[^\s]+\s/, ''); // Strip leading emoji
-    const { chatInput, btnSend } = AppState.dom;
-    chatInput.value = text;
-    btnSend.disabled = false;
-    sendMessage();
-}
-
-/** Handle Enter key (without Shift) to send */
 export function handleInputKey(event) {
     if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
@@ -99,13 +150,12 @@ export function handleInputKey(event) {
     }
 }
 
-/** Auto-resize the textarea and toggle Send button */
 export function setupInputAutosize() {
     const { chatInput, btnSend } = AppState.dom;
     if (!chatInput) return;
     chatInput.addEventListener('input', () => {
         chatInput.style.height = 'auto';
-        chatInput.style.height = Math.min(chatInput.scrollHeight, 160) + 'px';
+        chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
         btnSend.disabled = chatInput.value.trim() === '' || !AppState.isConnected;
     });
 }
