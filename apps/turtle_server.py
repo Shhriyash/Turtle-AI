@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -25,8 +26,8 @@ from typing import Any, Optional
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------------------------------------------------
@@ -67,6 +68,7 @@ from core.output_clean import clean_text_for_model, clean_text_for_tts
 from core.graph_store import GraphStore
 from core.memory_store import MemoryStore
 from core.confirmation_gate import ConfirmationGate
+from core.dream_pass import DreamPass
 from core.memory_journal import JournalStore, make_event
 from core.memory_extractor import extract_memory_event_specs
 from core.memory_replayer import replay
@@ -84,6 +86,7 @@ from core.paths import (
     MEMORY_PROFILE_FILE,
     MEMORY_STATE_FILE,
     PERSONAL_MEMORY_DIR,
+    PERSONAL_MEMORY_SNAPSHOTS_DIR,
     TASK_HISTORY_FILE,
     TEMP_AUDIO_DIR,
     ensure_dirs,
@@ -118,13 +121,14 @@ SERVER_PORT = 8765
 def _load_config() -> dict[str, Any]:
     """Load turtle_config.json with defaults."""
     defaults = {
-        "OPEN_ROUTER_MODEL": "nvidia/nemotron-3-nano-30b-a3b:free",
-        "GROQ_PRIMARY_MODEL": "openai/gpt-oss-120b",
+        "OPEN_ROUTER_MODEL": "nvidia/llama-3.1-nemotron-70b-instruct:free",
+        "GROQ_PRIMARY_MODEL": "llama-3.3-70b-versatile",
         "GROQ_FALLBACK_MODEL": "llama-3.1-8b-instant",
         "DEEPGRAM_TTS_MODEL": "aura-2-orion-en",
         "DEEPGRAM_TTS_ENCODING": "linear16",
         "DEEPGRAM_TTS_CONTAINER": "wav",
         "DEEPGRAM_TTS_SAMPLE_RATE": 24000,
+        "TURTLE_TTS_SPEED": 1.2,
         "GROQ_TTS_MODEL": "canopylabs/orpheus-v1-english",
         "GROQ_TTS_VOICE": "orion",
         "GROQ_TTS_FORMAT": "wav",
@@ -137,6 +141,10 @@ def _load_config() -> dict[str, Any]:
         "TURTLE_MEMORY_FLUSH_TOKENS": 20000,
         "TURTLE_MEMORY_PROFILE_MAX_LINES": 6,
         "TTS_DEBUG": False,
+        "STT_MODEL": "whisper-large-v3-turbo",
+        "MAIN_AGENT_MODEL": "openrouter:openai/gpt-oss-120b",
+        "EMAIL_AGENT_MODEL": "groq:llama-3.3-70b-versatile",
+        "DREAM_PASS_AGENT_MODEL": "",
         "SERVER_HOST": SERVER_HOST,
         "SERVER_PORT": SERVER_PORT,
     }
@@ -173,6 +181,7 @@ MEMORY_FLUSH_TURNS = int(config.get("TURTLE_MEMORY_FLUSH_TURNS", 20))
 MEMORY_FLUSH_TOKENS = int(config.get("TURTLE_MEMORY_FLUSH_TOKENS", 20000))
 MEMORY_PROFILE_MAX_LINES = int(config.get("TURTLE_MEMORY_PROFILE_MAX_LINES", 6))
 PERSONAL_MEMORY_ENABLED = os.getenv("TURTLE_PERSONAL_MEMORY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+PERSONAL_MEMORY_DREAM_PASS_ENABLED = os.getenv("TURTLE_PERSONAL_MEMORY_DREAM_PASS_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 PERSONAL_MEMORY_MAX_BYTES = int(os.getenv("TURTLE_PERSONAL_MEMORY_MAX_BYTES", "2048"))
 PERSONAL_MEMORY_MAX_TOPIC_FILES = int(os.getenv("TURTLE_PERSONAL_MEMORY_MAX_TOPIC_FILES", "2"))
 TOOL_OUTPUT_MAX_CHARS = int(os.getenv("TURTLE_TOOL_OUTPUT_MAX_CHARS", "3500"))
@@ -232,6 +241,29 @@ def _trim_history_for_context(history: list[ModelMessage]) -> list[ModelMessage]
 
     while trimmed and isinstance(trimmed[0], ModelResponse):
         trimmed = trimmed[1:]
+
+    # Guardrail: ensure at least one real user prompt remains in context.
+    # Without this, long tool-call loops can leave only tool request/return turns,
+    # causing the model to respond as if no user question was asked.
+    if trimmed and not any(_is_user_turn_request(m) for m in trimmed):
+        latest_user_index = -1
+        for index in range(len(history) - 1, -1, -1):
+            if _is_user_turn_request(history[index]):
+                latest_user_index = index
+                break
+        if latest_user_index >= 0:
+            candidate = history[latest_user_index:]
+            if len(candidate) > ACTIVE_HISTORY_MAX_MESSAGES:
+                candidate = candidate[-ACTIVE_HISTORY_MAX_MESSAGES:]
+            while (
+                len(candidate) > 1
+                and sum(len(str(m)) // 4 for m in candidate) > ACTIVE_HISTORY_MAX_TOKENS
+            ):
+                candidate = candidate[1:]
+            while candidate and not _is_user_turn_request(candidate[0]):
+                candidate = candidate[1:]
+            if candidate:
+                return candidate
 
     return trimmed or history[-ACTIVE_HISTORY_MAX_MESSAGES:]
 
@@ -302,6 +334,517 @@ def _normalize_url_for_cache(url: str) -> str:
         return raw
 
 
+def _parse_confirmation_answer(user_text: str) -> bool | None:
+    text = " ".join((user_text or "").strip().lower().split())
+    if not text:
+        return None
+
+    yes_prefixes = (
+        "yes",
+        "y",
+        "yeah",
+        "yep",
+        "sure",
+        "ok",
+        "okay",
+        "please do",
+        "go ahead",
+        "affirmative",
+    )
+    no_prefixes = (
+        "no",
+        "n",
+        "nope",
+        "nah",
+        "not now",
+        "don't",
+        "do not",
+        "skip",
+        "negative",
+    )
+
+    if any(text == token or text.startswith(f"{token} ") for token in yes_prefixes):
+        return True
+    if any(text == token or text.startswith(f"{token} ") for token in no_prefixes):
+        return False
+    return None
+
+
+def _maybe_handle_confirmation_turn(state: SharedState, user_text: str) -> str | None:
+    prompt = state.confirmation_gate.next_prompt()
+    if prompt is None:
+        return None
+
+    accepted = _parse_confirmation_answer(user_text)
+    if accepted is None:
+        return f"Quick check: {prompt.question} Please answer yes or no."
+
+    state.confirmation_gate.record_response(prompt.event_id, accepted=accepted)
+    if accepted:
+        return "Got it. I will remember that."
+    return "Understood. I will not store that preference."
+
+
+def _queue_confirmation_candidates_from_turn(
+    state: SharedState,
+    *,
+    session_id: str,
+    user_text: str,
+) -> int:
+    """Queue non-explicit memory candidates for yes/no confirmation in web mode."""
+    if not PERSONAL_MEMORY_ENABLED:
+        return 0
+
+    try:
+        profile = state.personal_memory_store.load_profile_snapshot()
+        fake_msg = ModelRequest(parts=[UserPromptPart(content=user_text)])
+        candidates = extract_memory_candidates_from_messages(
+            message_history=[fake_msg],
+            session_id=session_id,
+            profile=profile,
+        )
+        if not candidates:
+            return 0
+
+        pending_events = []
+        for idx, candidate in enumerate(candidates):
+            event = _candidate_to_journal_event(
+                candidate=candidate,
+                session_id=session_id,
+                ordinal=idx,
+            )
+            if event is None:
+                continue
+            if event.applied:
+                continue
+            if event.source == "explicit":
+                continue
+            pending_events.append(event)
+
+        if not pending_events:
+            return 0
+
+        state.journal_store.append_many(pending_events)
+        queued = 0
+        for event in pending_events:
+            if state.confirmation_gate.queue_candidate(event):
+                queued += 1
+
+        if queued:
+            print(f"LOG: Queued {queued} confirmation candidate(s) for {session_id}")
+        return queued
+    except Exception as e:
+        print(f"LOG: Confirmation candidate queue failed for {session_id}: {e}")
+        return 0
+
+
+async def _run_dream_pass_if_needed(
+    state: SharedState,
+    *,
+    session_id: str,
+) -> None:
+    """Run Stage C dream pass for pending memory candidates when trigger conditions are met."""
+    if not PERSONAL_MEMORY_ENABLED or not PERSONAL_MEMORY_DREAM_PASS_ENABLED:
+        return
+    if not session_id:
+        return
+
+    dream_pass = DreamPass(
+        journal=state.journal_store,
+        store=state.personal_memory_store,
+        confirmation_gate=state.confirmation_gate,
+        state_path=PERSONAL_MEMORY_DIR / "dream_pass_state.json",
+        snapshots_dir=PERSONAL_MEMORY_SNAPSHOTS_DIR,
+    )
+
+    if not dream_pass.should_run():
+        print(f"LOG: Dream pass skipped for {session_id} (trigger not met)")
+        return
+
+    dream_model = _build_model_from_str(
+        str(config.get("DREAM_PASS_AGENT_MODEL", "") or ""),
+        agents_mgr.model_settings,
+    )
+    if dream_model is None:
+        dream_model = get_groq_model(
+            model_name="openai/gpt-oss-120b",
+            settings=agents_mgr.model_settings,
+        )
+
+    if dream_model is None:
+        print(f"LOG: Dream pass skipped for {session_id} (no dream model available)")
+        return
+
+    result = await dream_pass.run(session_id=session_id, model=dream_model)
+    if result.skipped_reason:
+        print(f"LOG: Dream pass skipped for {session_id}: {result.skipped_reason}")
+    if result.rolled_back:
+        print(f"LOG: Dream pass rolled back for {session_id}: {result.sanity_failures}")
+
+
+# ---------------------------------------------------------------------------
+# Personal memory helpers (mirrors turtle_voice.py — kept standalone)
+# ---------------------------------------------------------------------------
+
+def _kind_for_candidate(candidate: PersonalMemoryCandidate) -> str:
+    if candidate.topic in {"identity", "contacts", "projects"}:
+        return "fact"
+    if candidate.topic == "corrections":
+        return "correction"
+    return "preference"
+
+
+def _source_for_candidate(candidate: PersonalMemoryCandidate) -> str:
+    source = str(candidate.source).strip().lower()
+    if source in {"explicit", "inferred", "synthesized", "migration"}:
+        return source
+    return "inferred"
+
+
+def _extractor_for_candidate(candidate: PersonalMemoryCandidate) -> str:
+    extraction_source = str(candidate.extraction_source).strip().lower()
+    if "dream" in extraction_source:
+        return "dream_pass"
+    if "llm" in extraction_source:
+        return "llm_turn"
+    return "deterministic"
+
+
+def _confidence_for_candidate(candidate: PersonalMemoryCandidate) -> float:
+    if candidate.confidence == "confirmed":
+        return 1.0
+    if candidate.confidence == "inferred":
+        return 0.8
+    return 0.5
+
+
+def _should_auto_apply_event(*, kind: str, source: str, confidence: float) -> bool:
+    if source != "explicit":
+        return False
+    if confidence < 0.9:
+        return False
+    return kind in {"fact", "preference"}
+
+
+def _candidate_to_journal_event(
+    *,
+    candidate: PersonalMemoryCandidate,
+    session_id: str,
+    ordinal: int,
+) -> Any | None:
+    topic = candidate.topic
+    key = candidate.key
+    value_text = str(candidate.value).strip()
+    value_lower = value_text.lower()
+    if not value_text:
+        return None
+
+    event_key = ""
+    event_value: dict[str, object] = {}
+
+    if topic == "identity" and key == "name":
+        event_key = "identity.name"
+        event_value = {"name": value_text}
+    elif topic == "identity" and key == "home_city":
+        event_key = "identity.home_city"
+        event_value = {"home_city": value_text}
+    elif topic == "identity" and key == "current_city":
+        event_key = "identity.current_city"
+        event_value = {"current_city": value_text}
+    elif topic == "identity" and key == "country":
+        event_key = "identity.country"
+        event_value = {"country": value_text}
+    elif topic == "identity" and key == "timezone":
+        event_key = "identity.timezone"
+        event_value = {"timezone": value_text}
+    elif topic == "identity" and key == "preferred_language":
+        event_key = "identity.preferred_language"
+        event_value = {"preferred_language": value_text}
+    elif topic == "identity" and key == "occupation":
+        event_key = "identity.occupation"
+        event_value = {"occupation": value_text}
+    elif topic == "identity" and key == "company":
+        event_key = "identity.company"
+        event_value = {"company": value_text}
+    elif topic == "identity" and key == "primary_email":
+        event_key = "identity.primary_email"
+        event_value = {"primary_email": value_lower}
+    elif topic == "identity" and key.startswith("known_email:"):
+        email = key.split(":", 1)[1].strip().lower() or value_lower
+        if not email:
+            return None
+        event_key = f"identity.known_email.{email}"
+        event_value = {"email": email}
+    elif topic == "preferences" and key == "response_style":
+        event_key = "preferences.response_style"
+        event_value = {"response_style": value_text}
+    elif topic == "preferences" and key == "humor_level":
+        event_key = "preferences.humor_level"
+        event_value = {"humor_level": value_text}
+    elif topic == "preferences" and key == "email_tone":
+        event_key = "preferences.email_tone"
+        event_value = {"email_tone": value_text}
+    elif topic == "workflow" and key == "prefers_draft_before_send":
+        event_key = "workflow.prefers_draft_before_send"
+        event_value = {"prefers_draft_before_send": value_lower in {"true", "1", "yes", "y"}}
+    elif topic == "workflow" and key == "primary_llm":
+        event_key = "workflow.primary_llm"
+        event_value = {"primary_llm": value_text}
+    elif topic == "contacts" and key.startswith("frequent_recipient:"):
+        email = key.split(":", 1)[1].strip().lower() or value_lower
+        if not email:
+            return None
+        event_key = f"contacts.frequent_recipient.{email}"
+        event_value = {"email": email}
+    elif topic == "projects" and key.startswith("project:"):
+        slug = key.split(":", 1)[1].strip().lower().replace(" ", "_")
+        if not slug:
+            return None
+        event_key = f"projects.project.{slug}"
+        event_value = {"name": value_text}
+    elif topic == "corrections":
+        slug = key.strip().replace(" ", "_") or "note"
+        event_key = f"corrections.{slug}"
+        event_value = {"summary": value_text}
+    else:
+        return None
+
+    stable_payload = {
+        "session": session_id,
+        "topic": topic,
+        "key": event_key,
+        "value": event_value,
+        "evidence": candidate.evidence,
+        "ord": ordinal,
+    }
+    digest = hashlib.sha1(
+        json.dumps(stable_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    kind = _kind_for_candidate(candidate)
+    source = _source_for_candidate(candidate)
+    confidence = _confidence_for_candidate(candidate)
+
+    return make_event(
+        event_id=f"sync_{digest[:22]}",
+        kind=kind,
+        topic=topic,
+        key=event_key,
+        value=event_value,
+        confidence=confidence,
+        source=source,
+        extractor=_extractor_for_candidate(candidate),
+        session_id=session_id,
+        turn_id=f"{session_id}_sync_{ordinal}",
+        evidence={
+            "user_text": candidate.evidence,
+            "observation_count": 1,
+        },
+        applied=_should_auto_apply_event(kind=kind, source=source, confidence=confidence),
+    )
+
+
+def _sync_personal_memory_from_messages(
+    state: "SharedState",
+    *,
+    session_id: str | None,
+    message_history: list[ModelMessage],
+) -> None:
+    """Extract memory candidates from message history and write applied facts to the journal."""
+    if not PERSONAL_MEMORY_ENABLED or not session_id or not message_history:
+        return
+    try:
+        profile = state.personal_memory_store.load_profile_snapshot()
+        candidates = extract_memory_candidates_from_messages(
+            message_history=message_history,
+            session_id=session_id,
+            profile=profile,
+        )
+        if not candidates:
+            return
+
+        events = [
+            event
+            for index, candidate in enumerate(candidates)
+            for event in [_candidate_to_journal_event(candidate=candidate, session_id=session_id, ordinal=index)]
+            if event is not None
+        ]
+        if not events:
+            return
+
+        state.journal_store.append_many(events)
+
+        queued_candidates = 0
+        for event in events:
+            if event.applied:
+                continue
+            if event.source == "explicit":
+                continue
+            if state.confirmation_gate.queue_candidate(event):
+                queued_candidates += 1
+
+        replay_result = replay(state.journal_store.load_all(), store=state.personal_memory_store)
+        if replay_result.written_topics or replay_result.cleared_topics:
+            topics = ", ".join(replay_result.written_topics) if replay_result.written_topics else "none"
+            print(
+                f"LOG: Personal memory updated for {session_id} "
+                f"({len(events)} events -> {replay_result.resolved_event_count} resolved entries across {topics})"
+            )
+            if queued_candidates:
+                print(f"LOG: Queued {queued_candidates} inferred memory candidate(s) for confirmation")
+    except Exception as e:
+        print(f"LOG: Personal memory sync failed for {session_id}: {e}")
+        traceback.print_exc()
+
+
+async def _sync_personal_memory_from_archive(
+    state: "SharedState",
+    *,
+    session_id: str | None,
+    archive_path: Path,
+) -> None:
+    """Read archived session messages and extract personal memory into the journal."""
+    if not PERSONAL_MEMORY_ENABLED or not session_id:
+        return
+    messages_path = archive_path / "messages.json"
+    if not messages_path.exists():
+        print(f"LOG: No messages file for personal memory sync {session_id}")
+        return
+    try:
+        message_history = ModelMessagesTypeAdapter.validate_json(messages_path.read_bytes())
+    except Exception as e:
+        print(f"LOG: Unable to read archived messages for personal memory sync {session_id}: {e}")
+        return
+    _sync_personal_memory_from_messages(state, session_id=session_id, message_history=message_history)
+    try:
+        await _run_dream_pass_if_needed(state, session_id=session_id)
+    except Exception as e:
+        print(f"LOG: Dream pass failed for {session_id}: {e}")
+
+
+def _apply_explicit_facts_from_turn(
+    state: "SharedState",
+    *,
+    session_id: str,
+    turn_id: str,
+    user_text: str,
+    task_type: str,
+) -> None:
+    """Immediately write high-confidence explicit facts (email, name) to the journal.
+
+    Called per-turn so disclosures like 'my email is X' are reflected in the
+    next turn's memory context without waiting for session-end replay.
+    """
+    if not PERSONAL_MEMORY_ENABLED:
+        return
+    try:
+        profile = state.personal_memory_store.load_profile_snapshot()
+        # Use a minimal single-message history to reuse candidate extraction + dedup
+        fake_msg = ModelRequest(parts=[UserPromptPart(content=user_text)])
+        candidates = extract_memory_candidates_from_messages(
+            message_history=[fake_msg],
+            session_id=session_id,
+            profile=profile,
+        )
+        # Only auto-apply explicit high-confidence facts; behaviors stay in the gate
+        explicit_candidates = [
+            c for c in candidates
+            if c.source == "explicit" and c.topic in {
+                "identity",
+                "preferences",
+                "workflow",
+                "contacts",
+                "projects",
+                "corrections",
+            }
+        ]
+        if not explicit_candidates:
+            return
+
+        events = [
+            event
+            for idx, candidate in enumerate(explicit_candidates)
+            for event in [_candidate_to_journal_event(candidate=candidate, session_id=session_id, ordinal=idx)]
+            if event is not None and _should_auto_apply_event(
+                kind=_kind_for_candidate(candidate),
+                source=_source_for_candidate(candidate),
+                confidence=_confidence_for_candidate(candidate),
+            )
+        ]
+        if not events:
+            return
+
+        state.journal_store.append_many(events)
+        result = replay(state.journal_store.load_all(), store=state.personal_memory_store)
+        if result.written_topics:
+            print(f"LOG: Per-turn memory applied for {session_id}: {result.written_topics}")
+    except Exception as e:
+        print(f"LOG: Per-turn fact extraction failed for {session_id}: {e}")
+
+
+def _runtime_agent_registry() -> list[dict[str, Any]]:
+    main_model = str(config.get("MAIN_AGENT_MODEL") or f"groq:{config.get('GROQ_PRIMARY_MODEL', 'llama-3.3-70b-versatile')}")
+    email_model = str(config.get("EMAIL_AGENT_MODEL") or main_model)
+    dream_model = str(config.get("DREAM_PASS_AGENT_MODEL") or "auto (groq:openai/gpt-oss-120b)")
+
+    return [
+        {
+            "id": "main_assistant",
+            "label": "Main Assistant",
+            "model": main_model,
+            "editable": True,
+            "config_key": "MAIN_AGENT_MODEL",
+            "status": "active",
+        },
+        {
+            "id": "email_specialist",
+            "label": "Email Specialist",
+            "model": email_model,
+            "editable": True,
+            "config_key": "EMAIL_AGENT_MODEL",
+            "status": "active",
+        },
+        {
+            "id": "dream_pass_reviewer",
+            "label": "Dream Pass Reviewer",
+            "model": dream_model,
+            "editable": True,
+            "config_key": "DREAM_PASS_AGENT_MODEL",
+            "status": "active" if PERSONAL_MEMORY_DREAM_PASS_ENABLED else "disabled",
+        },
+        {
+            "id": "main_fallback_chain",
+            "label": "Main Fallback Chain",
+            "model": f"{len(agents_mgr.main_assistant_fallbacks)} model(s)",
+            "editable": False,
+            "status": "derived",
+        },
+        {
+            "id": "email_fallback_chain",
+            "label": "Email Fallback Chain",
+            "model": f"{len(agents_mgr.email_agent_fallbacks)} model(s)",
+            "editable": False,
+            "status": "derived",
+        },
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _build_model_from_str(model_str: str, settings: Any) -> Any | None:
+    """Parse 'provider:model_name' and return a pydantic-ai model object."""
+    if not model_str:
+        return None
+    if model_str.startswith("groq:"):
+        return get_groq_model(model_name=model_str[5:], settings=settings)
+    if model_str.startswith("openrouter:"):
+        models = get_openrouter_models(model_name=model_str[11:], settings=settings)
+        return models[0] if models else None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Agent builder — creates agent chain from current config, supports hot-reload
 # ---------------------------------------------------------------------------
@@ -317,7 +860,7 @@ class AgentManager:
         self.email_agent_fallbacks: list[Agent] = []
         self.usage_limits = UsageLimits(request_limit=30)
         self.stt = FastRTCSTT(groq_client=groq_client)
-        self.rebuild(config)
+        self.rebuild(config)  # stt rebuilt inside rebuild()
 
     def rebuild(self, cfg: dict[str, Any]) -> None:
         """Rebuild all agents from the given config dict."""
@@ -326,6 +869,10 @@ class AgentManager:
             "max_tokens": int(cfg.get("max_tokens", 1024)),
         }
         settings = self.model_settings
+
+        # Update STT model on every rebuild
+        stt_model = cfg.get("STT_MODEL", "whisper-large-v3-turbo")
+        self.stt = FastRTCSTT(groq_client=groq_client, model=stt_model)
 
         openrouter_models = get_openrouter_models(
             model_name=cfg.get("OPEN_ROUTER_MODEL"),
@@ -347,9 +894,19 @@ class AgentManager:
             settings=settings,
         )
 
+        # Per-agent model overrides
+        actual_main_model = (
+            _build_model_from_str(cfg.get("MAIN_AGENT_MODEL", ""), settings)
+            or main_model
+        )
+        actual_email_model = (
+            _build_model_from_str(cfg.get("EMAIL_AGENT_MODEL", ""), settings)
+            or main_model
+        )
+
         # Main assistant
         self.main_assistant = Agent(
-            main_model,
+            actual_main_model,
             deps_type=SharedState,
             output_type=str,
             output_retries=OUTPUT_RETRIES,
@@ -372,7 +929,7 @@ class AgentManager:
 
         # Email agent
         self.email_agent = Agent(
-            main_model,
+            actual_email_model,
             deps_type=SharedState,
             output_type=str,
             output_retries=OUTPUT_RETRIES,
@@ -395,8 +952,13 @@ class AgentManager:
 
         # Register tools on the main assistant
         self._register_tools()
-        print(f"LOG: Agent chain rebuilt — model={cfg.get('OPEN_ROUTER_MODEL', 'default')}, "
-              f"temp={settings.get('temperature')}, max_tokens={settings.get('max_tokens')}")
+        print(
+            f"LOG: Agent chain rebuilt — "
+            f"main={cfg.get('MAIN_AGENT_MODEL') or cfg.get('GROQ_PRIMARY_MODEL', 'default')}, "
+            f"email={cfg.get('EMAIL_AGENT_MODEL') or 'same'}, "
+            f"stt={stt_model}, "
+            f"temp={settings.get('temperature')}, max_tokens={settings.get('max_tokens')}"
+        )
 
     def _register_tools(self) -> None:
         """Register all tools on self.main_assistant."""
@@ -412,7 +974,24 @@ class AgentManager:
             if cached:
                 return cached
             try:
-                results = await search_duckduckgo(ctx.deps.http_client, normalized_query, max_results=5)
+                results = await search_duckduckgo(ctx.deps.http_client, normalized_query, max_results=10)
+
+                # DuckDuckGo can underperform with strict site: filters for jobs.
+                # Retry once with a relaxed query to avoid empty tool outputs.
+                if not results and "site:" in normalized_query.lower():
+                    relaxed_query = " ".join(
+                        token for token in normalized_query.split()
+                        if not token.lower().startswith("site:")
+                    ).strip()
+                    if relaxed_query:
+                        results = await search_duckduckgo(
+                            ctx.deps.http_client,
+                            relaxed_query,
+                            max_results=10,
+                        )
+                        if results:
+                            normalized_query = relaxed_query
+
                 formatted = format_search_results(normalized_query, results)
             except Exception as e:
                 formatted = f"Web search failed for query: {normalized_query}\nError: {e}"
@@ -547,6 +1126,18 @@ agents_mgr = AgentManager()
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Turtle AI", docs_url=None, redoc_url=None)
 
+
+@app.middleware("http")
+async def no_cache_js(request: Request, call_next):
+    """Prevent browsers from caching JS/CSS so dev changes take effect immediately."""
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/static/js/") or path.startswith("/static/css/"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
 # Serve static files from web/ directory
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -558,6 +1149,14 @@ async def serve_index():
     if not index_path.exists():
         return JSONResponse({"error": "Frontend not built yet"}, status_code=404)
     return FileResponse(index_path, media_type="text/html")
+
+
+@app.get("/favicon.ico")
+async def serve_favicon():
+    favicon_svg = STATIC_DIR / "favicon.svg"
+    if favicon_svg.exists():
+        return FileResponse(favicon_svg, media_type="image/svg+xml")
+    return RedirectResponse(url="/static/favicon.svg")
 
 
 # ---------------------------------------------------------------------------
@@ -592,45 +1191,105 @@ async def update_config(body: dict[str, Any] | None = None):
 @app.get("/api/models")
 async def list_models():
     """List available model options for dev-mode dropdowns."""
+    openrouter_models = [
+        # OpenAI via OpenRouter
+        "openai/gpt-oss-120b",
+        "openai/gpt-4o-mini",
+        # Llama 4
+        "meta-llama/llama-4-scout:free",
+        "meta-llama/llama-4-maverick:free",
+        # Llama 3.3 / 3.1
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "meta-llama/llama-3.1-70b-instruct:free",
+        "meta-llama/llama-3.1-8b-instruct:free",
+        "meta-llama/llama-3.2-3b-instruct:free",
+        # DeepSeek
+        "deepseek/deepseek-r1:free",
+        "deepseek/deepseek-chat-v3-0324:free",
+        # Qwen 3
+        "qwen/qwen3-30b-a3b:free",
+        "qwen/qwen3-8b:free",
+        "qwen/qwen-2.5-72b-instruct:free",
+        # Google Gemma 3
+        "google/gemma-3-27b-it:free",
+        "google/gemma-3-12b-it:free",
+        "google/gemma-2-9b-it:free",
+        # Nvidia / Mistral / Microsoft
+        "nvidia/llama-3.1-nemotron-70b-instruct:free",
+        "nvidia/nemotron-3-nano-30b-a3b:free",
+        "mistralai/mistral-nemo:free",
+        "mistralai/mistral-7b-instruct:free",
+        "microsoft/phi-3-mini-128k-instruct:free",
+        "microsoft/phi-3-medium-128k-instruct:free",
+    ]
+    groq_models = [
+        # Llama 3.3 / 3.1
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "llama-3.1-8b-instant",
+        # Llama 3.2 vision
+        "llama-3.2-90b-vision-preview",
+        "llama-3.2-11b-vision-preview",
+        "llama-3.2-3b-preview",
+        "llama-3.2-1b-preview",
+        # Llama 3 legacy
+        "llama3-70b-8192",
+        "llama3-8b-8192",
+        # Deepseek
+        "deepseek-r1-distill-llama-70b",
+        # Qwen
+        "qwen-qwq-32b",
+        # Mixtral / Gemma
+        "mixtral-8x7b-32768",
+        "gemma2-9b-it",
+        "gemma-7b-it",
+    ]
+    groq_stt_models = [
+        "whisper-large-v3-turbo",
+        "whisper-large-v3",
+        "distil-whisper-large-v3-en",
+    ]
+    deepgram_tts_models = [
+        "aura-asteria-en",
+        "aura-luna-en",
+        "aura-stella-en",
+        "aura-athena-en",
+        "aura-hera-en",
+        "aura-orion-en",
+        "aura-arcas-en",
+        "aura-perseus-en",
+        "aura-angus-en",
+        "aura-orpheus-en",
+        "aura-helios-en",
+        "aura-zeus-en",
+        # aura-2 series
+        "aura-2-andromeda-en",
+        "aura-2-arcas-en",
+        "aura-2-asteria-en",
+        "aura-2-luna-en",
+        "aura-2-orion-en",
+        "aura-2-zeus-en",
+    ]
+    groq_tts_voices = ["orion", "atlas", "vale", "celeste", "nova"]
+    # Combined list for per-agent dropdowns (prefixed with provider)
+    all_models = (
+        [f"groq:{m}" for m in groq_models]
+        + [f"openrouter:{m}" for m in openrouter_models]
+    )
     return JSONResponse({
-        "openrouter_models": [
-            "nvidia/nemotron-3-nano-30b-a3b:free",
-            "meta-llama/llama-4-scout:free",
-            "meta-llama/llama-4-maverick:free",
-            "google/gemma-3-27b-it:free",
-            "qwen/qwen3-235b-a22b:free",
-            "deepseek/deepseek-chat-v3-0324:free",
-            "microsoft/mai-ds-r1:free",
-        ],
-        "groq_models": [
-            "openai/gpt-oss-120b",
-            "llama-3.1-8b-instant",
-            "llama-3.3-70b-versatile",
-            "gemma2-9b-it",
-            "meta-llama/llama-4-scout-17b-16e-instruct",
-        ],
-        "deepgram_tts_models": [
-            "aura-2-orion-en",
-            "aura-2-asteria-en",
-            "aura-2-luna-en",
-            "aura-2-stella-en",
-            "aura-2-athena-en",
-            "aura-2-hera-en",
-            "aura-2-arcas-en",
-            "aura-2-perseus-en",
-            "aura-2-angus-en",
-            "aura-2-orpheus-en",
-            "aura-2-helios-en",
-            "aura-2-zeus-en",
-        ],
-        "groq_tts_voices": [
-            "orion",
-            "atlas",
-            "vale",
-            "celeste",
-            "nova",
-        ],
+        "openrouter_models": openrouter_models,
+        "groq_models": groq_models,
+        "groq_stt_models": groq_stt_models,
+        "deepgram_tts_models": deepgram_tts_models,
+        "groq_tts_voices": groq_tts_voices,
+        "all_models": all_models,
     })
+
+
+@app.get("/api/agents")
+async def list_agents():
+    """List all runtime agents shown in the dev sidebar."""
+    return JSONResponse({"agents": _runtime_agent_registry()})
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +1345,28 @@ async def websocket_endpoint(ws: WebSocket):
             rag_system=rag_system,
         )
 
+        # Process pending sessions from previous runs (personal memory + RAG finalization)
+        for pending_sid, pending_archive_path in session_store.list_pending_finalization_archives():
+            print(f"LOG: Finalizing pending session {pending_sid}")
+            await _sync_personal_memory_from_archive(
+                state, session_id=pending_sid, archive_path=pending_archive_path,
+            )
+            try:
+                rag_finalized = await rag_system.finalize_archived_session(
+                    session_id=pending_sid, archive_path=pending_archive_path,
+                )
+                if rag_finalized:
+                    pending_manifest = pending_archive_path / "session.json"
+                    if pending_manifest.exists():
+                        manifest = json.loads(pending_manifest.read_text(encoding="utf-8"))
+                        manifest["status"] = "completed"
+                        pending_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                    print(f"LOG: Pending session {pending_sid} finalized")
+                else:
+                    print(f"LOG: Pending session {pending_sid} RAG finalization still pending")
+            except Exception as _e:
+                print(f"LOG: RAG finalization error for {pending_sid}: {_e}")
+
         await rag_system.start_session(session_id=restore_result.session_id)
         message_history: list[ModelMessage] | None = session_store.message_history or None
 
@@ -702,6 +1383,11 @@ async def websocket_endpoint(ws: WebSocket):
         try:
             while True:
                 raw = await ws.receive()
+
+                # Starlette sends an explicit disconnect frame before closing.
+                # Exit loop immediately to avoid a RuntimeError on next receive().
+                if raw.get("type") == "websocket.disconnect":
+                    break
 
                 # Binary frame = audio data
                 if "bytes" in raw and raw["bytes"]:
@@ -744,6 +1430,13 @@ async def websocket_endpoint(ws: WebSocket):
 
         except WebSocketDisconnect:
             print("LOG: WebSocket client disconnected")
+        except RuntimeError as e:
+            # Some disconnect paths surface as RuntimeError instead of WebSocketDisconnect.
+            if "disconnect message has been received" in str(e):
+                print("LOG: WebSocket client disconnected")
+            else:
+                print(f"LOG: WebSocket error: {e}")
+                traceback.print_exc()
         except Exception as e:
             print(f"LOG: WebSocket error: {e}")
             traceback.print_exc()
@@ -757,6 +1450,10 @@ async def websocket_endpoint(ws: WebSocket):
             session_id = state.session_store.session_id
             archive_path = state.session_store.archive_active(status="pending_finalization")
             if session_id and archive_path:
+                # Personal memory sync — must run before RAG finalization
+                await _sync_personal_memory_from_archive(
+                    state, session_id=session_id, archive_path=archive_path,
+                )
                 try:
                     rag_finalized = await rag_system.finalize_archived_session(
                         session_id=session_id, archive_path=archive_path,
@@ -767,8 +1464,8 @@ async def websocket_endpoint(ws: WebSocket):
                             manifest = json.loads(session_manifest.read_text(encoding="utf-8"))
                             manifest["status"] = "completed"
                             session_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    print(f"LOG: RAG finalization error for {session_id}: {_e}")
             print("LOG: Session archived and cleaned up")
 
 
@@ -797,6 +1494,13 @@ async def _handle_text_message(
     await _ws_send_json(ws, {"type": "status", "status": "thinking"})
 
     try:
+        confirmation_reply = _maybe_handle_confirmation_turn(state, user_text)
+        if confirmation_reply is not None:
+            await _ws_send_json(ws, {"type": "done", "content": confirmation_reply})
+            timings["total_ms"] = round((time.time() - overall_start) * 1000)
+            await _ws_send_json(ws, {"type": "timing", **timings})
+            return message_history
+
         task_type = _detect_task_type(user_text)
         memory_context = _resolve_memory_context(state, task_type=task_type, user_text=user_text)
         prompt_input = _compose_prompt_with_memory(user_text, memory_context)
@@ -830,6 +1534,35 @@ async def _handle_text_message(
             assistant_text=final_output,
             task_type=task_type,
         )
+        # Immediately apply explicit facts (email, name) so next turn sees them
+        _apply_explicit_facts_from_turn(
+            state,
+            session_id=state.session_store.session_id or "unknown_session",
+            turn_id=turn_id,
+            user_text=user_text,
+            task_type=task_type,
+        )
+        queued = _queue_confirmation_candidates_from_turn(
+            state,
+            session_id=state.session_store.session_id or "unknown_session",
+            user_text=user_text,
+        )
+        if queued:
+            prompt = state.confirmation_gate.next_prompt()
+            if prompt is not None:
+                await _ws_send_json(
+                    ws,
+                    {
+                        "type": "done",
+                        "content": f"Quick check: {prompt.question} Please answer yes or no.",
+                    },
+                )
+
+        if state.turn_counter >= 8:
+            try:
+                await _run_dream_pass_if_needed(state, session_id=state.session_store.session_id or "unknown_session")
+            except Exception as e:
+                print(f"LOG: Dream pass (per-turn) failed: {e}")
 
         timings["total_ms"] = round((time.time() - overall_start) * 1000)
         await _ws_send_json(ws, {"type": "timing", **timings})
@@ -866,15 +1599,34 @@ async def _handle_audio_message(
 
         # STT
         stt_start = time.time()
-        transcription = agents_mgr.stt.transcribe_from_audio((sample_rate, audio_array))
-        timings["stt_ms"] = round((time.time() - stt_start) * 1000)
+        print(f"LOG: STT transcribing {len(audio_array)} samples @ {sample_rate}Hz")
+        try:
+            transcription = agents_mgr.stt.transcribe_from_audio((sample_rate, audio_array))
+            timings["stt_ms"] = round((time.time() - stt_start) * 1000)
+            print(f"LOG: STT completed in {timings['stt_ms']}ms -> {repr(transcription[:80]) if transcription else 'empty'}")
+        except Exception as stt_exc:
+            timings["stt_ms"] = round((time.time() - stt_start) * 1000)
+            print(f"LOG: STT failed after {timings['stt_ms']}ms: {type(stt_exc).__name__}: {stt_exc}")
+            traceback.print_exc()
+            await _ws_send_json(ws, {"type": "error", "message": f"STT error: {stt_exc}"})
+            return message_history
 
         if not transcription or not transcription.strip():
+            print("LOG: STT returned empty transcription")
             await _ws_send_json(ws, {"type": "error", "message": "No speech detected"})
             return message_history
 
+        transcription = transcription.strip()
+
         # Send transcription to client
         await _ws_send_json(ws, {"type": "transcription", "text": transcription})
+
+        confirmation_reply = _maybe_handle_confirmation_turn(state, transcription)
+        if confirmation_reply is not None:
+            await _ws_send_json(ws, {"type": "done", "content": confirmation_reply})
+            timings["total_ms"] = round((time.time() - overall_start) * 1000)
+            await _ws_send_json(ws, {"type": "timing", **timings})
+            return message_history
 
         # Process as text
         await _ws_send_json(ws, {"type": "status", "status": "thinking"})
@@ -910,6 +1662,35 @@ async def _handle_audio_message(
             assistant_text=final_output,
             task_type=task_type,
         )
+        # Immediately apply explicit facts (email, name) so next turn sees them
+        _apply_explicit_facts_from_turn(
+            state,
+            session_id=state.session_store.session_id or "unknown_session",
+            turn_id=turn_id,
+            user_text=transcription,
+            task_type=task_type,
+        )
+        queued = _queue_confirmation_candidates_from_turn(
+            state,
+            session_id=state.session_store.session_id or "unknown_session",
+            user_text=transcription,
+        )
+        if queued:
+            prompt = state.confirmation_gate.next_prompt()
+            if prompt is not None:
+                await _ws_send_json(
+                    ws,
+                    {
+                        "type": "done",
+                        "content": f"Quick check: {prompt.question} Please answer yes or no.",
+                    },
+                )
+
+        if state.turn_counter >= 8:
+            try:
+                await _run_dream_pass_if_needed(state, session_id=state.session_store.session_id or "unknown_session")
+            except Exception as e:
+                print(f"LOG: Dream pass (per-turn) failed: {e}")
 
         # TTS
         await _ws_send_json(ws, {"type": "status", "status": "speaking"})
@@ -917,22 +1698,33 @@ async def _handle_audio_message(
         tts_text = clean_text_for_tts(final_output)
         audio_filename = f"tts_{int(time.time() * 1000)}.wav"
         speech_path = TEMP_AUDIO_DIR / audio_filename
+        tts_debug = os.getenv("TTS_DEBUG", "0") == "1"
 
         try:
-            result_path = synthesize_speech(tts_text, speech_path)
+            print(f"LOG: TTS attempting synthesis ({len(tts_text)} chars, path={speech_path})")
+            result_path = synthesize_speech(
+                tts_text,
+                speech_path,
+                speed=float(config.get("TURTLE_TTS_SPEED", 1.2)),
+            )
             timings["tts_ms"] = round((time.time() - tts_start) * 1000)
+            print(f"LOG: TTS synthesis succeeded in {timings['tts_ms']}ms -> {result_path}")
 
             if result_path and result_path.exists():
                 audio_data = result_path.read_bytes()
+                print(f"LOG: Sending TTS audio ({len(audio_data)} bytes)")
                 # Send audio as binary WebSocket frame
                 await ws.send_bytes(audio_data)
                 # Clean up temp file
                 result_path.unlink(missing_ok=True)
             else:
-                await _ws_send_json(ws, {"type": "error", "message": "TTS generation failed"})
+                print("LOG: TTS returned path but file does not exist")
+                await _ws_send_json(ws, {"type": "error", "message": "TTS generation failed: output file missing"})
         except Exception as e:
-            print(f"LOG: TTS error: {e}")
             timings["tts_ms"] = round((time.time() - tts_start) * 1000)
+            print(f"LOG: TTS error after {timings['tts_ms']}ms: {type(e).__name__}: {e}")
+            if tts_debug:
+                traceback.print_exc()
             await _ws_send_json(ws, {"type": "error", "message": f"TTS error: {e}"})
 
         timings["total_ms"] = round((time.time() - overall_start) * 1000)
@@ -955,5 +1747,16 @@ if __name__ == "__main__":
 
     host = str(config.get("SERVER_HOST", SERVER_HOST))
     port = int(config.get("SERVER_PORT", SERVER_PORT))
+    reload_enabled = os.getenv("TURTLE_SERVER_RELOAD", "1").strip().lower() not in {"0", "false", "no", "off"}
     print(f"[Turtle AI] Web Server starting at http://{host}:{port}")
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    if reload_enabled:
+        uvicorn.run(
+            "apps.turtle_server:app",
+            host=host,
+            port=port,
+            log_level="info",
+            reload=True,
+            reload_dirs=[str(ROOT_DIR)],
+        )
+    else:
+        uvicorn.run(app, host=host, port=port, log_level="info")

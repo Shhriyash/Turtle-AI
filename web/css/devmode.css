@@ -77,6 +77,12 @@
     margin-bottom: 6px;
 }
 
+#dev-tts-speed-value {
+    color: var(--accent);
+    font-weight: 700;
+    margin-left: 6px;
+}
+
 .dev-field select,
 .dev-field input {
     width: 100%;
@@ -91,9 +97,58 @@
     transition: border-color 0.2s;
 }
 
+#dev-tts-speed {
+    padding: 0;
+    height: 32px;
+    background: transparent;
+    border: none;
+}
+
 .dev-field select:focus,
 .dev-field input:focus {
     border-color: var(--accent);
+}
+
+.dev-agent-registry {
+    display: grid;
+    gap: 8px;
+}
+
+.dev-agent-item {
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+}
+
+.dev-agent-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+}
+
+.dev-agent-name {
+    font-size: 13px;
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.dev-agent-status {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.dev-agent-model {
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    word-break: break-all;
 }
 
 .dev-field select {

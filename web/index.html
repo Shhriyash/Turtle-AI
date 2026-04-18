@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="Turtle AI — Personal assistant with voice and chat">
     <title>Turtle AI</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 
@@ -31,7 +32,7 @@
             <!-- Header -->
             <header class="chat-header">
                 <div class="header-left">
-                    <div class="turtle-logo-mark">T</div>
+                    <div class="turtle-logo-mark"><img src="/static/assets/turtle-icon.png" alt="Turtle" /></div>
                     <div class="header-title">
                         Turtle AI
                         <span class="header-subtitle" id="session-label">Personal Assistant</span>
@@ -59,7 +60,7 @@
                          onmouseup="window._bubbleUp(event)"
                          ontouchstart="window._bubbleDown(event)"
                          ontouchend="window._bubbleUp(event)">
-                        <span class="bubble-mark">T</span>
+                        <span class="bubble-mark"><img src="/static/assets/turtle-icon.png" alt="Turtle" /></span>
                     </div>
                 </div>
                 <div class="bubble-status" id="bubble-status">Ready</div>
@@ -71,6 +72,17 @@
                     <div class="input-field-wrap">
                         <textarea id="chat-input" rows="1" placeholder="Message Turtle AI..."></textarea>
                     </div>
+                    <button class="btn-voice-mode" id="btn-voice-mode" type="button" title="Voice mode: Push-to-talk" aria-label="Toggle voice mode">
+                        PTT
+                    </button>
+                    <button class="btn-voice" id="btn-voice" type="button" title="Start voice input" aria-label="Voice input" aria-pressed="false">
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M12 14a3 3 0 0 0 3-3V7a3 3 0 0 0-6 0v4a3 3 0 0 0 3 3z"/>
+                            <path d="M19 11a7 7 0 0 1-14 0"/>
+                            <line x1="12" y1="18" x2="12" y2="22"/>
+                            <line x1="8" y1="22" x2="16" y2="22"/>
+                        </svg>
+                    </button>
                     <button class="btn-send" id="btn-send" disabled title="Send message">
                         <svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
                     </button>
@@ -125,29 +137,55 @@
             </div>
             <div class="dev-content">
                 <div class="dev-section">
-                    <div class="dev-section-title">Models</div>
+                    <div class="dev-section-title">Agent Models</div>
                     <div class="dev-field">
-                        <label for="dev-openrouter-model">Main Agent (OpenRouter)</label>
+                        <label for="dev-main-agent-model">Main Orchestrator</label>
+                        <select id="dev-main-agent-model"></select>
+                    </div>
+                    <div class="dev-field">
+                        <label for="dev-email-agent-model">Email Agent</label>
+                        <select id="dev-email-agent-model"></select>
+                    </div>
+                    <div class="dev-field">
+                        <label for="dev-dream-agent-model">Dream Pass Reviewer</label>
+                        <select id="dev-dream-agent-model"></select>
+                    </div>
+                </div>
+                <div class="dev-section">
+                    <div class="dev-section-title">Model Fallbacks</div>
+                    <div class="dev-field">
+                        <label for="dev-openrouter-model">OpenRouter Primary</label>
                         <select id="dev-openrouter-model"></select>
                     </div>
                     <div class="dev-field">
-                        <label for="dev-groq-model">Groq Primary Model</label>
+                        <label for="dev-groq-model">Groq Primary</label>
                         <select id="dev-groq-model"></select>
                     </div>
                     <div class="dev-field">
-                        <label for="dev-groq-fallback">Groq Fallback Model</label>
+                        <label for="dev-groq-fallback">Groq Fallback</label>
                         <select id="dev-groq-fallback"></select>
                     </div>
                 </div>
                 <div class="dev-section">
-                    <div class="dev-section-title">Voice</div>
+                    <div class="dev-section-title">Voice — TTS</div>
                     <div class="dev-field">
                         <label for="dev-deepgram-model">Deepgram TTS Model</label>
                         <select id="dev-deepgram-model"></select>
                     </div>
                     <div class="dev-field">
+                        <label for="dev-tts-speed">Turtle Voice Speed <span id="dev-tts-speed-value">1.20x</span></label>
+                        <input type="range" id="dev-tts-speed" min="0.7" max="1.5" step="0.05" value="1.2">
+                    </div>
+                    <div class="dev-field">
                         <label for="dev-groq-voice">Groq TTS Voice (fallback)</label>
                         <select id="dev-groq-voice"></select>
+                    </div>
+                </div>
+                <div class="dev-section">
+                    <div class="dev-section-title">Voice — STT</div>
+                    <div class="dev-field">
+                        <label for="dev-stt-model">Whisper Model (Groq)</label>
+                        <select id="dev-stt-model"></select>
                     </div>
                 </div>
                 <div class="dev-section">

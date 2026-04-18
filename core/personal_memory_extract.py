@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
@@ -43,6 +44,22 @@ class PersonalMemoryCandidate:
     extraction_source: str
 
 
+def _unwrap_user_request(user_text: str) -> str:
+    text = str(user_text or "").strip()
+    if not text:
+        return ""
+
+    # Some runtimes wrap user input with memory preamble before it reaches the model.
+    # Memory extraction should operate on the original user request only.
+    if "Relevant user memory:" in text and "User request:" in text:
+        match = re.search(r"User request:\s*(.+)$", text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            unwrapped = match.group(1).strip()
+            if unwrapped:
+                return unwrapped
+    return text
+
+
 def extract_memory_candidates_from_messages(
     *,
     message_history: list[ModelMessage],
@@ -58,7 +75,7 @@ def extract_memory_candidates_from_messages(
         for part in message.parts:
             if not isinstance(part, UserPromptPart):
                 continue
-            user_text = str(part.content).strip()
+            user_text = _unwrap_user_request(str(part.content))
             if not user_text:
                 continue
             task_type = _detect_task_type(user_text)
@@ -121,6 +138,15 @@ def _event_to_candidates(
     if key == "identity.name" and value.get("name"):
         name = str(value["name"]).strip()
         add("identity", "name", name, f"- Name: {name}", "replace")
+    elif key == "identity.home_city" and value.get("home_city"):
+        home_city = str(value["home_city"]).strip()
+        add("identity", "home_city", home_city, f"- Home city: {home_city}", "replace")
+    elif key == "identity.current_city" and value.get("current_city"):
+        current_city = str(value["current_city"]).strip()
+        add("identity", "current_city", current_city, f"- Current city: {current_city}", "replace")
+    elif key == "identity.country" and value.get("country"):
+        country = str(value["country"]).strip()
+        add("identity", "country", country, f"- Country: {country}", "replace")
     elif key == "identity.email":
         primary_email = str(value.get("primary_email", "")).strip().lower()
         if primary_email:
@@ -129,6 +155,18 @@ def _event_to_candidates(
             normalized = str(email).strip().lower()
             if normalized and normalized != primary_email:
                 add("identity", f"known_email:{normalized}", normalized, f"- Known email: {normalized}", "append_unique")
+    elif key == "identity.timezone" and value.get("timezone"):
+        timezone = str(value["timezone"]).strip()
+        add("identity", "timezone", timezone, f"- Timezone: {timezone}", "replace")
+    elif key == "identity.preferred_language" and value.get("preferred_language"):
+        language = str(value["preferred_language"]).strip()
+        add("identity", "preferred_language", language, f"- Preferred language: {language}", "replace")
+    elif key == "identity.occupation" and value.get("occupation"):
+        occupation = str(value["occupation"]).strip()
+        add("identity", "occupation", occupation, f"- Occupation: {occupation}", "replace")
+    elif key == "identity.company" and value.get("company"):
+        company = str(value["company"]).strip()
+        add("identity", "company", company, f"- Company: {company}", "replace")
     elif key == "preferences.response_style" and value.get("response_style"):
         response_style = str(value["response_style"]).strip()
         add("preferences", "response_style", response_style, f"- Response style: {response_style}", "replace")

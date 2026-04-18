@@ -475,7 +475,71 @@ def _confidence_for_candidate(candidate: PersonalMemoryCandidate) -> float:
 
 
 def _should_auto_apply_event(*, kind: str, source: str, confidence: float) -> bool:
-    return kind == "fact" and source == "explicit" and confidence >= 0.95
+    if source != "explicit":
+        return False
+    if confidence < 0.9:
+        return False
+    return kind in {"fact", "preference"}
+
+
+def _apply_explicit_facts_from_turn(
+    state: "SharedState",
+    *,
+    session_id: str,
+    turn_id: str,
+    user_text: str,
+    task_type: str,
+) -> None:
+    """Immediately write high-confidence explicit facts (email, name) to the journal.
+
+    Called per-turn so disclosures like 'my email is X' are reflected in the
+    next turn's memory context without waiting for session-end replay.
+    """
+    if not PERSONAL_MEMORY_ENABLED:
+        return
+    try:
+        profile = state.personal_memory_store.load_profile_snapshot()
+        event_specs = extract_memory_event_specs(
+            user_text=user_text,
+            task_type=task_type,
+            profile=profile,
+            mode="deterministic",
+        )
+        # Build a minimal single-message history so we can reuse
+        # extract_memory_candidates_from_messages with its dedup logic.
+        fake_msg = ModelRequest(parts=[UserPromptPart(content=user_text)])
+        candidates = extract_memory_candidates_from_messages(
+            message_history=[fake_msg],
+            session_id=session_id,
+            profile=profile,
+        )
+        # Only keep explicit high-confidence facts/preferences — behaviors go to the gate
+        explicit_candidates = [
+            c for c in candidates
+            if c.source == "explicit" and c.topic in {
+                "identity", "preferences", "workflow", "contacts", "projects", "corrections"
+            }
+        ]
+        if not explicit_candidates:
+            return
+        events = [
+            event
+            for idx, candidate in enumerate(explicit_candidates)
+            for event in [_candidate_to_journal_event(candidate=candidate, session_id=session_id, ordinal=idx)]
+            if event is not None and _should_auto_apply_event(
+                kind=_kind_for_candidate(candidate),
+                source=_source_for_candidate(candidate),
+                confidence=_confidence_for_candidate(candidate),
+            )
+        ]
+        if not events:
+            return
+        state.journal_store.append_many(events)
+        result = replay(state.journal_store.load_all(), store=state.personal_memory_store)
+        if result.written_topics:
+            print(f"LOG: Per-turn memory applied: {result.written_topics}")
+    except Exception as e:
+        print(f"LOG: Per-turn fact extraction failed for {session_id}: {e}")
 
 
 def _candidate_to_journal_event(
@@ -506,6 +570,27 @@ def _candidate_to_journal_event(
             return None
         event_key = f"identity.known_email.{email}"
         event_value = {"email": email}
+    elif topic == "identity" and key == "home_city":
+        event_key = "identity.home_city"
+        event_value = {"home_city": value_text}
+    elif topic == "identity" and key == "current_city":
+        event_key = "identity.current_city"
+        event_value = {"current_city": value_text}
+    elif topic == "identity" and key == "country":
+        event_key = "identity.country"
+        event_value = {"country": value_text}
+    elif topic == "identity" and key == "timezone":
+        event_key = "identity.timezone"
+        event_value = {"timezone": value_text}
+    elif topic == "identity" and key == "preferred_language":
+        event_key = "identity.preferred_language"
+        event_value = {"preferred_language": value_text}
+    elif topic == "identity" and key == "occupation":
+        event_key = "identity.occupation"
+        event_value = {"occupation": value_text}
+    elif topic == "identity" and key == "company":
+        event_key = "identity.company"
+        event_value = {"company": value_text}
     elif topic == "preferences" and key == "response_style":
         event_key = "preferences.response_style"
         event_value = {"response_style": value_text}
@@ -1376,7 +1461,22 @@ async def text_chat(state: SharedState, return_to_voice: bool = True):
                 )
                 if queued:
                     print(f"LOG: Queued {queued} memory confirmation candidate(s)")
-                
+                _apply_explicit_facts_from_turn(
+                    state,
+                    session_id=state.session_store.session_id or "unknown_session",
+                    turn_id=turn_id,
+                    user_text=user_input,
+                    task_type=task_type,
+                )
+                if state.turn_counter >= 8:
+                    try:
+                        await _run_dream_pass_if_needed(
+                            state,
+                            session_id=state.session_store.session_id or "unknown_session",
+                        )
+                    except Exception as _dp_exc:
+                        print(f"LOG: Dream pass (per-turn) failed: {_dp_exc}")
+
                 # Show usage information periodically
                 if usage.requests % 5 == 0 and usage.requests > 0:
                     print(f"\n[Usage: {usage.requests} requests, {usage.total_tokens} tokens]")
@@ -1472,6 +1572,21 @@ async def voice_response_handler(audio: Tuple[int, np.ndarray], state: SharedSta
         )
         if queued:
             print(f"LOG: Queued {queued} memory confirmation candidate(s)")
+        _apply_explicit_facts_from_turn(
+            state,
+            session_id=state.session_store.session_id or "unknown_session",
+            turn_id=turn_id,
+            user_text=transcription,
+            task_type=task_type,
+        )
+        if state.turn_counter >= 8:
+            try:
+                await _run_dream_pass_if_needed(
+                    state,
+                    session_id=state.session_store.session_id or "unknown_session",
+                )
+            except Exception as _dp_exc:
+                print(f"LOG: Dream pass (per-turn) failed: {_dp_exc}")
 
         # Generate and play TTS
         tts_start_time = time.time()

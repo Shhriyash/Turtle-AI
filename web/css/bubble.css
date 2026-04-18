@@ -162,16 +162,21 @@
 
 /* Letter mark inside the bubble */
 .bubble-mark {
-    font-size: 56px;
-    font-weight: 700;
-    letter-spacing: -3px;
-    background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    opacity: 0.7;
+    width: 60px;
+    height: 60px;
+    opacity: 0.8;
     transition: opacity 0.4s;
     pointer-events: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.bubble-mark img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    filter: drop-shadow(0 0 8px rgba(34, 211, 238, 0.4));
 }
 
 .bubble-orb.listening .bubble-mark,

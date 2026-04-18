@@ -49,6 +49,77 @@
     color: var(--text-muted);
 }
 
+.btn-voice-mode {
+    min-width: 68px;
+    height: 46px;
+    padding: 0 10px;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.2s var(--ease-out);
+    flex-shrink: 0;
+}
+
+.btn-voice-mode:hover {
+    background: var(--surface-hover);
+    color: var(--text-primary);
+    border-color: var(--border-accent);
+}
+
+.btn-voice-mode.auto {
+    color: var(--accent);
+    border-color: var(--border-accent);
+    background: rgba(34, 211, 238, 0.12);
+}
+
+.btn-voice {
+    width: 46px;
+    height: 46px;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s var(--ease-out);
+    flex-shrink: 0;
+}
+
+.btn-voice svg {
+    width: 18px;
+    height: 18px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.btn-voice:hover {
+    background: var(--surface-hover);
+    border-color: var(--border-accent);
+    color: var(--text-primary);
+}
+
+.btn-voice.recording {
+    color: var(--error);
+    border-color: rgba(248, 113, 113, 0.45);
+    background: rgba(248, 113, 113, 0.14);
+    box-shadow: 0 0 12px rgba(248, 113, 113, 0.16);
+}
+
+.btn-voice.recording:hover {
+    background: rgba(248, 113, 113, 0.22);
+}
+
 /* Send button — subtle, no gradient */
 .btn-send {
     width: 46px;

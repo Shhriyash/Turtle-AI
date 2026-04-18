@@ -8,6 +8,28 @@
 import AppState from './state.js';
 import { showToast } from './utils.js';
 
+function updateTtsSpeedLabel(value) {
+    const num = Number(value);
+    const el = document.getElementById('dev-tts-speed-value');
+    if (el) el.textContent = Number.isFinite(num) ? num.toFixed(2) + 'x' : '1.20x';
+}
+
+function bindTtsSpeedPreview() {
+    const slider = document.getElementById('dev-tts-speed');
+    if (!slider || slider.dataset.bound === '1') return;
+    slider.addEventListener('input', () => updateTtsSpeedLabel(slider.value));
+    slider.dataset.bound = '1';
+}
+
+async function postConfigPatch(cfgPatch) {
+    const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfgPatch),
+    });
+    return await res.json();
+}
+
 /** Toggle the dev panel open/close */
 export function toggleDevPanel() {
     AppState.devPanelOpen = !AppState.devPanelOpen;
@@ -29,16 +51,31 @@ export async function loadDevConfig() {
         const models = await modelsRes.json();
         const cfg = await configRes.json();
 
+        // Agent model overrides (prefixed: "groq:..." or "openrouter:...")
+        populateSelect('dev-main-agent-model', models.all_models, cfg.MAIN_AGENT_MODEL);
+        populateSelect('dev-email-agent-model', models.all_models, cfg.EMAIL_AGENT_MODEL);
+        populateSelect('dev-dream-agent-model', models.all_models, cfg.DREAM_PASS_AGENT_MODEL);
+
+        // Fallback pools
         populateSelect('dev-openrouter-model', models.openrouter_models, cfg.OPEN_ROUTER_MODEL);
         populateSelect('dev-groq-model', models.groq_models, cfg.GROQ_PRIMARY_MODEL);
         populateSelect('dev-groq-fallback', models.groq_models, cfg.GROQ_FALLBACK_MODEL);
+
+        // TTS
         populateSelect('dev-deepgram-model', models.deepgram_tts_models, cfg.DEEPGRAM_TTS_MODEL);
         populateSelect('dev-groq-voice', models.groq_tts_voices, cfg.GROQ_TTS_VOICE);
 
+        // STT
+        populateSelect('dev-stt-model', models.groq_stt_models, cfg.STT_MODEL);
+
+        // Parameters
         document.getElementById('dev-temperature').value = cfg.temperature ?? 0.2;
         document.getElementById('dev-max-tokens').value = cfg.max_tokens ?? 1024;
         document.getElementById('dev-history-turns').value = cfg.TURTLE_HISTORY_MAX_TURNS ?? 12;
         document.getElementById('dev-max-messages').value = cfg.ACTIVE_HISTORY_MAX_MESSAGES ?? 40;
+        document.getElementById('dev-tts-speed').value = cfg.TURTLE_TTS_SPEED ?? 1.2;
+        updateTtsSpeedLabel(cfg.TURTLE_TTS_SPEED ?? 1.2);
+        bindTtsSpeedPreview();
     } catch (e) {
         showToast('Failed to load config', true);
     }
@@ -56,16 +93,29 @@ function populateSelect(id, options, selected) {
         if (opt === selected) el.selected = true;
         select.appendChild(el);
     }
+    // If the saved value isn't in the list, add it as the first option so it stays selected
+    if (selected && !options.includes(selected)) {
+        const el = document.createElement('option');
+        el.value = selected;
+        el.textContent = selected + ' (custom)';
+        el.selected = true;
+        select.insertBefore(el, select.firstChild);
+    }
 }
 
 /** Collect form values and POST to /api/config */
 export async function applyDevConfig() {
     const cfg = {
+        MAIN_AGENT_MODEL: document.getElementById('dev-main-agent-model').value,
+        EMAIL_AGENT_MODEL: document.getElementById('dev-email-agent-model').value,
+        DREAM_PASS_AGENT_MODEL: document.getElementById('dev-dream-agent-model').value,
         OPEN_ROUTER_MODEL: document.getElementById('dev-openrouter-model').value,
         GROQ_PRIMARY_MODEL: document.getElementById('dev-groq-model').value,
         GROQ_FALLBACK_MODEL: document.getElementById('dev-groq-fallback').value,
         DEEPGRAM_TTS_MODEL: document.getElementById('dev-deepgram-model').value,
+        TURTLE_TTS_SPEED: parseFloat(document.getElementById('dev-tts-speed').value),
         GROQ_TTS_VOICE: document.getElementById('dev-groq-voice').value,
+        STT_MODEL: document.getElementById('dev-stt-model').value,
         temperature: parseFloat(document.getElementById('dev-temperature').value),
         max_tokens: parseInt(document.getElementById('dev-max-tokens').value, 10),
         TURTLE_HISTORY_MAX_TURNS: parseInt(document.getElementById('dev-history-turns').value, 10),
@@ -73,14 +123,10 @@ export async function applyDevConfig() {
     };
 
     try {
-        const res = await fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(cfg),
-        });
-        const result = await res.json();
+        const result = await postConfigPatch(cfg);
         if (result.status === 'ok') {
             showToast('Config applied — agents reloaded');
+            loadDevConfig();
         } else {
             showToast(result.error || 'Apply failed', true);
         }
@@ -92,11 +138,16 @@ export async function applyDevConfig() {
 /** Reset all fields to defaults and apply */
 export async function resetDevDefaults() {
     const defaults = {
-        OPEN_ROUTER_MODEL: 'nvidia/nemotron-3-nano-30b-a3b:free',
-        GROQ_PRIMARY_MODEL: 'openai/gpt-oss-120b',
+        MAIN_AGENT_MODEL: 'openrouter:openai/gpt-oss-120b',
+        EMAIL_AGENT_MODEL: 'groq:llama-3.3-70b-versatile',
+        DREAM_PASS_AGENT_MODEL: '',
+        OPEN_ROUTER_MODEL: 'nvidia/llama-3.1-nemotron-70b-instruct:free',
+        GROQ_PRIMARY_MODEL: 'llama-3.3-70b-versatile',
         GROQ_FALLBACK_MODEL: 'llama-3.1-8b-instant',
         DEEPGRAM_TTS_MODEL: 'aura-2-orion-en',
+        TURTLE_TTS_SPEED: 1.2,
         GROQ_TTS_VOICE: 'orion',
+        STT_MODEL: 'whisper-large-v3-turbo',
         temperature: 0.2,
         max_tokens: 1024,
         TURTLE_HISTORY_MAX_TURNS: 12,
@@ -104,12 +155,7 @@ export async function resetDevDefaults() {
     };
 
     try {
-        const res = await fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(defaults),
-        });
-        const result = await res.json();
+        const result = await postConfigPatch(defaults);
         if (result.status === 'ok') {
             showToast('Reset to defaults');
             loadDevConfig();

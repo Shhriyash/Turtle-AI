@@ -18,7 +18,16 @@ class OutputCleanTests(unittest.TestCase):
         cleaned = clean_text_for_tts(text)
         self.assertNotIn("*", cleaned)
         self.assertIn("Price.", cleaned)
-        self.assertIn("10 or 10", cleaned)
+        self.assertIn("10 out of 10", cleaned)
+
+    def test_clean_text_for_tts_normalizes_common_speech_tokens(self) -> None:
+        text = "Mail me @ 25% + tax = final. Link: https://example.com"
+        cleaned = clean_text_for_tts(text)
+        self.assertIn("at", cleaned)
+        self.assertIn("percent", cleaned)
+        self.assertIn("plus", cleaned)
+        self.assertIn("equals", cleaned)
+        self.assertIn("link", cleaned.lower())
 
 
 if __name__ == "__main__":

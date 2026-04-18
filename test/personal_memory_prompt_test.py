@@ -63,6 +63,26 @@ class PersonalMemoryPromptTests(unittest.TestCase):
         finally:
             shutil.rmtree(base, ignore_errors=True)
 
+    def test_web_query_with_locality_includes_identity_topic(self) -> None:
+        base = Path("test") / "_tmp" / f"personal_memory_prompt_{uuid.uuid4().hex}"
+        base.mkdir(parents=True, exist_ok=True)
+        try:
+            store = self._make_store(base)
+            store.write_topic("preferences", ["- Response style: concise"], {"confidence": "confirmed"})
+            store.write_topic("identity", ["- Home city: Indore"], {"confidence": "confirmed"})
+            store.update_index_entry("preferences", "Tone and verbosity defaults")
+            store.update_index_entry("identity", "Name, email, location and timezone")
+
+            builder = PersonalMemoryPromptBuilder(
+                store,
+                config=PersonalMemoryPromptConfig(max_bytes=1024, max_topic_files=3),
+            )
+            block = builder.build_memory_block(task_type="web", query="latest local news near me")
+
+            self.assertIn("Home city: Indore", block)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

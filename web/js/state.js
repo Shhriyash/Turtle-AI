@@ -12,6 +12,8 @@ const AppState = {
     isConnected: false,
     isThinking: false,
     isRecording: false,
+    voiceMode: 'ptt',
+    pttSpaceHeld: false,
 
     /** Audio recording state */
     /** @type {AudioContext|null} */
@@ -21,6 +23,13 @@ const AppState = {
     /** @type {Int16Array[]} */
     recordedChunks: [],
 
+    /** TTS playback state */
+    /** @type {AudioContext|null} */
+    ttsAudioContext: null,
+    /** @type {AudioBufferSourceNode|null} */
+    ttsSourceNode: null,
+    isTtsPlaying: false,
+
     /** UI state */
     devPanelOpen: false,
     responsePanelOpen: false,
@@ -29,6 +38,8 @@ const AppState = {
     dom: {
         chatInput: null,
         btnSend: null,
+        btnVoiceMode: null,
+        btnVoice: null,
         statusIndicator: null,
         statusText: null,
         connectionBanner: null,

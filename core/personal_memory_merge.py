@@ -20,7 +20,7 @@ TOPIC_TITLES = {
 }
 
 TOPIC_SUMMARIES = {
-    "identity": "Name, email, timezone, preferred address",
+    "identity": "Name, email, location, timezone, language, and role",
     "preferences": "Tone, response style, and delivery defaults",
     "workflow": "Recurring habits and operational defaults",
     "contacts": "Frequent recipients and confirmed aliases",
@@ -29,8 +29,14 @@ TOPIC_SUMMARIES = {
 
 REPLACEABLE_LABELS = {
     "name": "Name",
+    "home_city": "Home city",
+    "current_city": "Current city",
+    "country": "Country",
     "primary_email": "Primary email",
     "timezone": "Timezone",
+    "preferred_language": "Preferred language",
+    "occupation": "Occupation",
+    "company": "Company",
     "response_style": "Response style",
     "humor_level": "Humor level",
     "email_tone": "Email tone",
@@ -40,9 +46,15 @@ REPLACEABLE_LABELS = {
 
 LINE_SORT_ORDER = [
     "Name",
+    "Home city",
+    "Current city",
+    "Country",
     "Primary email",
     "Known email",
     "Timezone",
+    "Preferred language",
+    "Occupation",
+    "Company",
     "Response style",
     "Humor level",
     "Email tone",

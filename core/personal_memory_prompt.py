@@ -88,6 +88,17 @@ class PersonalMemoryPromptBuilder:
         elif task_type == "web":
             for topic in ("preferences", "projects", "workflow"):
                 add(topic)
+            if any(token in lowered for token in (
+                "news",
+                "latest",
+                "weather",
+                "local",
+                "near me",
+                "my city",
+                "my area",
+                "happening",
+            )):
+                add("identity")
         elif task_type == "url":
             for topic in ("projects", "preferences", "workflow"):
                 add(topic)
@@ -95,7 +106,20 @@ class PersonalMemoryPromptBuilder:
             for topic in ("preferences", "identity", "workflow"):
                 add(topic)
 
-        if any(token in lowered for token in ("name", "who am i", "call me", "timezone", "email address", "my email")):
+        if any(token in lowered for token in (
+            "name",
+            "who am i",
+            "call me",
+            "timezone",
+            "email address",
+            "my email",
+            "city",
+            "from",
+            "local",
+            "near me",
+            "location",
+            "where i live",
+        )):
             add("identity")
         if any(token in lowered for token in ("prefer", "usually", "style", "tone", "concise", "detailed", "default response")):
             add("preferences")

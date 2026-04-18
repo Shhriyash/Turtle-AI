@@ -92,6 +92,19 @@ class MemoryJournalTests(unittest.TestCase):
             make_event(
                 kind="fact",
                 topic="identity",
+                key="identity.home_city",
+                value={"home_city": "Indore"},
+                confidence=1.0,
+                source="explicit",
+                extractor="deterministic",
+                applied=True,
+                session_id="s1",
+                turn_id="t1b",
+                observed_at="2026-04-13T10:00:30Z",
+            ),
+            make_event(
+                kind="fact",
+                topic="identity",
                 key="identity.primary_email",
                 value={"primary_email": "user@example.com"},
                 confidence=1.0,
@@ -123,6 +136,7 @@ class MemoryJournalTests(unittest.TestCase):
 
         identity_text = (self.base / "identity.md").read_text(encoding="utf-8")
         self.assertIn("- Name: Shriyash", identity_text)
+        self.assertIn("- Home city: Indore", identity_text)
         self.assertIn("- Primary email: user@example.com", identity_text)
 
         prefs_text = (self.base / "preferences.md").read_text(encoding="utf-8")

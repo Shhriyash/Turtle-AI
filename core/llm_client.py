@@ -10,7 +10,7 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.settings import ModelSettings
 
 OPENROUTER_DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b:free"
-GROQ_DEFAULT_PRIMARY_MODEL = "openai/gpt-oss-120b"
+GROQ_DEFAULT_PRIMARY_MODEL = "llama-3.3-70b-versatile"
 GROQ_DEFAULT_FALLBACK_MODEL = "llama-3.1-8b-instant"
 OPENROUTER_KEY_ENV_VARS = [
     "OPEN_ROUTER_API_KEY_1",

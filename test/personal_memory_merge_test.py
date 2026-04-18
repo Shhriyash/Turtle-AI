@@ -71,6 +71,36 @@ class PersonalMemoryMergeTests(unittest.TestCase):
         finally:
             shutil.rmtree(base, ignore_errors=True)
 
+    def test_merge_extracts_location_from_wrapped_prompt(self) -> None:
+        base = Path("test") / "_tmp" / f"personal_memory_merge_{uuid.uuid4().hex}"
+        base.mkdir(parents=True, exist_ok=True)
+        try:
+            store = self._make_store(base)
+            wrapped_prompt = (
+                "Relevant user memory:\n"
+                "[Identity]\n"
+                "- Name: Shriyash\n\n"
+                "User request:\n"
+                "I am from Indore and I live in Bengaluru."
+            )
+            history = [
+                ModelRequest(parts=[UserPromptPart(content=wrapped_prompt)]),
+            ]
+
+            candidates = extract_memory_candidates_from_messages(
+                message_history=history,
+                session_id="session-location",
+                profile=None,
+            )
+            result = merge_personal_memory_candidates(store=store, candidates=candidates)
+
+            self.assertIn("identity", result.written_topics)
+            identity_text = (base / "identity.md").read_text(encoding="utf-8")
+            self.assertIn("Home city: Indore", identity_text)
+            self.assertIn("Current city: Bengaluru", identity_text)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
     def test_weak_signals_are_not_persisted(self) -> None:
         base = Path("test") / "_tmp" / f"personal_memory_merge_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)

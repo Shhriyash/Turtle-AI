@@ -25,7 +25,7 @@ TOPIC_TITLES = {
 }
 
 TOPIC_SUMMARIES = {
-    "identity": "Name, email, timezone, preferred address",
+    "identity": "Name, email, location, timezone, language, and role",
     "preferences": "Tone, response style, and delivery defaults",
     "workflow": "Recurring habits and operational defaults",
     "contacts": "Frequent recipients and confirmed aliases",
@@ -35,9 +35,15 @@ TOPIC_SUMMARIES = {
 
 LINE_SORT_ORDER = [
     "Name",
+    "Home city",
+    "Current city",
+    "Country",
     "Primary email",
     "Known email",
     "Timezone",
+    "Preferred language",
+    "Occupation",
+    "Company",
     "Response style",
     "Humor level",
     "Email tone",
@@ -166,6 +172,18 @@ def _render_event_lines(event: MemoryEvent) -> list[str]:
         name = _clean_text(value.get("name"))
         return [f"- Name: {name}"] if name else []
 
+    if key == "identity.home_city":
+        home_city = _clean_text(value.get("home_city"))
+        return [f"- Home city: {home_city}"] if home_city else []
+
+    if key == "identity.current_city":
+        current_city = _clean_text(value.get("current_city"))
+        return [f"- Current city: {current_city}"] if current_city else []
+
+    if key == "identity.country":
+        country = _clean_text(value.get("country"))
+        return [f"- Country: {country}"] if country else []
+
     if key == "identity.primary_email":
         email = _clean_text(value.get("primary_email") or value.get("email"))
         return [f"- Primary email: {email.lower()}"] if email else []
@@ -177,6 +195,18 @@ def _render_event_lines(event: MemoryEvent) -> list[str]:
     if key == "identity.timezone":
         tz = _clean_text(value.get("timezone"))
         return [f"- Timezone: {tz}"] if tz else []
+
+    if key == "identity.preferred_language":
+        language = _clean_text(value.get("preferred_language"))
+        return [f"- Preferred language: {language}"] if language else []
+
+    if key == "identity.occupation":
+        occupation = _clean_text(value.get("occupation"))
+        return [f"- Occupation: {occupation}"] if occupation else []
+
+    if key == "identity.company":
+        company = _clean_text(value.get("company"))
+        return [f"- Company: {company}"] if company else []
 
     if key == "preferences.response_style":
         style = _clean_text(value.get("response_style"))

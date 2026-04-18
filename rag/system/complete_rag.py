@@ -327,14 +327,20 @@ class TurtleRAGSystem:
         try:
             messages_path = archive_path / "messages.json"
             if not messages_path.exists():
-                return False
+                # Nothing to index; allow caller to mark archive as completed.
+                return True
 
             from pydantic_ai import ModelMessagesTypeAdapter
 
             message_history = ModelMessagesTypeAdapter.validate_json(messages_path.read_bytes())
+            if not message_history:
+                # Empty sessions are valid (connect/disconnect without turns).
+                return True
+
             turn_records = self._extract_turn_records_from_messages(message_history)
             if not turn_records:
-                return False
+                # Message shapes may be non-indexable; avoid permanent pending loop.
+                return True
 
             manifest_path = archive_path / "session.json"
             creation_time: str | None = None
