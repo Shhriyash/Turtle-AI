@@ -81,17 +81,6 @@ User accepts → MemoryEvent(applied=True) supersedes candidate → replay() →
 User rejects → contradiction event → 14-day silence window
 ```
 
-### Memory Context Injection
-
-`PersonalMemoryPromptBuilder` selects up to 2 topic files per turn by task type:
-
-| Task type | Topics selected |
-|-----------|----------------|
-| email | identity, contacts, workflow, preferences |
-| web/search | preferences, projects, workflow |
-| general | all topics |
-
-Max context injected: `TURTLE_PERSONAL_MEMORY_MAX_BYTES` (default 2048 bytes).
 
 ### Data Files
 
@@ -197,18 +186,6 @@ Browser ──WebSocket──► FastAPI (turtle_server.py)
   ▼
 AudioContext playback
 ```
-
-### WebSocket Protocol
-
-| Direction | Frame | Schema |
-|-----------|-------|--------|
-| Client → Server | JSON | `{ "type": "text", "content": "..." }` |
-| Client → Server | Binary | Raw PCM16 audio (`Int16Array`) |
-| Server → Client | JSON | `{ "type": "done", "content": "..." }` |
-| Server → Client | JSON | `{ "type": "transcription", "text": "..." }` |
-| Server → Client | JSON | `{ "type": "status", "status": "thinking" }` |
-| Server → Client | JSON | `{ "type": "timing", "stt_ms": N, "llm_ms": N, ... }` |
-| Server → Client | JSON | `{ "type": "error", "message": "..." }` |
 
 ---
 
