@@ -210,30 +210,6 @@ AudioContext playback
 | Server → Client | JSON | `{ "type": "timing", "stt_ms": N, "llm_ms": N, ... }` |
 | Server → Client | JSON | `{ "type": "error", "message": "..." }` |
 
-### Frontend Structure
-
-```
-web/
-├── index.html
-├── css/
-│   ├── tokens.css       # Design tokens
-│   ├── base.css         # Reset + layout
-│   ├── header.css       # Header bar + status
-│   ├── messages.css     # Chat bubbles, thinking dots
-│   ├── input.css        # Input bar, mic + send buttons
-│   ├── bubble.css       # Central Shazam-style bubble
-│   ├── panel.css        # Response panel
-│   ├── devmode.css      # Dev sidebar + timing cards
-│   └── components.css   # Toast notifications
-└── js/
-    ├── state.js         # Global app state singleton
-    ├── websocket.js     # WS connect, reconnect, dispatch
-    ├── chat.js          # Message rendering, markdown
-    ├── voice.js         # AudioWorklet recording + playback
-    ├── devmode.js       # Dev panel + config loader
-    └── utils.js         # Toast, status indicator, scroll
-```
-
 ---
 
 ## File Structure
@@ -372,15 +348,6 @@ The server runs with autoreload by default in development. Set `TURTLE_SERVER_RE
 python apps/turtle_voice.py
 ```
 
-### Other Entry Points
-
-```bash
-python apps/websearch_cli.py
-python rtc_vad/vad_simple.py
-python rtc_vad/vad_fastrtc.py
-python rtc_vad/fastrtc_real.py
-```
-
 ---
 
 ## Dependencies
@@ -424,20 +391,6 @@ sounddevice        # Streaming audio
 scipy              # Audio I/O
 keyboard           # Hotkey recording control
 ```
-
----
-
-## Voice Scripts Comparison
-
-Three VAD scripts in `rtc_vad/` share the same stack (Groq Whisper STT, OpenRouter LLM, Deepgram TTS with Groq fallback):
-
-| Script | VAD Technique | Recording Style | Latency |
-|--------|--------------|----------------|---------|
-| `vad_simple.py` | Energy/RMS threshold | Record-then-transcribe | Highest |
-| `vad_fastrtc.py` | FastRTC Silero VAD | Console mode still batch | Medium |
-| `fastrtc_real.py` | FastRTC Silero VAD + manual modes | VAD-driven stop | Best potential |
-
-All three currently write audio to WAV then run STT → LLM → TTS. Next step for lower latency: stream audio into STT and stream TTS output as chunks. See `VAD_COMPARISON.md` for measurements.
 
 ---
 
