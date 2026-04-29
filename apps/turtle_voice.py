@@ -91,6 +91,7 @@ load_env(override=True)
 try:
     logfire.configure(send_to_logfire="if-token-present")
     logfire.instrument_pydantic_ai()
+    logfire.instrument_httpx(capture_all=True)
 except Exception as e:
     print(f"LOG: logfire disabled ({e})")
 ensure_dirs()

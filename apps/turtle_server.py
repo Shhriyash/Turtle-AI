@@ -103,8 +103,10 @@ try:
     import logfire
     logfire.configure(send_to_logfire="if-token-present")
     logfire.instrument_pydantic_ai()
+    logfire.instrument_httpx(capture_all=True)
+    _logfire_loaded = True
 except Exception:
-    pass
+    _logfire_loaded = False
 
 ensure_dirs()
 
@@ -1126,6 +1128,9 @@ agents_mgr = AgentManager()
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Turtle AI", docs_url=None, redoc_url=None)
 
+if _logfire_loaded:
+    import logfire as _lf
+    _lf.instrument_fastapi(app)
 
 @app.middleware("http")
 async def no_cache_js(request: Request, call_next):
