@@ -1,4 +1,4 @@
-﻿"""
+"""
 FAISS Vector Storage for RAG System
 
 This module handles vector storage and retrieval using FAISS (Facebook AI Similarity Search).
@@ -12,7 +12,7 @@ import faiss
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
-from core.paths import RAG_VECTOR_DIR, ensure_dirs
+from core.paths import rag_vector_dir, ensure_dirs
 from core.io_atomic import atomic_write_json
 
 
@@ -28,7 +28,7 @@ class VectorStorage:
             embedding_dimension: Dimension of embeddings (1024 for Cohere embed-english-v3.0)
         """
         ensure_dirs()
-        self.storage_dir = Path(storage_dir) if storage_dir else RAG_VECTOR_DIR
+        self.storage_dir = Path(storage_dir) if storage_dir else rag_vector_dir("default")
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
         self.embedding_dimension = embedding_dimension
@@ -126,6 +126,9 @@ class VectorStorage:
             "session_id": session_id,
             "content": content,
         }
+        for key in ("timestamp", "topics", "turn_id_range", "creation_time", "chunk_id"):
+            if key in entry:
+                normalized[key] = entry[key]
         if bool(entry.get("deleted", False)):
             normalized["deleted"] = True
         if bool(entry.get("orphaned", False)):
@@ -152,6 +155,9 @@ class VectorStorage:
             "session_id": session_id,
             "content": content,
         }
+        for key in ("timestamp", "topics", "turn_id_range", "creation_time", "chunk_id"):
+            if key in chunk:
+                entry[key] = chunk[key]
         if bool(chunk.get("deleted", False)):
             entry["deleted"] = True
         if bool(chunk.get("orphaned", False)):

@@ -173,6 +173,16 @@ class MemoryStore:
             lines.append(f"Common recipient: {workflow['common_recipients'][0]}")
         if tools.get("primary_llm"):
             lines.append(f"Preferred model: {tools['primary_llm']}")
+        for t in (tools.get("tools") or [])[:2]:
+            lines.append(f"Preferred tool: {t}")
+
+        for style_key, label in (
+            ("working_style", "Working style"),
+            ("communication_style", "Communication style"),
+            ("decision_style", "Decision style"),
+        ):
+            for note in (profile.get(style_key, {}).get("notes") or [])[:1]:
+                lines.append(f"{label}: {note}")
 
         graph_lines = self.graph_store.query_context(
             GraphContextQuery(query=query, task_type=task_type, max_lines=2)

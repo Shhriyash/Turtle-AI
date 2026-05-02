@@ -167,6 +167,35 @@ class ConfirmationGate:
         replay(self.journal.load_all(), store=self.store)
         return response_event
 
+    def preview_pending(self, event_id: str) -> str | None:
+        """Return a human-readable preview of a pending candidate.
+
+        Surfaces the proposed (topic, key, value), the extractor that
+        produced it, confidence, and the evidence snippet — so the user
+        can decide whether to accept/reject without flying blind.
+        """
+        event = self._load_event(event_id)
+        if event is None:
+            return None
+        try:
+            value_str = json.dumps(event.value, ensure_ascii=False, indent=2)
+        except Exception:
+            value_str = str(event.value)
+        evidence = event.evidence or {}
+        if isinstance(evidence, dict):
+            evidence_str = evidence.get("note") or evidence.get("text") or json.dumps(evidence, ensure_ascii=False)
+        else:
+            evidence_str = str(evidence)
+        return (
+            f"Proposed memory:\n"
+            f"  topic: {event.topic}\n"
+            f"  key: {event.key}\n"
+            f"  value: {value_str}\n"
+            f"  source: {event.source} (extractor: {event.extractor}, confidence: {event.confidence:.2f})\n"
+            f"  evidence: {evidence_str}\n"
+            f"Reply yes to save, no to reject."
+        )
+
     def pending_count(self) -> int:
         return len(self._state["pending"])
 
@@ -273,6 +302,15 @@ def _render_question(event: MemoryEvent) -> str:
         email = value.get("email")
         if email:
             return f"I've seen {email} come up a lot — want me to save it as a frequent contact?"
+    if key in {"workflow.morning_routine", "workflow.daily_briefing"} or key.startswith("workflow.recurring_request"):
+        items = value.get("items") or value.get("steps") or []
+        cadence = value.get("cadence") or value.get("frequency") or "daily"
+        if isinstance(items, list) and items:
+            items_str = ", ".join(str(i) for i in items)
+            return f"Sounds like a {cadence} routine ({items_str}) — want me to remember it so I run it automatically?"
+        routine = value.get("routine") or value.get("name")
+        if routine:
+            return f"Sounds like a {cadence} routine ({routine}) — want me to remember it?"
     if key.startswith("projects.project."):
         name = value.get("name")
         if name:

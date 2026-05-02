@@ -119,9 +119,17 @@ export function formatMessage(text) {
     // Code blocks
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    
+    // Markdown Links
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+
+    // Raw URLs (using negative lookbehind to avoid replacing URLs inside href attributes)
+    html = html.replace(/(?<!href=")(https?:\/\/[^\s<]+[^<.,:;"')\]\s])/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+
     // Bold / Italic
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    
     // Paragraphs
     html = html.split('\n\n').map(p => `<p>${p}</p>`).join('');
     html = html.replace(/\n/g, '<br>');

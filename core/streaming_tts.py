@@ -1,0 +1,281 @@
+"""
+core/streaming_tts.py
+---------------------
+E3: Streaming TTS with sentence-boundary chunking.
+
+Instead of synthesising the full LLM output as one monolithic WAV (the current
+approach in openrouter_tts.py:synthesize_speech), this module:
+  1. Receives LLM output tokens as they stream.
+  2. Groups tokens into sentences at sentence boundaries (. ! ? \\n\\n).
+  3. Fires each sentence to Deepgram TTS in parallel as soon as the sentence
+     boundary is detected — while the next sentence is still generating.
+  4. Yields (sentence_text, audio_bytes) tuples back to the caller.
+
+E1/E2 (streaming STT + VAD barge-in) are deferred — marked as TODO below.
+E4 latency budget: TTS_FIRST_BYTE_MAX_MS=600 ms soft target, handled by the
+     caller's asyncio.wait_for at the handler level.
+
+Usage::
+
+    async for sentence, audio_bytes in stream_tts_sentences(text_generator()):
+        await ws.send_bytes(audio_bytes)   # stream chunk to client
+"""
+from __future__ import annotations
+
+import asyncio
+import io
+import os
+import re
+import threading
+import time
+from typing import AsyncIterator, Iterator
+
+
+# ---------------------------------------------------------------------------
+# Sentence boundary detection
+# ---------------------------------------------------------------------------
+
+# Sentence ends at: period/!/?/… followed by whitespace or end-of-string,
+# OR double-newline (paragraph break).
+_SENTENCE_BOUNDARY = re.compile(
+    r'(?<=[.!?…])\s+|(?<=\n)\n+'
+)
+
+# Minimum sentence length to fire TTS (avoid triggering on "ok." alone)
+_MIN_SENTENCE_CHARS = 12
+
+
+def split_into_sentences(text: str) -> list[str]:
+    """Split text into TTS-ready sentence chunks."""
+    # Collapse multiple spaces
+    text = re.sub(r' {2,}', ' ', text).strip()
+    if not text:
+        return []
+
+    parts = _SENTENCE_BOUNDARY.split(text)
+    sentences: list[str] = []
+    buffer = ""
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        buffer = (buffer + " " + part).strip() if buffer else part
+        # Fire when we have a real sentence (ends with sentence-ending punctuation)
+        if re.search(r'[.!?…]$', buffer) and len(buffer) >= _MIN_SENTENCE_CHARS:
+            sentences.append(buffer)
+            buffer = ""
+
+    # Flush any remaining buffer (last sentence without trailing punctuation)
+    if buffer and len(buffer) >= 3:
+        sentences.append(buffer)
+
+    return sentences
+
+
+class SentenceAccumulator:
+    """Stream tokens in, get complete sentences out."""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._sentences: list[str] = []
+
+    def feed(self, token: str) -> list[str]:
+        """Feed a token fragment; return any newly completed sentences."""
+        self._buffer += token
+        completed: list[str] = []
+
+        # Check for sentence boundary in accumulated buffer
+        while True:
+            m = _SENTENCE_BOUNDARY.search(self._buffer)
+            if not m:
+                break
+            sentence = self._buffer[: m.start()].strip()
+            remainder = self._buffer[m.end() :]
+            if sentence and len(sentence) >= _MIN_SENTENCE_CHARS:
+                completed.append(sentence)
+            self._buffer = remainder
+
+        return completed
+
+    def flush(self) -> list[str]:
+        """Return any remaining buffered text as the final sentence."""
+        buf = self._buffer.strip()
+        self._buffer = ""
+        if buf and len(buf) >= 3:
+            return [buf]
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Per-sentence Deepgram TTS synthesis (async)
+# ---------------------------------------------------------------------------
+
+async def _synthesize_sentence_async(
+    text: str,
+    *,
+    model: str | None = None,
+    speed: float | None = None,
+) -> bytes:
+    """Synthesise one sentence via Deepgram WS TTS and return raw audio bytes.
+
+    Runs the blocking Deepgram WS call in a thread executor to avoid blocking
+    the event loop.  E4: TTS_FIRST_BYTE_MAX_MS applies at the caller level.
+    """
+    from core.openrouter_tts import _synthesize_deepgram_ws
+
+    # Write to an in-memory path using a tempfile-style approach
+    import tempfile, pathlib
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        tmp_path = pathlib.Path(f.name)
+
+    loop = asyncio.get_event_loop()
+
+    def _synth() -> bytes:
+        try:
+            out = _synthesize_deepgram_ws(text, tmp_path, model=model, speed=speed)
+            return out.read_bytes()
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    audio_bytes = await loop.run_in_executor(None, _synth)
+    return audio_bytes
+
+
+# ---------------------------------------------------------------------------
+# Streaming TTS entry points
+# ---------------------------------------------------------------------------
+
+async def stream_tts_from_text(
+    full_text: str,
+    *,
+    model: str | None = None,
+    speed: float | None = None,
+    tts_timeout_s: float = 8.0,
+) -> AsyncIterator[tuple[str, bytes]]:
+    """E3: Split full_text into sentences and yield (sentence, audio_bytes) per sentence.
+
+    First audio chunk should arrive within ~600 ms of TTS start (Deepgram
+    aura-2-orion-en p50 is ~350-450 ms per sentence).
+
+    Args:
+        full_text: The complete LLM output text.
+        model: Deepgram model override.
+        speed: TTS speed (0.7–1.5).
+        tts_timeout_s: Per-sentence synthesis timeout.
+
+    Yields:
+        (sentence_text, wav_bytes) tuples in order.
+    """
+    sentences = split_into_sentences(full_text)
+    if not sentences:
+        return
+
+    # Fire sentences concurrently via a task queue; yield in order.
+    tasks: list[asyncio.Task] = []
+    for sentence in sentences:
+        task = asyncio.create_task(
+            _synthesize_sentence_async(sentence, model=model, speed=speed)
+        )
+        tasks.append((sentence, task))
+
+    for sentence, task in tasks:
+        try:
+            audio_bytes = await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=tts_timeout_s,
+            )
+            yield sentence, audio_bytes
+        except asyncio.TimeoutError:
+            print(f"LOG: TTS sentence timeout ({tts_timeout_s:.0f} s) for: {sentence[:40]!r}")
+            task.cancel()
+            continue
+        except Exception as exc:
+            print(f"LOG: TTS sentence error for {sentence[:40]!r}: {exc}")
+            task.cancel()
+            continue
+
+
+async def stream_tts_from_token_stream(
+    token_iterator: AsyncIterator[str],
+    *,
+    model: str | None = None,
+    speed: float | None = None,
+    tts_timeout_s: float = 8.0,
+) -> AsyncIterator[tuple[str, bytes]]:
+    """E3: Sentence-boundary chunked TTS from a streaming token iterator.
+
+    As LLM tokens arrive, groups them into sentences.  Fires TTS for each
+    completed sentence while the next sentence is still generating.
+
+    E1/E2 TODO: When STT streaming + barge-in is implemented, the caller will
+    cancel this iterator via an asyncio.CancelledError when VAD detects speech.
+
+    Args:
+        token_iterator: Async iterator of LLM token strings.
+        model: Deepgram model override.
+        speed: TTS speed.
+        tts_timeout_s: Per-sentence synthesis timeout.
+
+    Yields:
+        (sentence_text, wav_bytes) tuples as they complete.
+    """
+    accumulator = SentenceAccumulator()
+    pending_tasks: list[tuple[str, asyncio.Task]] = []
+
+    async for token in token_iterator:
+        completed = accumulator.feed(token)
+        for sentence in completed:
+            task = asyncio.create_task(
+                _synthesize_sentence_async(sentence, model=model, speed=speed)
+            )
+            pending_tasks.append((sentence, task))
+
+        # Yield any tasks that are already done (non-blocking drain)
+        still_pending = []
+        for sentence, task in pending_tasks:
+            if task.done():
+                try:
+                    audio_bytes = task.result()
+                    yield sentence, audio_bytes
+                except Exception as exc:
+                    print(f"LOG: TTS error: {exc}")
+            else:
+                still_pending.append((sentence, task))
+        pending_tasks = still_pending
+
+    # Flush accumulator after token stream ends
+    for sentence in accumulator.flush():
+        task = asyncio.create_task(
+            _synthesize_sentence_async(sentence, model=model, speed=speed)
+        )
+        pending_tasks.append((sentence, task))
+
+    # Drain remaining tasks in order
+    for sentence, task in pending_tasks:
+        try:
+            audio_bytes = await asyncio.wait_for(asyncio.shield(task), timeout=tts_timeout_s)
+            yield sentence, audio_bytes
+        except asyncio.TimeoutError:
+            print(f"LOG: TTS sentence timeout for: {sentence[:40]!r}")
+            task.cancel()
+        except Exception as exc:
+            print(f"LOG: TTS sentence error: {exc}")
+            task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# E1/E2 stubs (deferred)
+# ---------------------------------------------------------------------------
+
+# TODO E1: Implement streaming STT via Deepgram streaming or Groq Whisper streaming.
+#   New file: core/stt_streaming.py exposing AsyncIterator[str] of partial transcripts.
+#   Frontend receives {type: "transcription_partial", text} frames over the WS.
+
+# TODO E2: Wire rtc_vad/vad_fastrtc.py (Silero VAD) into WebSocket audio path.
+#   On VAD speech-start while TTS is streaming, cancel the stream_tts_from_token_stream
+#   iterator and send {type: "barge_in"} to the client.
+#   New orchestration file: core/voice_pipeline.py.

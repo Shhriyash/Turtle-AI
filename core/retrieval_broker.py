@@ -1,31 +1,21 @@
-"""Retrieval broker (Step 7) — assembles per-turn memory context under a hard token budget.
+"""Retrieval broker — assembles prompt-time memory plus recall-tool lookups.
 
-Four tiers, assembled in priority order, each capped at a sub-budget:
-
-  Tier 1  MEMORY.md index       60 tokens   always present
-  Tier 2  topic slice          200 tokens   always present, relevance-scored
-  Tier 3  episodic RAG hits    100 tokens   only on history/time trigger words
-  Tier 4  task history hit      40 tokens   only on history/time trigger words
-
-  Hard cap: 400 tokens total.
-
-"Tokens" are estimated at 1 token per 4 characters, consistent with the rest
-of the codebase.  The budget is intentionally conservative — these numbers are
-embedded in system-prompt context that already competes with the conversation.
-
-Tier 3 and 4 are gated behind ``_has_history_trigger`` to avoid a FAISS vector
-search and SQLite FTS query on every turn.  Explicit history queries (the
-``history_tool`` agent tool) run unconditionally via a separate code path.
+Prompt-time injection is intentionally small: MEMORY.md index + identity block,
+trimmed under a hard token budget. Episodic and task history are now accessed
+only through the recall tool.
 """
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Callable
 
 from core.personal_memory_prompt import PersonalMemoryPromptBuilder
 from core.personal_memory_store import PersonalMemoryStore
 from core.task_history import TaskHistoryStore
+from core.memory_journal import JournalStore
+from core.session_store import SessionStore
 
 
 # ---------------------------------------------------------------------------
@@ -34,11 +24,9 @@ from core.task_history import TaskHistoryStore
 
 @dataclass(frozen=True)
 class RetrievalBudget:
-    index_tokens: int = 60
-    topic_tokens: int = 200
-    episodic_tokens: int = 100
-    task_tokens: int = 40
-    total_tokens: int = 400
+    index_tokens: int = 240
+    summary_tokens: int = 150
+    total_tokens: int = 390
 
 
 DEFAULT_BUDGET = RetrievalBudget()
@@ -129,12 +117,18 @@ class RetrievalBroker:
         *,
         store: PersonalMemoryStore,
         task_store: TaskHistoryStore,
+        journal_store: JournalStore | None = None,
+        session_store: SessionStore | None = None,
         rag_system: Any | None = None,
+        vector_store: Any | None = None,
         budget: RetrievalBudget = DEFAULT_BUDGET,
     ) -> None:
         self.store = store
         self.task_store = task_store
+        self.journal_store = journal_store
+        self.session_store = session_store
         self.rag_system = rag_system
+        self.vector_store = vector_store
         self.budget = budget
         # Reuse existing topic-selection logic from PersonalMemoryPromptBuilder.
         self._prompt_builder = PersonalMemoryPromptBuilder(store)
@@ -157,78 +151,140 @@ class RetrievalBroker:
                 sections.append(trimmed)
                 tokens_used += _estimate_tokens(trimmed)
 
-        # --- Tier 2: topic slice (always) --------------------------------
+        # --- Tier 2: rolling summary tail -------------------------------
         remaining = self.budget.total_tokens - tokens_used
-        budget_2 = min(self.budget.topic_tokens, remaining)
+        budget_2 = min(self.budget.summary_tokens, remaining)
         if budget_2 > 0:
-            topic_text = self._build_topic_tier(task_type=task_type, query=query)
-            if topic_text:
-                trimmed = _trim_to_tokens(topic_text, budget_2)
+            summary_text = self._build_summary_tier()
+            if summary_text:
+                trimmed = _trim_to_tokens(summary_text, budget_2)
                 if trimmed:
                     sections.append(trimmed)
                     tokens_used += _estimate_tokens(trimmed)
 
-        # --- Tier 3 + 4: episodic + task (history triggers only) ---------
-        if _has_history_trigger(query):
-            # Tier 3: episodic RAG
-            remaining = self.budget.total_tokens - tokens_used
-            budget_3 = min(self.budget.episodic_tokens, remaining)
-            if budget_3 > 0 and self.rag_system is not None:
-                episodic_text = await self._build_episodic_tier(query)
-                if episodic_text:
-                    trimmed = _trim_to_tokens(episodic_text, budget_3)
-                    if trimmed:
-                        sections.append(trimmed)
-                        tokens_used += _estimate_tokens(trimmed)
-
-            # Tier 4: task history
-            remaining = self.budget.total_tokens - tokens_used
-            budget_4 = min(self.budget.task_tokens, remaining)
-            if budget_4 > 0:
-                task_text = self._build_task_tier(query)
-                if task_text:
-                    trimmed = _trim_to_tokens(task_text, budget_4)
-                    if trimmed:
-                        sections.append(trimmed)
-                        # tokens_used += ... (not needed, this is the last tier)
-
         return "\n\n".join(sections).strip()
+
+    async def recall(
+        self,
+        *,
+        query: str,
+        scope: str,
+        message_history: list[Any] | None = None,
+        trim_fn: Callable[[list[Any]], list[Any]] | None = None,
+    ) -> str:
+        """Dispatch recall queries by scope."""
+        scope_key = str(scope or "").strip().lower()
+        if scope_key == "personal":
+            return await self._build_personal_tier(query)
+        if scope_key == "episodic":
+            return await self._build_episodic_tier(query)
+        if scope_key == "tasks":
+            return self._build_task_tier(query)
+        if scope_key == "working":
+            return self._build_working_tier(query, message_history, trim_fn)
+        return ""
 
     # ------------------------------------------------------------------
     # Tier builders
     # ------------------------------------------------------------------
 
     def _build_index_tier(self) -> str:
-        """Tier 1: compact MEMORY.md index summary."""
+        """Tier 1: MEMORY.md index + full bodies of identity.md and preferences.md.
+
+        The index lines alone are just descriptions, not actual values. We
+        always expand identity to ensure key facts are present in the prompt.
+        """
+        sections: list[str] = []
         entries = self.store.load_index()
+        if entries:
+            lines = [f"- {entry.title}: {entry.summary}" for entry in entries]
+            sections.append("[Memory Index]\n" + "\n".join(lines))
+
+        for topic_label, topic_key in (("Identity", "identity"), ("Preferences", "preferences")):
+            try:
+                doc = self.store.load_topic(topic_key)
+            except Exception:
+                continue
+            body_lines = [str(line).strip() for line in (doc.lines or []) if str(line).strip()]
+            if not body_lines:
+                continue
+            sections.append(f"[{topic_label}]\n" + "\n".join(body_lines))
+
+        return "\n\n".join(sections).strip()
+
+    def _build_summary_tier(self) -> str:
+        if self.session_store is None:
+            return ""
+        entries = self.session_store.get_summary_tail(max_entries=6)
         if not entries:
             return ""
-        lines = [f"- {entry.title}: {entry.summary}" for entry in entries]
-        return "[Memory Index]\n" + "\n".join(lines)
+        lines = ["[Recent Summary]"]
+        for entry in entries:
+            timestamp = str(entry.get("timestamp", "")).strip()
+            turn_range = entry.get("turn_id_range")
+            bullets = entry.get("bullets") or []
+            header = timestamp
+            if isinstance(turn_range, (list, tuple)) and len(turn_range) == 2:
+                header = f"{header} (turns {turn_range[0]}-{turn_range[1]})" if header else f"turns {turn_range[0]}-{turn_range[1]}"
+            if header:
+                lines.append(header)
+            for bullet in bullets:
+                bullet_text = str(bullet).strip()
+                if bullet_text:
+                    lines.append(f"- {bullet_text}")
+        return "\n".join(lines).strip()
 
-    def _build_topic_tier(self, *, task_type: str, query: str) -> str:
-        """Tier 2: relevance-scored topic file content.
+    async def _build_personal_tier(self, query: str) -> str:
+        """Search personal memory topics + journal for relevant matches."""
+        query_text = str(query or "").strip()
+        if not query_text:
+            return ""
+        lowered = query_text.lower()
 
-        Topic selection reuses the existing ``PersonalMemoryPromptBuilder``
-        logic (task-type priority + keyword signals in the query).
-        """
-        entries = self.store.load_index()
-        # _select_topics is a private method we own; accessing it here is fine.
-        selected = self._prompt_builder._select_topics(  # noqa: SLF001
-            task_type=task_type,
-            query=query,
-            entries=entries,
-        )
         sections: list[str] = []
-        for topic_name in selected[:3]:  # at most 3 before token trimming
-            document = self.store.load_topic(topic_name)
-            if document.lines:
-                title = (
-                    document.metadata.get("title")
-                    or topic_name.replace("_", " ").title()
+        topic_hits: list[str] = []
+        for topic_name in sorted(self.store.topic_paths.keys()):
+            try:
+                doc = self.store.load_topic(topic_name)
+            except Exception:
+                continue
+            matches = []
+            for line in doc.lines or []:
+                line_text = str(line).strip()
+                if not line_text:
+                    continue
+                if lowered in line_text.lower():
+                    matches.append(line_text)
+                if len(matches) >= 4:
+                    break
+            if matches:
+                title = doc.metadata.get("title") or topic_name.replace("_", " ").title()
+                topic_hits.append("\n".join([f"[{title}]", *matches]))
+            if len(topic_hits) >= 3:
+                break
+
+        if topic_hits:
+            sections.append("\n\n".join(topic_hits))
+
+        if self.journal_store is not None:
+            journal_hits: list[str] = []
+            try:
+                events = self.journal_store.load_all()
+            except Exception:
+                events = []
+            for event in reversed(events[-200:]):
+                text = json.dumps(event.to_payload(), ensure_ascii=False)
+                if lowered not in text.lower():
+                    continue
+                value_text = json.dumps(event.value, ensure_ascii=False)
+                journal_hits.append(
+                    f"- {event.topic} {event.key}: {value_text}"
                 )
-                section = "\n".join([f"[{title}]", *document.lines])
-                sections.append(section)
+                if len(journal_hits) >= 5:
+                    break
+            if journal_hits:
+                sections.append("[Journal]\n" + "\n".join(journal_hits))
+
         return "\n\n".join(sections).strip()
 
     async def _build_episodic_tier(self, query: str) -> str:
@@ -243,16 +299,23 @@ class RetrievalBroker:
                 return ""
             if not isinstance(chunks, list) or not chunks:
                 return ""
+            window = _infer_temporal_window(query)
             lines = ["[Past Conversations]"]
-            for chunk in chunks[:3]:
+            added = 0
+            for chunk in chunks:
                 content = str(chunk.get("content", "")).strip()
                 ts = str(chunk.get("timestamp", "")).strip()
+                if window and not _timestamp_in_window(ts, window):
+                    continue
                 if not content:
                     continue
                 prefix = f"[{ts}] " if ts else ""
                 # Keep individual chunk excerpts short
                 excerpt = content[:200]
                 lines.append(f"- {prefix}{excerpt}")
+                added += 1
+                if added >= 3:
+                    break
             return "\n".join(lines) if len(lines) > 1 else ""
         except Exception:
             return ""
@@ -263,3 +326,98 @@ class RetrievalBroker:
             return self.task_store.format_search_results(query, max_results=1)
         except Exception:
             return ""
+
+    def _build_working_tier(
+        self,
+        query: str,
+        message_history: list[Any] | None,
+        trim_fn: Callable[[list[Any]], list[Any]] | None,
+    ) -> str:
+        query_text = str(query or "").strip()
+        if not query_text or not message_history:
+            return ""
+        lowered = query_text.lower()
+
+        visible = trim_fn(message_history) if trim_fn else []
+        hidden = message_history
+        if visible:
+            hidden = message_history[:-len(visible)]
+        if not hidden:
+            return ""
+
+        lines: list[str] = []
+        try:
+            from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart, ToolCallPart, ToolReturnPart
+        except Exception:
+            ModelRequest = ModelResponse = UserPromptPart = TextPart = ToolCallPart = ToolReturnPart = None
+
+        for message in hidden:
+            if ModelRequest and isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if UserPromptPart and isinstance(part, UserPromptPart):
+                        content = str(part.content).strip()
+                        if content and lowered in content.lower():
+                            lines.append(f"user: {content}")
+            elif ModelResponse and isinstance(message, ModelResponse):
+                for part in message.parts:
+                    if TextPart and isinstance(part, TextPart):
+                        content = str(part.content).strip()
+                        if content and lowered in content.lower():
+                            lines.append(f"assistant: {content}")
+                    elif ToolCallPart and isinstance(part, ToolCallPart):
+                        args = str(part.args).strip()
+                        tool_name = str(part.tool_name).strip()
+                        content = f"tool_call {tool_name}: {args}".strip()
+                        if lowered in content.lower():
+                            lines.append(content)
+                    elif ToolReturnPart and isinstance(part, ToolReturnPart):
+                        content = str(part.content).strip()
+                        tool_name = str(part.tool_name).strip()
+                        line = f"tool_return {tool_name}: {content}".strip()
+                        if content and lowered in line.lower():
+                            lines.append(line)
+            else:
+                raw = str(message).strip()
+                if raw and lowered in raw.lower():
+                    lines.append(raw)
+
+            if len(lines) >= 8:
+                break
+
+        if not lines:
+            return ""
+        return "[Earlier In This Conversation]\n" + "\n".join(f"- {line}" for line in lines)
+
+
+def _infer_temporal_window(query: str) -> tuple[datetime, datetime] | None:
+    lowered = query.lower()
+    now = datetime.now(UTC)
+    if "today" in lowered:
+        start = datetime(now.year, now.month, now.day, tzinfo=UTC)
+        end = start + timedelta(days=1)
+        return (start, end)
+    if "yesterday" in lowered:
+        end = datetime(now.year, now.month, now.day, tzinfo=UTC)
+        start = end - timedelta(days=1)
+        return (start, end)
+    if "last week" in lowered or "week ago" in lowered:
+        start = now - timedelta(days=7)
+        return (start, now)
+    if "last month" in lowered or "month ago" in lowered:
+        start = now - timedelta(days=30)
+        return (start, now)
+    if "last year" in lowered or "year ago" in lowered:
+        start = now - timedelta(days=365)
+        return (start, now)
+    return None
+
+
+def _timestamp_in_window(timestamp: str, window: tuple[datetime, datetime]) -> bool:
+    if not timestamp:
+        return False
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    start, end = window
+    return start <= parsed <= end

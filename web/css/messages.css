@@ -158,6 +158,19 @@
 .message-bubble p { margin-bottom: 8px; }
 .message-bubble p:last-child { margin-bottom: 0; }
 
+.message-bubble a {
+    color: var(--text-accent);
+    text-decoration: underline;
+    text-decoration-color: rgba(34, 211, 238, 0.4);
+    text-underline-offset: 3px;
+    transition: all 0.2s var(--ease-out);
+}
+
+.message-bubble a:hover {
+    color: #fff;
+    text-decoration-color: var(--accent);
+}
+
 .message-bubble code {
     background: rgba(0,0,0,0.3);
     padding: 2px 6px;

@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from core.paths import PERSONAL_MEMORY_JOURNAL_DIR
+from core.paths import personal_journal_dir
 
 
 ALLOWED_KINDS = frozenset({"fact", "preference", "behavior", "correction", "contradiction"})
@@ -103,8 +103,9 @@ def validate_event(event: MemoryEvent) -> None:
 class JournalStore:
     """Append-only JSONL journal, sharded by month, idempotent by event_id."""
 
-    def __init__(self, journal_dir: Path = PERSONAL_MEMORY_JOURNAL_DIR) -> None:
-        self.journal_dir = journal_dir
+    def __init__(self, user_id: str = "default", journal_dir: Path | None = None) -> None:
+        self.user_id = user_id
+        self.journal_dir = journal_dir or personal_journal_dir(user_id)
         self.journal_dir.mkdir(parents=True, exist_ok=True)
 
     def _shard_path_for(self, observed_at: str) -> Path:
@@ -132,7 +133,32 @@ class JournalStore:
         return event
 
     def append_many(self, events: Iterable[MemoryEvent]) -> list[MemoryEvent]:
-        return [self.append(event) for event in events]
+        # Phase 1: dedup-on-append. Skip events whose (topic, kind, normalized
+        # value) matches one of the last 50 events with an identical value.
+        recent: list[MemoryEvent] = []
+        try:
+            all_events = self.load_all()
+            recent = all_events[-50:]
+        except Exception:
+            recent = []
+
+        def _signature(ev: MemoryEvent) -> tuple[str, str, str]:
+            try:
+                normalized = json.dumps(ev.value, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                normalized = str(ev.value)
+            return (str(ev.topic), str(ev.kind), normalized)
+
+        recent_sigs = {_signature(ev) for ev in recent}
+
+        results: list[MemoryEvent] = []
+        for event in events:
+            sig = _signature(event)
+            if sig in recent_sigs:
+                continue
+            results.append(self.append(event))
+            recent_sigs.add(sig)
+        return results
 
     def iter_events(self) -> Iterator[MemoryEvent]:
         if not self.journal_dir.exists():
@@ -169,6 +195,26 @@ class JournalStore:
             if existing.event_id == event_id:
                 return True
         return False
+
+    def flush(self) -> None:
+        """Best-effort fsync for existing journal shards."""
+        if not self.journal_dir.exists():
+            return
+        for shard_dir in sorted(self.journal_dir.iterdir()):
+            if not shard_dir.is_dir():
+                continue
+            path = shard_dir / "events.jsonl"
+            if not path.exists():
+                continue
+            try:
+                with path.open("a", encoding="utf-8") as file:
+                    file.flush()
+                    try:
+                        os.fsync(file.fileno())
+                    except Exception:
+                        pass
+            except Exception:
+                continue
 
 
 def make_event(

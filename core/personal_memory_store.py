@@ -6,17 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from core.io_atomic import atomic_write_text
-from core.paths import (
-    PERSONAL_MEMORY_CONTACTS_FILE,
-    PERSONAL_MEMORY_CORRECTIONS_FILE,
-    PERSONAL_MEMORY_DIR,
-    PERSONAL_MEMORY_IDENTITY_FILE,
-    PERSONAL_MEMORY_INDEX_FILE,
-    PERSONAL_MEMORY_LOGS_DIR,
-    PERSONAL_MEMORY_PREFERENCES_FILE,
-    PERSONAL_MEMORY_PROJECTS_FILE,
-    PERSONAL_MEMORY_WORKFLOW_FILE,
-)
+from core.worker import queue_service
+from core.paths import personal_memory_dir, personal_memory_file
 from core.personal_memory_schema import (
     MarkdownMemoryDocument,
     parse_markdown_memory,
@@ -37,26 +28,32 @@ class PersonalMemoryIndexEntry:
 
 
 class PersonalMemoryStore:
-    DEFAULT_TOPICS = {
-        "identity": PERSONAL_MEMORY_IDENTITY_FILE,
-        "preferences": PERSONAL_MEMORY_PREFERENCES_FILE,
-        "workflow": PERSONAL_MEMORY_WORKFLOW_FILE,
-        "contacts": PERSONAL_MEMORY_CONTACTS_FILE,
-        "projects": PERSONAL_MEMORY_PROJECTS_FILE,
-        "corrections": PERSONAL_MEMORY_CORRECTIONS_FILE,
-    }
-
     def __init__(
         self,
+        user_id: str = "default",
         *,
-        base_dir: Path = PERSONAL_MEMORY_DIR,
-        index_path: Path = PERSONAL_MEMORY_INDEX_FILE,
-        logs_dir: Path = PERSONAL_MEMORY_LOGS_DIR,
+        base_dir: Path | None = None,
+        index_path: Path | None = None,
+        logs_dir: Path | None = None,
         topic_paths: dict[str, Path] | None = None,
     ) -> None:
-        self.base_dir = base_dir
-        self.index_path = index_path
-        self.logs_dir = logs_dir
+        self.user_id = user_id
+        self.base_dir = base_dir or personal_memory_dir(user_id)
+        self.index_path = index_path or personal_memory_file(user_id, "MEMORY.md")
+        self.logs_dir = logs_dir or (self.base_dir / "logs")
+        
+        self.DEFAULT_TOPICS = {
+            "identity": personal_memory_file(user_id, "identity.md"),
+            "preferences": personal_memory_file(user_id, "preferences.md"),
+            "workflow": personal_memory_file(user_id, "workflow.md"),
+            "contacts": personal_memory_file(user_id, "contacts.md"),
+            "projects": personal_memory_file(user_id, "projects.md"),
+            "corrections": personal_memory_file(user_id, "corrections.md"),
+            "working_style": personal_memory_file(user_id, "working_style.md"),
+            "communication_style": personal_memory_file(user_id, "communication_style.md"),
+            "tool_preferences": personal_memory_file(user_id, "tool_preferences.md"),
+            "decision_style": personal_memory_file(user_id, "decision_style.md"),
+        }
         self.topic_paths = dict(self.DEFAULT_TOPICS)
         if topic_paths:
             self.topic_paths.update({self._normalize_topic_name(key): value for key, value in topic_paths.items()})
@@ -122,6 +119,15 @@ class PersonalMemoryStore:
         lines = content if isinstance(content, str) else list(content)
         serialized = serialize_markdown_memory(normalized_metadata, lines)
         atomic_write_text(path, serialized)
+        
+        # D5/G3: Enqueue embedding job
+        try:
+            import asyncio
+            loop = asyncio.get_running_loop()
+            loop.create_task(queue_service.enqueue("embed_personal_memory", user_id=self.user_id, topic_name=topic_name, lines=lines))
+        except RuntimeError:
+            pass
+            
         return parse_markdown_memory(serialized, default_topic=normalized_metadata["topic"])
 
     def update_index_entry(self, name: str, summary_line: str, *, title: str | None = None) -> list[PersonalMemoryIndexEntry]:
@@ -172,7 +178,10 @@ class PersonalMemoryStore:
             "identity": {"name": None, "emails": [], "timezone": None},
             "preferences": {"response_style": None, "humor_level": None, "email_tone": None},
             "workflow": {"prefers_draft_before_send": None, "common_recipients": [], "email_interactions": 0},
-            "tool_preferences": {"primary_llm": None},
+            "tool_preferences": {"primary_llm": None, "tools": []},
+            "working_style": {"notes": []},
+            "communication_style": {"notes": []},
+            "decision_style": {"notes": []},
         }
 
         identity = self.load_topic("identity")
@@ -233,6 +242,29 @@ class PersonalMemoryStore:
             if normalized and normalized not in recipients:
                 recipients.append(normalized)
         profile["workflow"]["common_recipients"] = recipients
+
+        for topic_key in ("working_style", "communication_style", "decision_style"):
+            doc = self.load_topic(topic_key)
+            notes: list[str] = []
+            for line in doc.lines:
+                content = self._strip_bullet(line).strip()
+                if content:
+                    notes.append(content)
+            profile[topic_key]["notes"] = notes
+
+        tool_prefs = self.load_topic("tool_preferences")
+        tools: list[str] = []
+        for line in tool_prefs.lines:
+            content = self._strip_bullet(line)
+            lowered = content.lower()
+            if lowered.startswith("preferred primary model:"):
+                profile["tool_preferences"]["primary_llm"] = content.split(":", 1)[1].strip() or None
+            elif lowered.startswith("tool:"):
+                value = content.split(":", 1)[1].strip()
+                if value and value not in tools:
+                    tools.append(value)
+        profile["tool_preferences"]["tools"] = tools
+
         return profile
 
     def _ensure_layout(self) -> None:

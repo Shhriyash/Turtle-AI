@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 from typing import Any
@@ -96,12 +96,12 @@ def is_key_failure_error(exc: Exception) -> bool:
         if exc.status_code in {401, 403, 404, 429}:
             return True
         if exc.status_code == 400:
-            # Providers occasionally return request-template / tool-render compatibility
-            # failures as HTTP 400 for a specific model. Treat as fallback-eligible.
+            # Only treat 400 as fallback-eligible when it's a known provider-level
+            # tool-render / template-compatibility failure.  Generic validation
+            # errors (bad args, missing fields) must NOT trigger a model swap —
+            # they should surface as semantic errors to the caller.
             message = str(exc).lower()
-            if any(token in message for token in harmony_tool_render_tokens):
-                return True
-            return True
+            return any(token in message for token in harmony_tool_render_tokens)
         return False
     if isinstance(exc, ModelAPIError):
         messages = _flatten_exception_messages(exc)
@@ -138,7 +138,23 @@ def _fallback_log(exc: Exception) -> None:
     print(f"LOG: Model failed ({exc.__class__.__name__}), trying next fallback")
 
 
+def _is_retryable_upstream_error(exc: Exception) -> bool:
+    """True for transient 5xx / network errors that warrant retrying another model."""
+    if isinstance(exc, ModelHTTPError):
+        return exc.status_code >= 500
+    message = str(exc).lower()
+    return any(token in message for token in ["connection", "timeout", "eof", "reset", "service unavailable"])
+
+
 async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any], *args: Any, **kwargs: Any):
+    """Run the primary agent, falling over to fallbacks on key/rate/tool-render failures.
+
+    Semantic fallback strategy (A5):
+    - is_key_failure_error (401/403/404/429/harmony 400) → model swap
+    - 5xx / transient network → model swap
+    - Other 400 (bad args, validation) → propagate immediately; caller handles
+      semantically (clarify, ask again) rather than burning another model.
+    """
     agents = [primary_agent] + (fallback_agents or [])
     last_exc: Exception | None = None
     for idx, agent in enumerate(agents):
@@ -146,7 +162,8 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
             return await agent.run(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
-            if idx < len(agents) - 1 and is_key_failure_error(exc):
+            should_fallback = is_key_failure_error(exc) or _is_retryable_upstream_error(exc)
+            if idx < len(agents) - 1 and should_fallback:
                 _fallback_log(exc)
                 continue
             raise
@@ -156,6 +173,7 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
 
 
 def run_agent_sync_with_fallbacks(primary_agent: Any, fallback_agents: list[Any], *args: Any, **kwargs: Any):
+    """Sync variant — same fallback strategy as run_agent_with_fallbacks."""
     agents = [primary_agent] + (fallback_agents or [])
     last_exc: Exception | None = None
     for idx, agent in enumerate(agents):
@@ -163,7 +181,8 @@ def run_agent_sync_with_fallbacks(primary_agent: Any, fallback_agents: list[Any]
             return agent.run_sync(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
-            if idx < len(agents) - 1 and is_key_failure_error(exc):
+            should_fallback = is_key_failure_error(exc) or _is_retryable_upstream_error(exc)
+            if idx < len(agents) - 1 and should_fallback:
                 _fallback_log(exc)
                 continue
             raise

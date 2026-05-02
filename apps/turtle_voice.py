@@ -4,9 +4,12 @@ Turtle - Personal Assistant with Web Search and URL Context Capabilities
 Enhanced assistant with real-time web search, URL analysis, and conversation memory.
 """
 
+import atexit
 import asyncio
 import os
+import signal
 import sys
+import threading
 from dataclasses import dataclass, field
 import hashlib
 import re
@@ -66,6 +69,7 @@ from core.memory_replayer import replay
 from core.personal_memory_extract import PersonalMemoryCandidate, extract_memory_candidates_from_messages
 from core.personal_memory_prompt import PersonalMemoryPromptBuilder, PersonalMemoryPromptConfig
 from core.personal_memory_store import PersonalMemoryStore
+from core.periodic_reflector import PeriodicReflector
 from core.task_history import TaskHistoryStore
 from core.paths import (
     MEMORY_EPISODES_FILE,
@@ -84,6 +88,7 @@ from core.system_prompts import load_prompt
 from core.openrouter_tts import synthesize_speech
 from core.stt_fastrtc import FastRTCSTT
 from core.web_search import format_search_results, search_duckduckgo
+from tools.contracts import ToolResult
 
 
 
@@ -118,6 +123,87 @@ class SharedState:
     search_cache: dict[str, str] = field(default_factory=dict)
     turn_counter: int = 0
     retrieval_broker: RetrievalBroker | None = field(default=None)
+    reflector: PeriodicReflector | None = None
+
+
+# ---------------------------------------------------------------------------
+# Robust shutdown wiring (Phase 3)
+# ---------------------------------------------------------------------------
+_ACTIVE_STATES: dict[int, "SharedState"] = {}
+_SHUTDOWN_LOCK = threading.Lock()
+_SHUTDOWN_REQUESTED = False
+
+
+def _register_shutdown_state(state: "SharedState") -> None:
+    _ACTIVE_STATES[id(state)] = state
+
+
+def _unregister_shutdown_state(state: "SharedState") -> None:
+    _ACTIVE_STATES.pop(id(state), None)
+
+
+async def _shutdown_state(state: "SharedState") -> None:
+    session_id = state.session_store.session_id
+    if not session_id:
+        return
+    try:
+        await state.session_store.archive_active(status="pending_finalization")
+    except Exception as exc:
+        print(f"LOG: Shutdown archive failed for {session_id}: {exc}")
+    try:
+        state.journal_store.flush()
+    except Exception as exc:
+        print(f"LOG: Shutdown journal flush failed for {session_id}: {exc}")
+
+
+async def _shutdown_all_states() -> None:
+    for state in list(_ACTIVE_STATES.values()):
+        await _shutdown_state(state)
+
+
+def _run_shutdown_sync() -> None:
+    global _SHUTDOWN_REQUESTED
+    with _SHUTDOWN_LOCK:
+        if _SHUTDOWN_REQUESTED:
+            return
+        _SHUTDOWN_REQUESTED = True
+
+    def _runner() -> None:
+        try:
+            asyncio.run(_shutdown_all_states())
+        except Exception as exc:
+            print(f"LOG: Shutdown handler failed: {exc}")
+
+    if not _ACTIVE_STATES:
+        return
+    thread = threading.Thread(target=_runner, name="turtle_shutdown")
+    thread.start()
+    thread.join()
+
+
+def _call_prev_handler(prev: object, signum: int, frame: object | None) -> None:
+    if callable(prev):
+        try:
+            prev(signum, frame)
+        except Exception:
+            pass
+
+
+_PREV_SIGINT = signal.getsignal(signal.SIGINT)
+_PREV_SIGTERM = signal.getsignal(signal.SIGTERM)
+
+
+def _on_shutdown(signum, frame) -> None:
+    _run_shutdown_sync()
+    if signum == signal.SIGINT:
+        _call_prev_handler(_PREV_SIGINT, signum, frame)
+    elif signum == signal.SIGTERM:
+        _call_prev_handler(_PREV_SIGTERM, signum, frame)
+
+
+signal.signal(signal.SIGINT, _on_shutdown)
+signal.signal(signal.SIGTERM, _on_shutdown)
+atexit.register(_run_shutdown_sync)
 
 
 class TurtleVoiceProcessor:
@@ -331,14 +417,33 @@ def _parse_confirmation_answer(user_text: str) -> bool | None:
     return None
 
 
+def _wants_preview(user_text: str) -> bool:
+    text = " ".join(str(user_text or "").strip().lower().split())
+    if not text:
+        return False
+    triggers = (
+        "show me", "show it", "show the", "show what",
+        "what would you save", "what do you want to save",
+        "what is it", "what's it", "what pattern",
+        "preview", "details", "more info", "more context",
+        "which memory", "the exact",
+    )
+    return any(trigger in text for trigger in triggers)
+
+
 def _maybe_handle_confirmation_turn(state: SharedState, user_text: str) -> str | None:
     prompt = state.confirmation_gate.next_prompt()
     if prompt is None:
         return None
 
+    if _wants_preview(user_text):
+        preview = state.confirmation_gate.preview_pending(prompt.event_id)
+        if preview:
+            return preview
+
     accepted = _parse_confirmation_answer(user_text)
     if accepted is None:
-        return f"Quick check: {prompt.question} Please answer yes or no."
+        return f"Quick check: {prompt.question} Please answer yes or no, or say 'show me' to see what I'd save."
 
     state.confirmation_gate.record_response(prompt.event_id, accepted=accepted)
     if accepted:
@@ -768,56 +873,9 @@ def _sync_personal_memory_from_messages(
         print(f"LOG: Personal memory sync failed for {session_id}: {e}")
 
 
-def _extract_stage_b_json_array(raw_text: str) -> list[dict[str, object]]:
-    text = str(raw_text or "").strip()
-    if not text:
-        return []
-
-    candidates: list[str] = [text]
-
-    fenced = re.search(r"```(?:json)?\s*(\[.*\])\s*```", text, flags=re.DOTALL | re.IGNORECASE)
-    if fenced:
-        candidates.insert(0, fenced.group(1).strip())
-
-    bracketed = re.search(r"\[.*\]", text, flags=re.DOTALL)
-    if bracketed:
-        candidates.append(bracketed.group(0).strip())
-
-    for candidate in candidates:
-        try:
-            payload = json.loads(candidate)
-        except Exception:
-            continue
-        if not isinstance(payload, list):
-            continue
-        normalized: list[dict[str, object]] = []
-        for item in payload:
-            if isinstance(item, dict):
-                normalized.append(item)
-        return normalized
-
-    return []
-
-
-def _stage_b_turns_from_messages(message_history: list[ModelMessage], max_turns: int) -> list[dict[str, str]]:
-    turns: list[dict[str, str]] = []
-    for message in message_history:
-        if isinstance(message, ModelRequest):
-            for part in message.parts:
-                if not isinstance(part, UserPromptPart):
-                    continue
-                text = str(part.content).strip()
-                if not text:
-                    continue
-                turns.append({"role": "user", "text": text})
-        elif isinstance(message, ModelResponse):
-            text = str(message.text or "").strip()
-            if text:
-                turns.append({"role": "assistant", "text": text})
-
-    if max_turns <= 0:
-        return turns
-    return turns[-max_turns:]
+from core.personal_memory_extract import (
+    run_stage_b_session_extractor as _shared_run_stage_b_session_extractor,
+)
 
 
 async def _run_stage_b_session_extractor(
@@ -826,124 +884,13 @@ async def _run_stage_b_session_extractor(
     session_id: str,
     message_history: list[ModelMessage],
 ) -> int:
-    if not PERSONAL_MEMORY_ENABLED or not PERSONAL_MEMORY_STAGE_B_ENABLED:
-        return 0
-    if not session_id or not message_history:
-        return 0
-
-    stage_b_model = get_groq_model(model_name="openai/gpt-oss-120b", settings=model_settings)
-    if stage_b_model is None:
-        print(f"LOG: Stage B skipped for {session_id} (Groq unavailable)")
-        return 0
-
-    turns = _stage_b_turns_from_messages(message_history, PERSONAL_MEMORY_STAGE_B_MAX_TURNS)
-    if not turns:
-        return 0
-
-    profile = state.personal_memory_store.load_profile_snapshot()
-    prompt = (
-        "Extract candidate personal-memory events from this session.\n"
-        "Return ONLY JSON array. No prose.\n"
-        "Each item must include: kind, topic, key, value, confidence, source, evidence.\n"
-        "Rules:\n"
-        "- source must be inferred or synthesized (never explicit).\n"
-        "- confidence in [0,1].\n"
-        "- topic in: identity, preferences, workflow, contacts, projects, corrections.\n"
-        "- key should be stable dotted path.\n"
-        "- value must be an object.\n"
-        "- Max candidates: "
-        f"{PERSONAL_MEMORY_STAGE_B_MAX_CANDIDATES}.\n\n"
-        f"Current profile snapshot:\n{json.dumps(profile, ensure_ascii=False, indent=2)}\n\n"
-        f"Session turns:\n{json.dumps(turns, ensure_ascii=False, indent=2)}"
-    )
-
-    extractor_agent = Agent(
-        stage_b_model,
-        deps_type=SharedState,
-        output_type=str,
-        output_retries=1,
-        instructions="Return only valid JSON array.",
-    )
-
-    try:
-        result = await extractor_agent.run(prompt, deps=state)
-    except Exception as e:
-        print(f"LOG: Stage B skipped for {session_id} (model unavailable: {e})")
-        return 0
-
-    raw_items = _extract_stage_b_json_array(result.output)
-    if not raw_items:
-        return 0
-
-    events = []
-    for index, item in enumerate(raw_items[:PERSONAL_MEMORY_STAGE_B_MAX_CANDIDATES]):
-        kind = str(item.get("kind", "")).strip().lower()
-        topic = str(item.get("topic", "")).strip().lower()
-        key = str(item.get("key", "")).strip()
-        value = item.get("value", {})
-        source = str(item.get("source", "inferred")).strip().lower()
-        evidence = item.get("evidence", {})
-        try:
-            confidence = float(item.get("confidence", 0.0) or 0.0)
-        except Exception:
-            confidence = 0.0
-
-        if kind not in {"fact", "preference", "behavior", "correction", "contradiction"}:
-            continue
-        if topic not in {"identity", "preferences", "workflow", "contacts", "projects", "corrections"}:
-            continue
-        if not key or not isinstance(value, dict):
-            continue
-        if source not in {"inferred", "synthesized"}:
-            source = "inferred"
-        confidence = max(0.0, min(1.0, confidence))
-        if not isinstance(evidence, dict):
-            evidence = {"note": str(evidence)}
-
-        payload_for_id = {
-            "session": session_id,
-            "kind": kind,
-            "topic": topic,
-            "key": key,
-            "value": value,
-            "idx": index,
-        }
-        digest = hashlib.sha1(
-            json.dumps(payload_for_id, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
-
-        events.append(
-            make_event(
-                event_id=f"stageb_{digest[:20]}",
-                kind=kind,
-                topic=topic,
-                key=key,
-                value=value,
-                confidence=confidence,
-                source=source,
-                extractor="llm_turn",
-                session_id=session_id,
-                turn_id=f"{session_id}_stageb_{index}",
-                evidence=evidence,
-                applied=False,
-            )
-        )
-
-    if not events:
-        return 0
-
-    state.journal_store.append_many(events)
-    queued = 0
-    for event in events:
-        if state.confirmation_gate.queue_candidate(event):
-            queued += 1
-
-    state.personal_memory_store.append_daily_log(
-        f"Stage B candidates written: {len(events)} (queued: {queued})",
+    return await _shared_run_stage_b_session_extractor(
+        state,
         session_id=session_id,
+        message_history=message_history,
+        model_settings=model_settings,
     )
-    print(f"LOG: Stage B wrote {len(events)} candidates for {session_id} (queued: {queued})")
-    return len(events)
+
 
 
 async def _run_dream_pass_if_needed(
@@ -1368,20 +1315,47 @@ async def send_email_assistant(ctx: RunContext[SharedState], query: str) -> str:
 async def history_tool(ctx: RunContext[SharedState], query: str) -> str:
     """Search conversation history for past discussions and information"""
     try:
-        task_history = ctx.deps.task_history_store.format_search_results(query, max_results=5)
-        result = await ctx.deps.rag_system.query_history(query)
-        sections: list[str] = []
-        if task_history:
-            sections.append(task_history)
-        if result != "cannot find in history":
-            sections.append(result)
+        broker = ctx.deps.retrieval_broker
+        if broker is None:
+            return ToolResult.empty("Recall is not available.").to_agent_string()
+        recall_text = await broker.recall(
+            query=query,
+            scope="episodic",
+            message_history=ctx.deps.session_store.message_history,
+            trim_fn=_trim_history_for_context,
+        )
+        if not recall_text:
+            return ToolResult.empty("No relevant information found in previous conversations.").to_agent_string()
+        return ToolResult.ok(recall_text).to_agent_string()
 
-        if not sections:
-            return "No relevant information found in task history or previous conversations."
-        return "\n\n".join(sections)
-            
     except Exception:
-        return "Unable to access conversation history at the moment."
+        return ToolResult.upstream_error("History lookup failed.").to_agent_string()
+
+
+@main_assistant.tool
+async def recall(ctx: RunContext[SharedState], query: str, scope: str) -> str:
+    """Recall personal, episodic, task, or working context."""
+    query_text = str(query or "").strip()
+    scope_text = str(scope or "").strip().lower()
+    if not query_text:
+        return ToolResult.invalid("query must not be empty").to_agent_string()
+    if scope_text not in {"personal", "episodic", "tasks", "working"}:
+        return ToolResult.invalid("scope must be personal, episodic, tasks, or working").to_agent_string()
+    broker = ctx.deps.retrieval_broker
+    if broker is None:
+        return ToolResult.empty("Recall is not available.").to_agent_string()
+    try:
+        recall_text = await broker.recall(
+            query=query_text,
+            scope=scope_text,
+            message_history=ctx.deps.session_store.message_history,
+            trim_fn=_trim_history_for_context,
+        )
+    except Exception:
+        return ToolResult.upstream_error("Recall failed.").to_agent_string()
+    if not recall_text:
+        return ToolResult.empty("No relevant information found.").to_agent_string()
+    return ToolResult.ok(recall_text).to_agent_string()
 
 
 async def text_chat(state: SharedState, return_to_voice: bool = True):
@@ -1469,14 +1443,13 @@ async def text_chat(state: SharedState, return_to_voice: bool = True):
                     user_text=user_input,
                     task_type=task_type,
                 )
-                if state.turn_counter >= 8:
-                    try:
-                        await _run_dream_pass_if_needed(
-                            state,
-                            session_id=state.session_store.session_id or "unknown_session",
-                        )
-                    except Exception as _dp_exc:
-                        print(f"LOG: Dream pass (per-turn) failed: {_dp_exc}")
+                if state.reflector is not None:
+                    await state.reflector.on_turn(
+                        state,
+                        session_id=state.session_store.session_id or "",
+                        message_history=message_history or [],
+                        dream_pass_runner=_run_dream_pass_if_needed,
+                    )
 
                 # Show usage information periodically
                 if usage.requests % 5 == 0 and usage.requests > 0:
@@ -1580,14 +1553,13 @@ async def voice_response_handler(audio: Tuple[int, np.ndarray], state: SharedSta
             user_text=transcription,
             task_type=task_type,
         )
-        if state.turn_counter >= 8:
-            try:
-                await _run_dream_pass_if_needed(
-                    state,
-                    session_id=state.session_store.session_id or "unknown_session",
-                )
-            except Exception as _dp_exc:
-                print(f"LOG: Dream pass (per-turn) failed: {_dp_exc}")
+        if state.reflector is not None:
+            await state.reflector.on_turn(
+                state,
+                session_id=state.session_store.session_id or "",
+                message_history=state.session_store.message_history or [],
+                dream_pass_runner=_run_dream_pass_if_needed,
+            )
 
         # Generate and play TTS
         tts_start_time = time.time()
@@ -1653,6 +1625,8 @@ async def voice_chat():
         retrieval_broker = RetrievalBroker(
             store=personal_memory_store,
             task_store=task_history_store,
+            journal_store=journal_store,
+            session_store=session_store,
             rag_system=rag_system,
         )
         state = SharedState(
@@ -1666,7 +1640,9 @@ async def voice_chat():
             task_history_store=task_history_store,
             rag_system=rag_system,
             retrieval_broker=retrieval_broker,
+            reflector=PeriodicReflector(),
         )
+        _register_shutdown_state(state)
         voice_processor = TurtleVoiceProcessor(state)
         if restore_result.had_corrupt_active:
             print("LOG: Corrupt active session files were quarantined before starting a new session")
@@ -1843,6 +1819,7 @@ async def voice_chat():
                         f"LOG: Session {session_id} archived but still pending finalization "
                         f"at {archive_path}"
                     )
+            _unregister_shutdown_state(state)
 
 
 
@@ -1883,6 +1860,8 @@ async def text_mode_chat():
         retrieval_broker = RetrievalBroker(
             store=personal_memory_store,
             task_store=task_history_store,
+            journal_store=journal_store,
+            session_store=session_store,
             rag_system=rag_system,
         )
         state = SharedState(
@@ -1896,7 +1875,9 @@ async def text_mode_chat():
             task_history_store=task_history_store,
             rag_system=rag_system,
             retrieval_broker=retrieval_broker,
+            reflector=PeriodicReflector(),
         )
+        _register_shutdown_state(state)
         if restore_result.had_corrupt_active:
             print("LOG: Corrupt active session files were quarantined before starting a new session")
 
@@ -1968,6 +1949,7 @@ async def text_mode_chat():
                         f"LOG: Session {session_id} archived but still pending finalization "
                         f"at {archive_path}"
                     )
+            _unregister_shutdown_state(state)
 
 
 async def main():

@@ -130,6 +130,19 @@
 .panel-msg-content p { margin-bottom: 8px; }
 .panel-msg-content p:last-child { margin-bottom: 0; }
 
+.panel-msg-content a {
+    color: var(--text-accent);
+    text-decoration: underline;
+    text-decoration-color: rgba(34, 211, 238, 0.4);
+    text-underline-offset: 3px;
+    transition: all 0.2s var(--ease-out);
+}
+
+.panel-msg-content a:hover {
+    color: #fff;
+    text-decoration-color: var(--accent);
+}
+
 .panel-msg-content code {
     background: rgba(0,0,0,0.3);
     padding: 2px 6px;

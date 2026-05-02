@@ -14,6 +14,8 @@ from rag.embedder.embedding_model import get_embedding_model
 from rag.chunking.json_chunking import get_chunker
 from rag.storage.vector_storage import get_vector_storage
 from core.paths import RAG_DATA_DIR, ensure_dirs
+from core.episodic_summarizer import summarize_window
+from core.config import settings
 
 from core.env import load_env
 from pydantic_ai.messages import (
@@ -175,7 +177,7 @@ class TurtleRAGSystem:
                 )
         return chunks
 
-    def _index_turn_records(
+    async def _index_turn_records(
         self,
         *,
         session_id: str,
@@ -186,30 +188,27 @@ class TurtleRAGSystem:
             return True
 
         creation_timestamp = creation_time or datetime.now().isoformat()
-        try:
-            chunk_turn_records = getattr(self.chunker, "chunk_turn_records", None)
-            if not callable(chunk_turn_records):
-                raise AttributeError("chunk_turn_records is not implemented on active chunker")
-            chunks = chunk_turn_records(
-                session_id=session_id,
-                turn_records=turn_records,
-                creation_time=creation_timestamp,
-            )
-        except Exception as e:
-            print(f"LOG: Turn-record chunking unavailable, using fallback chunker for {session_id}: {e}")
-            chunks = self._fallback_chunk_turn_records(
-                session_id=session_id,
-                turn_records=turn_records,
-                creation_time=creation_timestamp,
-            )
+        summary = await summarize_window(turn_records, model=settings.episodic_summary_model)
+        summary_text = summary.summary.strip()
+        if not summary_text:
+            return True
 
-        if not chunks:
-            return False
+        chunk = {
+            "chunk_id": f"{session_id}_episode_{summary.timestamp}",
+            "session_id": session_id,
+            "creation_time": creation_timestamp,
+            "chunk_index": 0,
+            "content": summary_text,
+            "char_count": len(summary_text),
+            "estimated_tokens": max(1, len(summary_text) // 4),
+            "topics": summary.topics,
+            "turn_id_range": summary.turn_id_range,
+            "timestamp": summary.timestamp,
+        }
 
-        chunk_contents = [chunk["content"] for chunk in chunks]
-        embeddings = self.embedder.embed_for_storage(chunk_contents)
+        embeddings = self.embedder.embed_for_storage([summary_text])
         with self._vector_lock:
-            self.vector_store.add_chunks(chunks, embeddings)
+            self.vector_store.add_chunks([chunk], embeddings)
         return True
 
     @staticmethod
@@ -350,7 +349,7 @@ class TurtleRAGSystem:
                 except Exception:
                     creation_time = None
 
-            indexed = self._index_turn_records(
+            indexed = await self._index_turn_records(
                 session_id=session_id,
                 turn_records=turn_records,
                 creation_time=creation_time,
@@ -361,6 +360,44 @@ class TurtleRAGSystem:
             return True
         except Exception as e:
             print(f"LOG: Failed to finalize archived session {session_id}: {e}")
+            return False
+
+    async def add_episodic_summary(
+        self,
+        *,
+        session_id: str,
+        turn_records: list[dict[str, Any]],
+        creation_time: str | None = None,
+    ) -> bool:
+        if not session_id or not turn_records:
+            return False
+
+        creation_timestamp = creation_time or datetime.now().isoformat()
+        try:
+            summary = await summarize_window(turn_records, model=settings.episodic_summary_model)
+            summary_text = summary.summary.strip()
+            if not summary_text:
+                return True
+
+            chunk = {
+                "chunk_id": f"{session_id}_episode_{summary.timestamp}",
+                "session_id": session_id,
+                "creation_time": creation_timestamp,
+                "chunk_index": 0,
+                "content": summary_text,
+                "char_count": len(summary_text),
+                "estimated_tokens": max(1, len(summary_text) // 4),
+                "topics": summary.topics,
+                "turn_id_range": summary.turn_id_range,
+                "timestamp": summary.timestamp,
+            }
+
+            embeddings = self.embedder.embed_for_storage([summary_text])
+            with self._vector_lock:
+                self.vector_store.add_chunks([chunk], embeddings)
+            return True
+        except Exception as e:
+            print(f"LOG: Episodic summary add failed for {session_id}: {e}")
             return False
     
     async def start_session(self, session_id: str | None = None) -> str:
