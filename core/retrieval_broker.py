@@ -7,6 +7,7 @@ only through the recall tool.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
@@ -98,6 +99,89 @@ def _has_history_trigger(query: str) -> bool:
     """Return True if *query* contains any history/time trigger phrase."""
     lowered = query.lower()
     return any(trigger in lowered for trigger in _HISTORY_TRIGGERS)
+
+
+# Filler the model prepends ("do you remember", "tell me", "what is"...) — these
+# never appear in stored memory lines, so they kill the substring match.
+_RECALL_QUERY_FILLER_RE = re.compile(
+    r"^(?:do\s+you\s+remember|do\s+you\s+know|can\s+you\s+tell\s+me|tell\s+me|"
+    r"what\s+is|what's|whats|who\s+is|who's|whos|recall|remember)\s+",
+    re.IGNORECASE,
+)
+
+# Possessives the model adds because the system prompt taught it to phrase
+# queries from the assistant's perspective ("user's <noun>", "my <noun>",
+# "your <noun>"). Stored memory lines never contain these tokens.
+_RECALL_QUERY_POSSESSIVE_RE = re.compile(
+    r"\b(?:the\s+user'?s?|user'?s?|my|your|their|his|her)\s+",
+    re.IGNORECASE,
+)
+
+
+def _normalize_recall_query(query: str) -> str:
+    """Lowercase + strip natural-language filler + strip possessives.
+
+    The personal-memory lexical search compares the query as a substring of
+    each topic line. If the model emits "user's best friend" but the line is
+    "- Best Friend: Aarav", the substring fails. Normalization brings the
+    query into the same shape the store uses ("best friend") so the match has
+    a chance of hitting.
+    """
+    text = " ".join(str(query or "").split()).strip().lower()
+    if not text:
+        return ""
+    # Strip leading filler — may chain ("do you know if my..." → "if my..." → "if...").
+    for _ in range(3):
+        replaced = _RECALL_QUERY_FILLER_RE.sub("", text)
+        if replaced == text:
+            break
+        text = replaced
+    text = _RECALL_QUERY_POSSESSIVE_RE.sub("", text)
+    text = " ".join(text.split())
+    text = text.rstrip("?.!,; ")
+    return text
+
+
+# Maps query keywords → topic file(s) we should dump in full when lexical
+# search misses. Order within each tuple is preserved so the highest-signal
+# keywords match first.
+_TOPIC_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("relations", (
+        "best friend", "boyfriend", "girlfriend",
+        "wife", "husband", "spouse", "partner",
+        "brother", "sister", "sibling", "cousin",
+        "mom", "mother", "dad", "father", "parent",
+        "family", "relative", "friend",
+    )),
+    ("identity", (
+        "name", "email", "timezone", "time zone",
+        "language", "city", "country",
+        "occupation", "job", "role", "profession",
+        "company", "employer", "work",
+    )),
+    ("workflow", (
+        "morning routine", "daily briefing",
+        "routine", "schedule", "habit",
+        "every morning", "every day", "every week",
+        "daily", "weekly", "briefing",
+    )),
+    ("contacts", ("recipient", "mail to", "send to", "contact")),
+    ("projects", ("project", "repo", "repository", "codebase", "working on")),
+    ("preferences", ("prefer", "tone", "style", "humor", "concise", "detailed")),
+)
+
+
+def _topics_for_keywords(query: str) -> list[str]:
+    """Return candidate topic names whose keyword family appears in *query*."""
+    if not query:
+        return []
+    topics: list[str] = []
+    for topic_name, keywords in _TOPIC_KEYWORDS:
+        if topic_name in topics:
+            continue
+        if any(kw in query for kw in keywords):
+            topics.append(topic_name)
+    return topics
 
 
 # ---------------------------------------------------------------------------
@@ -235,11 +319,19 @@ class RetrievalBroker:
         return "\n".join(lines).strip()
 
     async def _build_personal_tier(self, query: str) -> str:
-        """Search personal memory topics + journal for relevant matches."""
-        query_text = str(query or "").strip()
-        if not query_text:
+        """Search personal memory topics + journal for relevant matches.
+
+        The model frequently phrases queries as "user's X" or "my X" — neither
+        token appears in stored memory. We normalize the query first so the
+        substring match has a chance of hitting. If lexical match still finds
+        nothing, we fall back to dumping the full body of any topic file the
+        query keyword-routes to, letting the model do the matching itself.
+        """
+        if not str(query or "").strip():
             return ""
-        lowered = query_text.lower()
+        lowered = _normalize_recall_query(query)
+        if not lowered:
+            return ""
 
         sections: list[str] = []
         topic_hits: list[str] = []
@@ -265,6 +357,28 @@ class RetrievalBroker:
 
         if topic_hits:
             sections.append("\n\n".join(topic_hits))
+        else:
+            # Lexical miss — dump full topic bodies the query keyword-routes to.
+            fallback_topics = _topics_for_keywords(lowered)
+            fallback_hits: list[str] = []
+            for topic_name in fallback_topics:
+                try:
+                    doc = self.store.load_topic(topic_name)
+                except Exception:
+                    continue
+                body_lines = [
+                    str(line).strip()
+                    for line in (doc.lines or [])
+                    if str(line).strip()
+                ]
+                if not body_lines:
+                    continue
+                title = doc.metadata.get("title") or topic_name.replace("_", " ").title()
+                fallback_hits.append("\n".join([f"[{title}]", *body_lines]))
+                if len(fallback_hits) >= 2:
+                    break
+            if fallback_hits:
+                sections.append("\n\n".join(fallback_hits))
 
         if self.journal_store is not None:
             journal_hits: list[str] = []
@@ -273,8 +387,8 @@ class RetrievalBroker:
             except Exception:
                 events = []
             for event in reversed(events[-200:]):
-                text = json.dumps(event.to_payload(), ensure_ascii=False)
-                if lowered not in text.lower():
+                text = json.dumps(event.to_payload(), ensure_ascii=False).lower()
+                if lowered not in text:
                     continue
                 value_text = json.dumps(event.value, ensure_ascii=False)
                 journal_hits.append(

@@ -39,19 +39,42 @@ def verify_token(token: str) -> dict:
 
 async def authenticate_websocket(websocket: WebSocket) -> str:
     """
-    Extracts token from query parameters ?token=... or headers.
-    Returns user_id. Closes connection if invalid.
+    Resolve the WebSocket caller's user_id.
+
+    Resolution order:
+      1. ``turtle_uid`` cookie minted by the magic-link onboarding flow
+         (apps/onboarding_routes.py).
+      2. ``?token=...`` query param (legacy native-client path).
+      3. ``Authorization: Bearer ...`` header.
+      4. Dev-only fallback to a shared local_dev_user when TURTLE_DEV_ANON=1.
+
+    Closes the connection with 1008 if none resolve.
     """
+    # 1. Cookie set by /onboarding/claim.
+    cookie_token = websocket.cookies.get("turtle_uid")
+    if cookie_token:
+        from apps.onboarding_routes import verify_session_cookie
+
+        user_id = verify_session_cookie(cookie_token)
+        if user_id:
+            return user_id
+
+    # 2/3. Query-param or Authorization header (legacy).
     token = websocket.query_params.get("token")
     if not token and "Authorization" in websocket.headers:
         auth_header = websocket.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header.split(" ")[1]
 
-    # In local mode, if no token is provided, fallback to a default local user to ease dev
-    if not token and not settings.is_cloud:
+    # 4. Dev-only escape hatch.
+    if not token and settings.dev_anon and not settings.is_cloud:
         from core.identity import identity_manager
         await identity_manager.init_db()
+        print(
+            "WARN: auth falling back to local_dev_user (TURTLE_DEV_ANON=1). "
+            "No identity.md is seeded for this user — Turtle will ask for the name. "
+            "Go through /onboarding/start to use a real identity."
+        )
         return await identity_manager.resolve_user("web", "local_dev_user")
 
     if not token:

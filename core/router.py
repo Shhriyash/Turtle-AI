@@ -108,10 +108,14 @@ def _parse_router_response(text: str) -> RouterDecision:
         return RouterDecision(intent="clarify", complexity="low", reason="router parse failed")
 
 
+_DEFAULT_ROUTER_MODEL = "llama-3.1-8b-instant"
+
+
 async def route_turn(
     user_text: str,
     *,
     timeout_ms: int = 4000,
+    model_name: str | None = None,
 ) -> RouterDecision:
     """
     Route a user turn using a small, fast Groq model.
@@ -136,10 +140,15 @@ async def route_turn(
     try:
         client = AsyncGroq(api_key=api_key)
         system_prompt = _load_router_prompt()
+        # Accept "groq:model" form for consistency with the dev UI;
+        # strip the prefix since AsyncGroq only speaks to Groq.
+        resolved = (model_name or _DEFAULT_ROUTER_MODEL).strip()
+        if resolved.startswith("groq:"):
+            resolved = resolved[len("groq:"):]
 
         async def _call() -> RouterDecision:
             response = await client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model=resolved,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_text},

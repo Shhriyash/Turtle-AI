@@ -52,11 +52,21 @@ load_env(override=True)
 # Core imports — identical to turtle_voice.py
 from groq import Groq
 from pydantic_ai import Agent, RunContext, ModelMessagesTypeAdapter
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, UserPromptPart
+from dataclasses import replace as _dc_replace
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.usage import UsageLimits, RunUsage
 
 from core.llm_client import (
     get_groq_model,
+    get_google_models,
     get_openrouter_models,
     get_groq_fallback_model,
     run_agent_with_fallbacks,
@@ -74,9 +84,14 @@ from core.email_flow import (
 )
 from core.output_clean import clean_text_for_model, clean_text_for_tts
 from core.graph import select_graph as _select_graph
-from core.graph_store import GraphStore
 from core.memory_store import MemoryStore
 from core.confirmation_gate import ConfirmationGate
+from core.guardrails import (
+    StorageCapExceededError,
+    WebSocketRateLimitExceeded,
+    ws_rate_limiter,
+)
+from core.telemetry import emit as emit_event, emit_once as emit_event_once
 from core.dream_pass import DreamPass
 from core.memory_journal import JournalStore, make_event
 from core.memory_extractor import extract_memory_event_specs
@@ -84,6 +99,7 @@ from core.memory_replayer import replay
 from core.personal_memory_extract import (
     PersonalMemoryCandidate,
     extract_memory_candidates_from_messages,
+    extract_memory_candidates_from_messages_async,
     run_stage_b_session_extractor,
 )
 from core.periodic_reflector import PeriodicReflector
@@ -91,11 +107,6 @@ from core.personal_memory_prompt import PersonalMemoryPromptBuilder, PersonalMem
 from core.personal_memory_store import PersonalMemoryStore
 from core.task_history import TaskHistoryStore
 from core.paths import (
-    MEMORY_EPISODES_FILE,
-    MEMORY_EVENTS_FILE,
-    MEMORY_GRAPH_FILE,
-    MEMORY_PROFILE_FILE,
-    MEMORY_STATE_FILE,
     TASK_HISTORY_FILE,
     TEMP_AUDIO_DIR,
     ensure_dirs,
@@ -149,15 +160,17 @@ def _load_config() -> dict[str, Any]:
         "max_tokens": 1024,
         "TURTLE_HISTORY_MAX_TURNS": 12,
         "ACTIVE_HISTORY_MAX_MESSAGES": 40,
-        "TURTLE_HISTORY_MAX_TOKENS": 12000,
-        "TURTLE_MEMORY_FLUSH_TURNS": 20,
-        "TURTLE_MEMORY_FLUSH_TOKENS": 20000,
+        "TURTLE_HISTORY_MAX_TOKENS": 4000,
+        "TURTLE_MEMORY_FLUSH_TURNS": 8,
+        "TURTLE_MEMORY_FLUSH_TOKENS": 6000,
         "TURTLE_MEMORY_PROFILE_MAX_LINES": 6,
         "TTS_DEBUG": False,
         "STT_MODEL": "whisper-large-v3-turbo",
-        "MAIN_AGENT_MODEL": "openrouter:openai/gpt-oss-120b",
+        "MAIN_AGENT_MODEL": "groq:openai/gpt-oss-120b",
         "EMAIL_AGENT_MODEL": "groq:llama-3.3-70b-versatile",
         "DREAM_PASS_AGENT_MODEL": "",
+        "PERSONAL_MEMORY_DREAM_PASS_ENABLED": settings.personal_memory_dream_pass_enabled,
+        "ROUTER_AGENT_MODEL": "groq:llama-3.1-8b-instant",
         "SERVER_HOST": SERVER_HOST,
         "SERVER_PORT": SERVER_PORT,
     }
@@ -182,16 +195,22 @@ config = _load_config()
 # ---------------------------------------------------------------------------
 # Shared constants (mirrored from turtle_voice.py)
 # ---------------------------------------------------------------------------
-EMAIL_PROMPT = load_prompt("email_agent")
+EMAIL_PROMPT = load_prompt("email_agent").replace("{bot_email}", settings.bot_email)
 _MAIN_ASSISTANT_PROMPT_TEMPLATE = load_prompt("main_assistant")
 
 
-def _build_main_assistant_prompt(*, timezone: str = "UTC", channel: str = "web") -> str:
+def _build_main_assistant_prompt(
+    *,
+    timezone: str = "UTC",
+    channel: str = "web",
+    user_greeting_block: str = "",
+) -> str:
     """Inject runtime context into the main assistant system prompt (C2).
 
-    The {runtime_context} placeholder in main_assistant.txt is replaced with
-    live values so prompt caching still works on the static parts of the block.
-    Dynamic content is isolated to this small substitution.
+    The {runtime_context} and {user_greeting_block} placeholders in
+    main_assistant.txt are replaced with live values so prompt caching still
+    works on the static parts of the block. Dynamic content is isolated to
+    these small substitutions.
     """
     import datetime
     now_utc = datetime.datetime.now(datetime.UTC).strftime("%A, %d %B %Y, %H:%M UTC")
@@ -201,7 +220,44 @@ def _build_main_assistant_prompt(*, timezone: str = "UTC", channel: str = "web")
         f"Active channel: {channel}",
     ]
     runtime_context = "\n".join(runtime_lines)
-    return _MAIN_ASSISTANT_PROMPT_TEMPLATE.replace("{runtime_context}", runtime_context)
+    return (
+        _MAIN_ASSISTANT_PROMPT_TEMPLATE
+        .replace("{runtime_context}", runtime_context)
+        .replace("{user_greeting_block}", user_greeting_block)
+    )
+
+
+def _extract_user_name(identity_doc) -> str | None:
+    """Pull the user's first name from an identity.md MarkdownMemoryDocument."""
+    try:
+        for raw in identity_doc.lines:
+            line = str(raw).strip().lstrip("-").strip()
+            if line.lower().startswith("name:"):
+                return line.split(":", 1)[1].strip() or None
+    except Exception:
+        return None
+    return None
+
+
+def _build_user_greeting_block(user_id: str) -> str:
+    """Render the per-user greeting block injected into <runtime_context>."""
+    if not user_id:
+        return (
+            "You don't yet know this user's name. If they haven't introduced "
+            "themselves and the moment is right, ask once — naturally."
+        )
+    try:
+        store = PersonalMemoryStore(user_id=user_id)
+        identity = store.load_topic("identity")
+        name = _extract_user_name(identity)
+    except Exception:
+        name = None
+    if name:
+        return f"You are speaking with {name}."
+    return (
+        "You don't yet know this user's name. If they haven't introduced "
+        "themselves and the moment is right, ask once — naturally."
+    )
 
 
 # Static fallback used by AgentManager.rebuild (agents are built at startup);
@@ -215,12 +271,21 @@ OUTPUT_RETRIES = 1
 SESSION_RESTORE_MODE = os.getenv("SESSION_RESTORE_MODE", "strict_new")
 ACTIVE_HISTORY_MAX_TURNS = int(config.get("TURTLE_HISTORY_MAX_TURNS", 12))
 ACTIVE_HISTORY_MAX_MESSAGES = int(config.get("ACTIVE_HISTORY_MAX_MESSAGES", 40))
-ACTIVE_HISTORY_MAX_TOKENS = int(config.get("TURTLE_HISTORY_MAX_TOKENS", 12000))
-MEMORY_FLUSH_TURNS = int(config.get("TURTLE_MEMORY_FLUSH_TURNS", 20))
-MEMORY_FLUSH_TOKENS = int(config.get("TURTLE_MEMORY_FLUSH_TOKENS", 20000))
+ACTIVE_HISTORY_MAX_TOKENS = int(config.get("TURTLE_HISTORY_MAX_TOKENS", 4000))
+MEMORY_FLUSH_TURNS = int(config.get("TURTLE_MEMORY_FLUSH_TURNS", 8))
+MEMORY_FLUSH_TOKENS = int(config.get("TURTLE_MEMORY_FLUSH_TOKENS", 6000))
 MEMORY_PROFILE_MAX_LINES = int(config.get("TURTLE_MEMORY_PROFILE_MAX_LINES", 6))
 PERSONAL_MEMORY_ENABLED = settings.personal_memory_enabled
-PERSONAL_MEMORY_DREAM_PASS_ENABLED = settings.personal_memory_dream_pass_enabled
+
+
+def _dream_pass_enabled() -> bool:
+    """Read the dream-pass flag dynamically so the dev panel can hot-toggle it."""
+    raw = config.get("PERSONAL_MEMORY_DREAM_PASS_ENABLED")
+    if raw is None:
+        return bool(settings.personal_memory_dream_pass_enabled)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 PERSONAL_MEMORY_MAX_BYTES = settings.personal_memory_max_bytes
 PERSONAL_MEMORY_MAX_TOPIC_FILES = settings.personal_memory_max_topic_files
 TOOL_OUTPUT_MAX_CHARS = settings.tool_output_max_chars
@@ -236,7 +301,7 @@ groq_client = Groq(api_key=_groq_key)
 class SharedState:
     http_client: httpx.AsyncClient
     session_store: SessionStore
-    memory_store: MemoryStore
+    memory_store: MemoryStore | None
     personal_memory_store: PersonalMemoryStore
     personal_memory_prompt: PersonalMemoryPromptBuilder
     journal_store: JournalStore
@@ -370,6 +435,26 @@ def _trim_history_for_context(history: list[ModelMessage]) -> list[ModelMessage]
     while trimmed and isinstance(trimmed[0], ModelResponse):
         trimmed = trimmed[1:]
 
+    # Pair-aware front trim: a leading ModelRequest whose only parts are
+    # ToolReturnPart / tool-tied RetryPromptPart is necessarily an orphan —
+    # the originating ToolCallPart precedes it in conversation order, and
+    # anything before the front of `trimmed` has already been discarded. Drop
+    # it. Gemini direct rejects such histories with INVALID_ARGUMENT, and
+    # even on lenient providers it confuses the model.
+    def _is_leading_orphan(msg: ModelMessage) -> bool:
+        if not isinstance(msg, ModelRequest):
+            return False
+        if not msg.parts:
+            return True
+        return all(
+            isinstance(p, ToolReturnPart)
+            or (isinstance(p, RetryPromptPart) and getattr(p, "tool_call_id", None))
+            for p in msg.parts
+        )
+
+    while len(trimmed) > 1 and _is_leading_orphan(trimmed[0]):
+        trimmed = trimmed[1:]
+
     # Guardrail: ensure at least one real user prompt remains in context.
     # Without this, long tool-call loops can leave only tool request/return turns,
     # causing the model to respond as if no user question was asked.
@@ -394,6 +479,73 @@ def _trim_history_for_context(history: list[ModelMessage]) -> list[ModelMessage]
                 return candidate
 
     return trimmed or history[-ACTIVE_HISTORY_MAX_MESSAGES:]
+
+
+def _sanitize_tool_pairs(history: list[ModelMessage]) -> list[ModelMessage]:
+    """Drop orphan tool-call / tool-return parts so Gemini accepts the history.
+
+    Gemini direct enforces that every function-call turn is followed by a
+    matching function-response turn (and rejects with HTTP 400 INVALID_ARGUMENT
+    otherwise). Groq / OpenRouter tolerate gaps. Trimming the context window
+    can leave orphans at either boundary — e.g. the front-trim lands on a
+    ModelRequest containing a ToolReturnPart whose originating ToolCallPart
+    was dropped, or keeps a ModelResponse containing a ToolCallPart whose
+    return has been discarded.
+
+    Strategy: compute the set of tool_call_ids that appear as BOTH a call and
+    a return anywhere in the surviving history. Keep only those; drop the
+    rest. Untagged parts (UserPromptPart, TextPart, SystemPromptPart, plain
+    RetryPromptPart without a tool_call_id) pass through untouched. Messages
+    left with zero parts are dropped entirely.
+
+    This is provider-agnostic: Groq/OpenRouter are unaffected (they already
+    accepted the pairs); Gemini stops 400ing.
+    """
+    call_ids: set[str] = set()
+    return_ids: set[str] = set()
+    for msg in history:
+        if isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if isinstance(part, ToolCallPart) and part.tool_call_id:
+                    call_ids.add(part.tool_call_id)
+        elif isinstance(msg, ModelRequest):
+            for part in msg.parts:
+                tcid = getattr(part, "tool_call_id", None)
+                if tcid and isinstance(part, (ToolReturnPart, RetryPromptPart)):
+                    return_ids.add(tcid)
+    paired = call_ids & return_ids
+
+    def _keep_part(part: Any) -> bool:
+        if isinstance(part, ToolCallPart):
+            return bool(part.tool_call_id) and part.tool_call_id in paired
+        if isinstance(part, ToolReturnPart):
+            return bool(part.tool_call_id) and part.tool_call_id in paired
+        if isinstance(part, RetryPromptPart):
+            tcid = getattr(part, "tool_call_id", None)
+            # Plain retries (no tool_call_id) are model-level retry signals,
+            # not tied to a specific call — keep them.
+            return tcid is None or tcid in paired
+        return True
+
+    cleaned: list[ModelMessage] = []
+    for msg in history:
+        kept_parts = [p for p in msg.parts if _keep_part(p)]
+        if not kept_parts:
+            continue
+        if len(kept_parts) == len(msg.parts):
+            cleaned.append(msg)
+        else:
+            cleaned.append(_dc_replace(msg, parts=kept_parts))
+
+    # Fail-open: pydantic-ai raises UserError("Processed history cannot be
+    # empty") if we hand it []. That can happen when trim lands deep in a
+    # tool chain whose surviving window is exclusively orphan call/return
+    # turns. Returning the input unchanged lets the model attempt the request
+    # — Gemini may 400 on adjacency, but `is_key_failure_error` now treats
+    # that as fallback-eligible, so the cascade recovers instead of crashing.
+    if not cleaned:
+        return history
+    return cleaned
 
 
 def _detect_task_type(user_text: str) -> str:
@@ -462,7 +614,9 @@ async def _resolve_memory_context(state: SharedState, *, task_type: str, user_te
         except Exception:
             pass
 
-    # Tier 3: Raw MemoryStore lines
+    # Tier 3: Raw MemoryStore lines (legacy; only populated for non-web entrypoints)
+    if state.memory_store is None:
+        return ""
     fallback_lines = state.memory_store.get_context_lines(task_type=task_type, query=user_text)
     return "\n".join(fallback_lines).strip()
 
@@ -539,17 +693,30 @@ def _maybe_handle_confirmation_turn(state: SharedState, user_text: str) -> str |
         return None
 
     if _wants_preview(user_text):
-        preview = state.confirmation_gate.preview_pending(prompt.event_id)
+        preview = state.confirmation_gate.preview_pending(list(prompt.all_event_ids))
         if preview:
             return preview
 
     accepted = _parse_confirmation_answer(user_text)
     if accepted is None:
-        return f"Quick check: {prompt.question} Please answer yes or no, or say 'show me' to see what I'd save."
+        # C2+C3: don't hard-intercept; the turn proceeds normally and the
+        # caller is expected to surface the prompt as a sidecar message so
+        # the user can answer it next turn while the current question is
+        # answered now.
+        return None
 
-    state.confirmation_gate.record_response(prompt.event_id, accepted=accepted)
+    for event_id in prompt.all_event_ids:
+        state.confirmation_gate.record_response(event_id, accepted=accepted)
     if accepted:
+        if state.user_id:
+            emit_event_once(state.user_id, "memory_first_confirmed", topic=prompt.topic)
+        if prompt.topic == "workflow":
+            _register_user_routines_safe(state)
+        if len(prompt.all_event_ids) > 1:
+            return "Got it. I will remember those."
         return "Got it. I will remember that."
+    if len(prompt.all_event_ids) > 1:
+        return "Understood. I will not store those."
     return "Understood. I will not store that preference."
 
 
@@ -559,10 +726,40 @@ def _queue_confirmation_candidates_from_turn(
     session_id: str,
     user_text: str,
 ) -> int:
-    """Queue non-explicit memory candidates for yes/no confirmation in web mode."""
+    """Phase 2 / B1+B2: schedule async multi-turn extraction in the background.
+
+    Returns immediately. The actual extraction + journaling + queueing runs
+    as an asyncio task so the user-facing turn doesn't block on the (often
+    cheap regex but sometimes LLM) extraction path. Multi-turn flows like
+    "save as routine" -> "every day" -> "8 am" need a window of recent
+    turns, not the single current utterance.
+    """
     if not PERSONAL_MEMORY_ENABLED:
         return 0
 
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Not in async context (test/voice path) — fall back to sync single-turn.
+        return _queue_confirmation_candidates_sync(
+            state, session_id=session_id, user_text=user_text
+        )
+
+    loop.create_task(
+        _queue_confirmation_candidates_async(
+            state, session_id=session_id, user_text=user_text
+        )
+    )
+    return 0
+
+
+def _queue_confirmation_candidates_sync(
+    state: SharedState,
+    *,
+    session_id: str,
+    user_text: str,
+) -> int:
+    """Sync single-utterance fallback for environments without a running loop."""
     try:
         profile = state.personal_memory_store.load_profile_snapshot()
         fake_msg = ModelRequest(parts=[UserPromptPart(content=user_text)])
@@ -571,39 +768,77 @@ def _queue_confirmation_candidates_from_turn(
             session_id=session_id,
             profile=profile,
         )
-        if not candidates:
-            return 0
-
-        pending_events = []
-        for idx, candidate in enumerate(candidates):
-            event = _candidate_to_journal_event(
-                candidate=candidate,
-                session_id=session_id,
-                ordinal=idx,
-            )
-            if event is None:
-                continue
-            if event.applied:
-                continue
-            if event.source == "explicit":
-                continue
-            pending_events.append(event)
-
-        if not pending_events:
-            return 0
-
-        state.journal_store.append_many(pending_events)
-        queued = 0
-        for event in pending_events:
-            if state.confirmation_gate.queue_candidate(event):
-                queued += 1
-
-        if queued:
-            print(f"LOG: Queued {queued} confirmation candidate(s) for {session_id}")
-        return queued
+        return _journal_and_queue_candidates(state, candidates, session_id=session_id)
     except Exception as e:
-        print(f"LOG: Confirmation candidate queue failed for {session_id}: {e}")
+        print(f"LOG: Confirmation candidate queue (sync) failed for {session_id}: {e}")
         return 0
+
+
+async def _queue_confirmation_candidates_async(
+    state: SharedState,
+    *,
+    session_id: str,
+    user_text: str,
+) -> int:
+    """B1+B2: windowed multi-turn extraction with LLM fallback. Background task."""
+    try:
+        profile = state.personal_memory_store.load_profile_snapshot()
+        window = max(1, int(settings.memory_extract_window_turns))
+        history_tail = list(state.session_store.message_history or [])[-window:]
+
+        # Append the just-received user_text so it's always included even if
+        # the session_store hasn't been flushed for this turn yet.
+        history_with_current = history_tail + [
+            ModelRequest(parts=[UserPromptPart(content=user_text)])
+        ]
+
+        candidates = await extract_memory_candidates_from_messages_async(
+            message_history=history_with_current,
+            session_id=session_id,
+            profile=profile,
+        )
+        return _journal_and_queue_candidates(state, candidates, session_id=session_id)
+    except Exception as e:
+        print(f"LOG: Confirmation candidate queue (async) failed for {session_id}: {e}")
+        return 0
+
+
+def _journal_and_queue_candidates(
+    state: SharedState,
+    candidates: list[PersonalMemoryCandidate],
+    *,
+    session_id: str,
+) -> int:
+    if not candidates:
+        return 0
+
+    pending_events = []
+    for idx, candidate in enumerate(candidates):
+        event = _candidate_to_journal_event(
+            candidate=candidate,
+            session_id=session_id,
+            ordinal=idx,
+        )
+        if event is None:
+            continue
+        if event.applied:
+            continue
+        if event.source == "explicit":
+            continue
+        pending_events.append(event)
+
+    if not pending_events:
+        return 0
+
+    state.journal_store.append_many(pending_events)
+    queued = 0
+    for event in pending_events:
+        if state.confirmation_gate.queue_candidate(event):
+            queued += 1
+
+    if queued:
+        print(f"LOG: Queued {queued} confirmation candidate(s) for {session_id}")
+    return queued
 
 
 async def _run_dream_pass_if_needed(
@@ -612,7 +847,7 @@ async def _run_dream_pass_if_needed(
     session_id: str,
 ) -> None:
     """Run Stage C dream pass for pending memory candidates when trigger conditions are met."""
-    if not PERSONAL_MEMORY_ENABLED or not PERSONAL_MEMORY_DREAM_PASS_ENABLED:
+    if not PERSONAL_MEMORY_ENABLED or not _dream_pass_enabled():
         return
     if not session_id:
         return
@@ -771,6 +1006,23 @@ def _candidate_to_journal_event(
     elif topic == "workflow" and key == "primary_llm":
         event_key = "workflow.primary_llm"
         event_value = {"primary_llm": value_text}
+    elif topic == "workflow" and key in {"morning_routine", "daily_briefing"} or (
+        topic == "workflow" and key.startswith("recurring_request")
+    ):
+        # D1 fix: routine candidates carry a structured dict in value_struct.
+        struct = getattr(candidate, "value_struct", None) or {}
+        if not isinstance(struct, dict) or "cadence" not in struct:
+            return None
+        if key.startswith("recurring_request"):
+            slug = key.split(".", 1)[1] if "." in key else "routine"
+            event_key = f"workflow.recurring_request.{slug}"
+        else:
+            event_key = f"workflow.{key}"
+        event_value = dict(struct)
+    elif topic == "relations":
+        slug = key.strip().replace(" ", "_") or "person"
+        event_key = f"relations.{slug}"
+        event_value = {"role": slug, "name": value_text}
     elif topic == "contacts" and key.startswith("frequent_recipient:"):
         email = key.split(":", 1)[1].strip().lower() or value_lower
         if not email:
@@ -927,6 +1179,60 @@ async def _sync_personal_memory_from_archive(
         print(f"LOG: Dream pass failed for {session_id}: {e}")
 
 
+def _auto_promote_pending_workflow_on_confirm(
+    state: "SharedState",
+    *,
+    user_text: str,
+) -> int:
+    """B3: promote workflow.* pending candidates when user_text reads as confirm.
+
+    If the gate's next prompt belongs to topic='workflow' and the current turn's
+    user_text parses as a yes, accept the whole batch so the gate writes the
+    superseding `source=explicit, applied=True` event and the replayer picks
+    it up on the next memory load. Returns count of events promoted.
+
+    Note: when `_maybe_handle_confirmation_turn` already intercepts a pure
+    yes/no, this function never runs (intercepted before the agent reply).
+    This path matters when a turn carries BOTH new content AND a confirmation,
+    and the gate handler didn't intercept.
+    """
+    accepted = _parse_confirmation_answer(user_text)
+    if accepted is not True:
+        return 0
+
+    prompt = state.confirmation_gate.next_prompt()
+    if prompt is None or prompt.topic != "workflow":
+        return 0
+
+    promoted = 0
+    for event_id in prompt.all_event_ids:
+        result = state.confirmation_gate.record_response(event_id, accepted=True)
+        if result is not None:
+            promoted += 1
+    if promoted:
+        print(f"LOG: Auto-promoted {promoted} pending workflow event(s) on confirmation")
+        _register_user_routines_safe(state)
+    return promoted
+
+
+def _register_user_routines_safe(state: "SharedState") -> None:
+    """Phase 4 / E1: re-scan + register a user's routines after a write.
+
+    Idempotent — APScheduler replaces existing job ids on re-registration.
+    """
+    if not state.user_id:
+        return
+    try:
+        sched = get_routine_scheduler()
+        if sched is None:
+            return
+        n = sched.register_for_user(state.user_id)
+        if n:
+            print(f"LOG: Re-registered {n} routine(s) for {state.user_id}")
+    except Exception as e:
+        print(f"LOG: routine registration failed for {state.user_id}: {e}")
+
+
 def _apply_explicit_facts_from_turn(
     state: "SharedState",
     *,
@@ -939,9 +1245,20 @@ def _apply_explicit_facts_from_turn(
 
     Called per-turn so disclosures like 'my email is X' are reflected in the
     next turn's memory context without waiting for session-end replay.
+
+    Phase 2 / B3: also auto-promote any pending workflow.* candidate when the
+    current user text reads as confirmation. This catches the multi-turn flow
+    where the candidate was queued by B1+B2's async extractor on an earlier
+    turn and the user's current message is a yes/save-it without going through
+    the dedicated confirmation_turn handler (e.g. when the message also
+    carries new content).
     """
     if not PERSONAL_MEMORY_ENABLED:
         return
+    try:
+        _auto_promote_pending_workflow_on_confirm(state, user_text=user_text)
+    except Exception as e:
+        print(f"LOG: Workflow auto-promote failed for {session_id}: {e}")
     try:
         profile = state.personal_memory_store.load_profile_snapshot()
         # Use a minimal single-message history to reuse candidate extraction + dedup
@@ -984,6 +1301,8 @@ def _apply_explicit_facts_from_turn(
         result = replay(state.journal_store.load_all(), store=state.personal_memory_store)
         if result.written_topics:
             print(f"LOG: Per-turn memory applied for {session_id}: {result.written_topics}")
+            if "workflow" in result.written_topics:
+                _register_user_routines_safe(state)
     except Exception as e:
         print(f"LOG: Per-turn fact extraction failed for {session_id}: {e}")
 
@@ -992,6 +1311,7 @@ def _runtime_agent_registry() -> list[dict[str, Any]]:
     main_model = str(config.get("MAIN_AGENT_MODEL") or f"groq:{config.get('GROQ_PRIMARY_MODEL', 'llama-3.3-70b-versatile')}")
     email_model = str(config.get("EMAIL_AGENT_MODEL") or main_model)
     dream_model = str(config.get("DREAM_PASS_AGENT_MODEL") or "auto (groq:openai/gpt-oss-120b)")
+    stage_b_model = f"groq:{settings.personal_memory_stage_b_model}"
 
     return [
         {
@@ -1016,7 +1336,29 @@ def _runtime_agent_registry() -> list[dict[str, Any]]:
             "model": dream_model,
             "editable": True,
             "config_key": "DREAM_PASS_AGENT_MODEL",
-            "status": "active" if PERSONAL_MEMORY_DREAM_PASS_ENABLED else "disabled",
+            "status": "active" if _dream_pass_enabled() else "disabled",
+        },
+        {
+            "id": "router",
+            "label": "Intent Router",
+            "model": str(config.get("ROUTER_AGENT_MODEL") or "groq:llama-3.1-8b-instant"),
+            "editable": True,
+            "config_key": "ROUTER_AGENT_MODEL",
+            "status": "active",
+        },
+        {
+            "id": "planner",
+            "label": "Multi-step Planner",
+            "model": "groq:llama-3.1-8b-instant",
+            "editable": False,
+            "status": "hardcoded",
+        },
+        {
+            "id": "stage_b_extractor",
+            "label": "Stage B Memory Extractor",
+            "model": stage_b_model,
+            "editable": False,
+            "status": "active" if PERSONAL_MEMORY_ENABLED else "disabled",
         },
         {
             "id": "main_fallback_chain",
@@ -1047,6 +1389,9 @@ def _build_model_from_str(model_str: str, settings: Any) -> Any | None:
         return get_groq_model(model_name=model_str[5:], settings=settings)
     if model_str.startswith("openrouter:"):
         models = get_openrouter_models(model_name=model_str[11:], settings=settings)
+        return models[0] if models else None
+    if model_str.startswith("gemini:"):
+        models = get_google_models(model_name=model_str[7:], settings=settings)
         return models[0] if models else None
     return None
 
@@ -1080,81 +1425,119 @@ class AgentManager:
         stt_model = cfg.get("STT_MODEL", "whisper-large-v3-turbo")
         self.stt = FastRTCSTT(groq_client=groq_client, model=stt_model)
 
+        # Model pools — one per provider/key. Each pool is ordered so the first
+        # element is the preferred entry-point for that provider.
         openrouter_models = get_openrouter_models(
-            model_name=cfg.get("OPEN_ROUTER_MODEL"),
-            settings=settings,
+            model_name=cfg.get("OPEN_ROUTER_MODEL"), settings=settings,
         )
-        if not openrouter_models:
-            raise RuntimeError("No OpenRouter API keys found.")
-
-        primary_groq = get_groq_model(
-            model_name=cfg.get("GROQ_PRIMARY_MODEL"),
-            settings=settings,
+        gemini_models = get_google_models(
+            model_name=cfg.get("GEMINI_MODEL"), settings=settings,
         )
-        main_model = primary_groq or openrouter_models[0]
-
-        openrouter_fallbacks = openrouter_models[1:] or openrouter_models
-        delegator_fallbacks = openrouter_models if primary_groq else openrouter_fallbacks
-        groq_fallback = get_groq_fallback_model(
-            model_name=cfg.get("GROQ_FALLBACK_MODEL"),
-            settings=settings,
+        gpt_oss = get_groq_model(
+            model_name="openai/gpt-oss-120b", settings=settings,
+        )
+        groq_llama = get_groq_model(
+            model_name=cfg.get("GROQ_PRIMARY_MODEL"), settings=settings,
+        )
+        groq_llama_small = get_groq_fallback_model(
+            model_name=cfg.get("GROQ_FALLBACK_MODEL"), settings=settings,
         )
 
-        # Per-agent model overrides
-        actual_main_model = (
-            _build_model_from_str(cfg.get("MAIN_AGENT_MODEL", ""), settings)
-            or main_model
+        if not (openrouter_models or gemini_models or gpt_oss or groq_llama):
+            raise RuntimeError(
+                "No model providers available. Set GEMINI_API_KEY, "
+                "OPEN_ROUTER_API_KEY_*, or GROQ_API_KEY."
+            )
+
+        # Per-agent cascades. Each is a flat list [primary, *fallbacks] composed
+        # in priority order; build_chain() drops Nones and de-dupes identity.
+        def build_chain(*candidates: Any) -> list[Any]:
+            seen: list[Any] = []
+            for c in candidates:
+                if c is None:
+                    continue
+                items = c if isinstance(c, list) else [c]
+                for item in items:
+                    if item is not None and id(item) not in {id(s) for s in seen}:
+                        seen.append(item)
+            return seen
+
+        # If the per-agent override resolves to the same provider+model as the
+        # head of a pool, skip the override (it'd create a redundant first-rung
+        # retry on the same API key). Pool ordering already encodes the
+        # desired primary anyway.
+        def _override_redundant(override: Any, pool: list[Any]) -> bool:
+            if override is None or not pool:
+                return False
+            head = pool[0]
+            return (
+                type(override) is type(head)
+                and getattr(override, "model_name", None) == getattr(head, "model_name", None)
+            )
+
+        # main_assistant: gpt-oss → Gemini direct → Gemini via OpenRouter.
+        # gpt-oss-120b on Groq handles the conversational + tool-call workload;
+        # if Groq 429s or harmony-errors, Gemini direct picks up cleanly, and
+        # OpenRouter is the last resort if Google quota is exhausted.
+        main_override = _build_model_from_str(cfg.get("MAIN_AGENT_MODEL", ""), settings)
+        main_head: Any = main_override or gpt_oss
+        # Groq llama tacked on as final rescue: if Groq harmony-errors AND every
+        # Gemini variant 400s on function-call adjacency (Google strict, OR
+        # often proxies to the same backend), llama-3.3-70b on Groq is lenient
+        # about message order and gives us a non-zero chance of recovery.
+        main_chain = build_chain(
+            main_head, gemini_models, openrouter_models, groq_llama, groq_llama_small,
         )
-        actual_email_model = (
-            _build_model_from_str(cfg.get("EMAIL_AGENT_MODEL", ""), settings)
-            or main_model
+
+        # email_agent: Gemini direct → Gemini via OpenRouter → Llama (Groq).
+        # Email composition is structure-heavy, so leading with Gemini's
+        # stronger instruction-following pays off. Llama is the final rung in
+        # case Google + OpenRouter are both unavailable.
+        email_override = _build_model_from_str(cfg.get("EMAIL_AGENT_MODEL", ""), settings)
+        if _override_redundant(email_override, gemini_models):
+            email_override = None
+        email_head: Any = email_override or (gemini_models[0] if gemini_models else None)
+        email_chain = build_chain(
+            email_head,
+            gemini_models, openrouter_models, groq_llama, groq_llama_small,
         )
+
+        if not main_chain or not email_chain:
+            raise RuntimeError(
+                "Cannot build agent chain — no usable model for main/email agent."
+            )
 
         # Main assistant
         self.main_assistant = Agent(
-            actual_main_model,
+            main_chain[0],
             deps_type=SharedState,
             output_type=str,
             output_retries=OUTPUT_RETRIES,
             instructions=MAIN_ASSISTANT_PROMPT,
-            history_processors=[_trim_history_for_context],
+            history_processors=[_trim_history_for_context, _sanitize_tool_pairs],
         )
-        self.main_assistant_fallbacks = []
-        for fb in delegator_fallbacks:
-            self.main_assistant_fallbacks.append(
-                Agent(fb, deps_type=SharedState, output_type=str,
-                      output_retries=OUTPUT_RETRIES, instructions=MAIN_ASSISTANT_PROMPT,
-                      history_processors=[_trim_history_for_context])
-            )
-        if groq_fallback:
-            self.main_assistant_fallbacks.append(
-                Agent(groq_fallback, deps_type=SharedState, output_type=str,
-                      output_retries=OUTPUT_RETRIES, instructions=MAIN_ASSISTANT_PROMPT,
-                      history_processors=[_trim_history_for_context])
-            )
+        self.main_assistant_fallbacks = [
+            Agent(m, deps_type=SharedState, output_type=str,
+                  output_retries=OUTPUT_RETRIES, instructions=MAIN_ASSISTANT_PROMPT,
+                  history_processors=[_trim_history_for_context, _sanitize_tool_pairs])
+            for m in main_chain[1:]
+        ]
 
         # Email agent
         self.email_agent = Agent(
-            actual_email_model,
+            email_chain[0],
             deps_type=SharedState,
             output_type=str,
             output_retries=OUTPUT_RETRIES,
             instructions=EMAIL_PROMPT,
-            history_processors=[_trim_history_for_context],
+            history_processors=[_trim_history_for_context, _sanitize_tool_pairs],
         )
-        self.email_agent_fallbacks = []
-        for fb in delegator_fallbacks:
-            self.email_agent_fallbacks.append(
-                Agent(fb, deps_type=SharedState, output_type=str,
-                      output_retries=OUTPUT_RETRIES, instructions=EMAIL_PROMPT,
-                      history_processors=[_trim_history_for_context])
-            )
-        if groq_fallback:
-            self.email_agent_fallbacks.append(
-                Agent(groq_fallback, deps_type=SharedState, output_type=str,
-                      output_retries=OUTPUT_RETRIES, instructions=EMAIL_PROMPT,
-                      history_processors=[_trim_history_for_context])
-            )
+        self.email_agent_fallbacks = [
+            Agent(m, deps_type=SharedState, output_type=str,
+                  output_retries=OUTPUT_RETRIES, instructions=EMAIL_PROMPT,
+                  history_processors=[_trim_history_for_context, _sanitize_tool_pairs])
+            for m in email_chain[1:]
+        ]
 
         # Register tools on the main assistant
         self._register_tools()
@@ -1182,6 +1565,23 @@ class AgentManager:
                 return f"Tool: {name}"  # graceful fallback
 
         agent = self.main_assistant
+
+        # Per-turn dynamic instructions: inject the user-specific greeting
+        # block so a freshly-onboarded user gets greeted by name and a stranger
+        # gets a gentle "ask once" hint. Runs once per turn against the live
+        # SharedState (which carries the resolved user_id).
+        def _attach_user_greeting(target_agent: Agent) -> None:
+            @target_agent.instructions
+            async def _user_greeting(ctx: RunContext[SharedState]) -> str:
+                try:
+                    uid = ctx.deps.user_id if ctx.deps is not None else ""
+                except Exception:
+                    uid = ""
+                return _build_user_greeting_block(uid)
+
+        _attach_user_greeting(agent)
+        for fb in self.main_assistant_fallbacks:
+            _attach_user_greeting(fb)
 
         @agent.tool(description=_load_tool_contract("search_web"))
         async def search_web(ctx: RunContext[SharedState], args: WebSearchArgs) -> str:
@@ -1416,6 +1816,36 @@ agents_mgr = AgentManager()
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Turtle AI", docs_url=None, redoc_url=None)
 
+# Phase 4 / E1: routine scheduler — singleton, started/stopped with the app.
+_routine_scheduler = None  # type: ignore[var-annotated]
+
+
+@app.on_event("startup")
+async def _start_routine_scheduler() -> None:
+    global _routine_scheduler
+    try:
+        from core.routine_scheduler import RoutineScheduler
+        _routine_scheduler = RoutineScheduler()
+        _routine_scheduler.start()
+    except Exception as e:
+        print(f"LOG: RoutineScheduler failed to start: {e}")
+        _routine_scheduler = None
+
+
+@app.on_event("shutdown")
+async def _stop_routine_scheduler() -> None:
+    global _routine_scheduler
+    if _routine_scheduler is not None:
+        try:
+            _routine_scheduler.shutdown()
+        except Exception as e:
+            print(f"LOG: RoutineScheduler shutdown error: {e}")
+    _routine_scheduler = None
+
+
+def get_routine_scheduler():
+    return _routine_scheduler
+
 if _logfire_loaded:
     try:
         import logfire as _lf
@@ -1452,6 +1882,12 @@ app.include_router(_whatsapp_router)
 app.include_router(_imessage_router)
 app.include_router(_slack_router)
 app.include_router(_twilio_voice_router)
+
+from apps.onboarding_routes import router as _onboarding_router, verify_session_cookie
+app.include_router(_onboarding_router)
+
+from apps.admin_routes import router as _admin_router
+app.include_router(_admin_router)
 
 
 # Per-(user_id, channel) message history — keyed by (user_id, channel).
@@ -1505,7 +1941,20 @@ set_channel_dispatch(_channel_dispatch_handler)
 
 
 @app.get("/")
-async def serve_index():
+async def serve_index(request: Request):
+    """Serve the chat UI when authenticated, otherwise serve onboarding.
+
+    "Authenticated" = a valid turtle_uid cookie, OR the dev_anon escape hatch
+    is on. Anything else lands on the onboarding form.
+    """
+    cookie_token = request.cookies.get("turtle_uid")
+    authed = bool(cookie_token and verify_session_cookie(cookie_token))
+    if not authed and not (settings.dev_anon and not settings.is_cloud):
+        onboarding_path = STATIC_DIR / "onboarding.html"
+        if onboarding_path.exists():
+            return FileResponse(onboarding_path, media_type="text/html")
+        return JSONResponse({"error": "Onboarding page missing"}, status_code=500)
+
     index_path = STATIC_DIR / "index.html"
     if not index_path.exists():
         return JSONResponse({"error": "Frontend not built yet"}, status_code=404)
@@ -1553,57 +2002,68 @@ async def update_config(body: dict[str, Any] | None = None):
 async def list_models():
     """List available model options for dev-mode dropdowns."""
     openrouter_models = [
-        # OpenAI via OpenRouter
+        # OpenAI
         "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "openai/gpt-5",
+        "openai/gpt-5-mini",
+        "openai/gpt-4.1",
         "openai/gpt-4o-mini",
-        # Llama 4
-        "meta-llama/llama-4-scout:free",
-        "meta-llama/llama-4-maverick:free",
-        # Llama 3.3 / 3.1
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "meta-llama/llama-3.1-70b-instruct:free",
-        "meta-llama/llama-3.1-8b-instruct:free",
-        "meta-llama/llama-3.2-3b-instruct:free",
+        # Anthropic Claude 4.x
+        "anthropic/claude-opus-4.7",
+        "anthropic/claude-sonnet-4.6",
+        "anthropic/claude-haiku-4.5",
+        # Google Gemini
+        "google/gemini-2.5-pro",
+        "google/gemini-2.5-flash",
+        "google/gemini-2.0-flash-001",
+        # xAI / Mistral
+        "x-ai/grok-4",
+        "x-ai/grok-3-mini",
+        "mistralai/mistral-large-2411",
+        "mistralai/mistral-small-3.2-24b-instruct",
+        # Llama 4 / 3.3
+        "meta-llama/llama-4-scout",
+        "meta-llama/llama-4-maverick",
+        "meta-llama/llama-3.3-70b-instruct",
         # DeepSeek
-        "deepseek/deepseek-r1:free",
-        "deepseek/deepseek-chat-v3-0324:free",
+        "deepseek/deepseek-r1",
+        "deepseek/deepseek-chat-v3.1",
         # Qwen 3
+        "qwen/qwen3-235b-a22b",
+        "qwen/qwen3-30b-a3b",
+        "qwen/qwen3-coder",
+        # Moonshot
+        "moonshotai/kimi-k2-0905",
+        # Free tier picks
+        "meta-llama/llama-4-scout:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "deepseek/deepseek-r1:free",
         "qwen/qwen3-30b-a3b:free",
-        "qwen/qwen3-8b:free",
-        "qwen/qwen-2.5-72b-instruct:free",
-        # Google Gemma 3
         "google/gemma-3-27b-it:free",
-        "google/gemma-3-12b-it:free",
-        "google/gemma-2-9b-it:free",
-        # Nvidia / Mistral / Microsoft
         "nvidia/llama-3.1-nemotron-70b-instruct:free",
         "nvidia/nemotron-3-nano-30b-a3b:free",
-        "mistralai/mistral-nemo:free",
-        "mistralai/mistral-7b-instruct:free",
-        "microsoft/phi-3-mini-128k-instruct:free",
-        "microsoft/phi-3-medium-128k-instruct:free",
     ]
     groq_models = [
+        # GPT-OSS (OpenAI weights on Groq)
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        # Llama 4
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
         # Llama 3.3 / 3.1
         "llama-3.3-70b-versatile",
-        "llama-3.1-70b-versatile",
         "llama-3.1-8b-instant",
-        # Llama 3.2 vision
-        "llama-3.2-90b-vision-preview",
-        "llama-3.2-11b-vision-preview",
-        "llama-3.2-3b-preview",
-        "llama-3.2-1b-preview",
+        # Moonshot Kimi K2
+        "moonshotai/kimi-k2-instruct-0905",
+        # DeepSeek / Qwen
+        "deepseek-r1-distill-llama-70b",
+        "qwen/qwen3-32b",
         # Llama 3 legacy
         "llama3-70b-8192",
         "llama3-8b-8192",
-        # Deepseek
-        "deepseek-r1-distill-llama-70b",
-        # Qwen
-        "qwen-qwq-32b",
-        # Mixtral / Gemma
-        "mixtral-8x7b-32768",
+        # Gemma
         "gemma2-9b-it",
-        "gemma-7b-it",
     ]
     groq_stt_models = [
         "whisper-large-v3-turbo",
@@ -1747,18 +2207,9 @@ async def websocket_endpoint(ws: WebSocket):
     async with httpx.AsyncClient() as client:
         session_store = SessionStore()
         restore_result = await session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
-        graph_store = GraphStore(graph_path=MEMORY_GRAPH_FILE)
-        memory_store = MemoryStore(
-            profile_path=MEMORY_PROFILE_FILE,
-            events_path=MEMORY_EVENTS_FILE,
-            episodes_path=MEMORY_EPISODES_FILE,
-            state_path=MEMORY_STATE_FILE,
-            graph_store=graph_store,
-            flush_turns=MEMORY_FLUSH_TURNS,
-            flush_tokens=MEMORY_FLUSH_TOKENS,
-            profile_max_lines=MEMORY_PROFILE_MAX_LINES,
-            write_enabled=False,
-        )
+        # Legacy single-tenant MemoryStore intentionally not constructed here —
+        # personal memory now lives under personal_memory_dir(user_id).
+        memory_store = None
         personal_memory_store = PersonalMemoryStore(user_id=user_id)
         journal_store = JournalStore(user_id=user_id)
         confirmation_gate = ConfirmationGate(
@@ -1774,7 +2225,7 @@ async def websocket_endpoint(ws: WebSocket):
             ),
         )
         task_history_store = TaskHistoryStore(TASK_HISTORY_FILE)
-        rag_system = TurtleRAGSystem()
+        rag_system = TurtleRAGSystem(user_id=user_id)
 
         # D4: construct RetrievalBroker for 4-tier memory context retrieval
         from core.storage.local.faiss_store import FAISSVectorStore
@@ -1847,8 +2298,30 @@ async def websocket_endpoint(ws: WebSocket):
                 if raw.get("type") == "websocket.disconnect":
                     break
 
+                # Phase 6: per-user inbound rate limit. Helper bubbles
+                # WebSocketRateLimitExceeded so we can close cleanly.
+                async def _check_user_message_rate() -> bool:
+                    try:
+                        ws_rate_limiter.check_and_record(user_id)
+                        return True
+                    except WebSocketRateLimitExceeded as exc:
+                        await _ws_send_json(ws, {
+                            "type": "error",
+                            "code": "rate_limited",
+                            "window": exc.window,
+                            "limit": exc.limit,
+                            "message": (
+                                f"Message rate limit reached "
+                                f"({exc.limit}/{exc.window}). Try again later."
+                            ),
+                        })
+                        await ws.close(code=1008, reason="rate_limited")
+                        return False
+
                 # Binary frame = audio data
                 if "bytes" in raw and raw["bytes"]:
+                    if not await _check_user_message_rate():
+                        break
                     audio_bytes = raw["bytes"]
                     message_history = await _handle_audio_message(
                         ws, state, audio_bytes, message_history
@@ -1868,6 +2341,8 @@ async def websocket_endpoint(ws: WebSocket):
                     if msg_type == "text":
                         content = str(msg.get("content", "")).strip()
                         if content:
+                            if not await _check_user_message_rate():
+                                break
                             message_history = await _handle_text_message(
                                 ws, state, content, message_history
                             )
@@ -1877,6 +2352,8 @@ async def websocket_endpoint(ws: WebSocket):
                         audio_b64 = msg.get("data", "")
                         sample_rate = int(msg.get("sample_rate", 16000))
                         if audio_b64:
+                            if not await _check_user_message_rate():
+                                break
                             audio_bytes = base64.b64decode(audio_b64)
                             message_history = await _handle_audio_message(
                                 ws, state, audio_bytes, message_history,
@@ -1900,7 +2377,7 @@ async def websocket_endpoint(ws: WebSocket):
             traceback.print_exc()
         finally:
             # Session cleanup
-            if state.session_store.session_id:
+            if state.session_store.session_id and state.memory_store is not None:
                 state.memory_store.force_checkpoint(
                     session_id=state.session_store.session_id,
                     reason="session_end",
@@ -1939,6 +2416,44 @@ async def _ws_send_json(ws: WebSocket, data: dict[str, Any]) -> None:
         pass
 
 
+def _classify_handler_error(exc: Exception) -> tuple[str, str]:
+    """Phase 1 / F1+F2+F3: map an exception to a (code, user-friendly message).
+
+    The raw exception string (e.g. pydantic-ai ModelHTTPError stack fragments
+    with `status_code: 402, model_name: ...`) must never reach the UI toast.
+    """
+    try:
+        from pydantic_ai.exceptions import ModelHTTPError
+    except Exception:
+        ModelHTTPError = None  # type: ignore
+
+    if ModelHTTPError is not None and isinstance(exc, ModelHTTPError):
+        status = getattr(exc, "status_code", None)
+        body = str(exc).lower()
+        if status == 402:
+            return "credit_exhausted", (
+                "I'm out of credits on a backend right now. Please ping the operator."
+            )
+        if status in (429, 503):
+            return "upstream_overload", (
+                "Search is unavailable right now. Try again in a minute."
+            )
+        if status == 400 and ("harmony" in body or "render tokens" in body or "tools should have a name" in body):
+            return "serialization_bug", (
+                "I hit an internal serialization bug — it's been logged."
+            )
+        if isinstance(status, int) and status >= 500:
+            return "upstream_overload", (
+                "A backend is having trouble. Try again in a moment."
+            )
+        return "upstream_error", "Something went wrong upstream. The error has been logged."
+
+    msg = str(exc).lower()
+    if "timeout" in msg or isinstance(exc, asyncio.TimeoutError):
+        return "timeout", "That took too long to come back. Try again."
+    return "internal_error", "Something went wrong. The error has been logged."
+
+
 async def _handle_text_message(
     ws: WebSocket,
     state: SharedState,
@@ -1948,6 +2463,9 @@ async def _handle_text_message(
     """Process a text chat message and stream the response."""
     timings: dict[str, float] = {}
     overall_start = time.time()
+
+    if state.user_id:
+        emit_event_once(state.user_id, "first_message_sent", channel="web")
 
     await _ws_send_json(ws, {"type": "status", "status": "thinking"})
 
@@ -1959,13 +2477,27 @@ async def _handle_text_message(
             await _ws_send_json(ws, {"type": "timing", **timings})
             return message_history
 
+        # C2+C3: if a memory-confirmation prompt is pending and the user is
+        # not answering it right now, surface the question as a sidecar
+        # message before the agent reply. Their next yes/no will be picked
+        # up by _maybe_handle_confirmation_turn on the following turn.
+        pending_prompt = state.confirmation_gate.next_prompt()
+        if pending_prompt is not None:
+            await _ws_send_json(ws, {
+                "type": "confirmation_prompt",
+                "event_ids": list(pending_prompt.all_event_ids),
+                "topic": pending_prompt.topic,
+                "key": pending_prompt.key,
+                "message": pending_prompt.question,
+            })
+
         task_type = _detect_task_type(user_text)
 
         # A1: Router stage — runs concurrently with memory resolution.
         # RouterDecision drives graph selection in Tier 1 (A2); here it feeds logs + timings.
         from core.router import route_turn as _route_turn
         router_start = time.time()
-        router_task = asyncio.create_task(_route_turn(user_text))
+        router_task = asyncio.create_task(_route_turn(user_text, model_name=str(config.get("ROUTER_AGENT_MODEL") or "")))
 
         memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=user_text)
         prompt_input = _compose_prompt_with_memory(user_text, memory_context)
@@ -2005,13 +2537,14 @@ async def _handle_text_message(
         message_history = response.all_messages()
         await state.session_store.replace_messages(message_history)
         state.rag_system.add_conversation(user_text, final_output)
-        state.memory_store.record_turn(
-            session_id=state.session_store.session_id or "unknown_session",
-            turn_id=turn_id,
-            user_text=user_text,
-            assistant_text=final_output,
-            task_type=task_type,
-        )
+        if state.memory_store is not None:
+            state.memory_store.record_turn(
+                session_id=state.session_store.session_id or "unknown_session",
+                turn_id=turn_id,
+                user_text=user_text,
+                assistant_text=final_output,
+                task_type=task_type,
+            )
         # Immediately apply explicit facts (email, name) so next turn sees them
         _apply_explicit_facts_from_turn(
             state,
@@ -2043,7 +2576,19 @@ async def _handle_text_message(
     except Exception as e:
         print(f"LOG: Text handler error: {e}")
         traceback.print_exc()
-        await _ws_send_json(ws, {"type": "error", "message": str(e)})
+        code, friendly = _classify_handler_error(e)
+        if _logfire_loaded:
+            try:
+                import logfire as _lf
+                _lf.error(
+                    "turtle.turn_failed",
+                    error_class=e.__class__.__name__,
+                    error_code=code,
+                    error_message=str(e),
+                )
+            except Exception:
+                pass
+        await _ws_send_json(ws, {"type": "error", "code": code, "message": friendly})
         return message_history
 
 
@@ -2107,7 +2652,7 @@ async def _handle_audio_message(
         # A1: Router stage — same as text path, concurrent with memory resolution.
         from core.router import route_turn as _route_turn
         router_start = time.time()
-        router_task = asyncio.create_task(_route_turn(transcription))
+        router_task = asyncio.create_task(_route_turn(transcription, model_name=str(config.get("ROUTER_AGENT_MODEL") or "")))
 
         memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=transcription)
         prompt_input = _compose_prompt_with_memory(transcription, memory_context)
@@ -2142,13 +2687,14 @@ async def _handle_audio_message(
         message_history = response.all_messages()
         await state.session_store.replace_messages(message_history)
         state.rag_system.add_conversation(transcription, final_output)
-        state.memory_store.record_turn(
-            session_id=state.session_store.session_id or "unknown_session",
-            turn_id=turn_id,
-            user_text=transcription,
-            assistant_text=final_output,
-            task_type=task_type,
-        )
+        if state.memory_store is not None:
+            state.memory_store.record_turn(
+                session_id=state.session_store.session_id or "unknown_session",
+                turn_id=turn_id,
+                user_text=transcription,
+                assistant_text=final_output,
+                task_type=task_type,
+            )
         # Immediately apply explicit facts (email, name) so next turn sees them
         _apply_explicit_facts_from_turn(
             state,

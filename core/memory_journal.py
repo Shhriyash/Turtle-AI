@@ -9,12 +9,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from core.paths import personal_journal_dir
+from core.guardrails import enforce_storage_cap
+from core.paths import personal_journal_dir, personal_memory_dir
 
 
 ALLOWED_KINDS = frozenset({"fact", "preference", "behavior", "correction", "contradiction"})
 ALLOWED_TOPICS = frozenset(
-    {"identity", "preferences", "workflow", "contacts", "projects", "corrections"}
+    {"identity", "preferences", "workflow", "contacts", "projects", "corrections", "relations"}
 )
 ALLOWED_SOURCES = frozenset({"explicit", "inferred", "synthesized", "migration"})
 ALLOWED_EXTRACTORS = frozenset({"deterministic", "llm_turn", "dream_pass", "migration"})
@@ -123,6 +124,13 @@ class JournalStore:
             return event
         path = self._shard_path_for(event.observed_at)
         line = json.dumps(event.to_payload(), ensure_ascii=False, sort_keys=True)
+        # Phase 6: enforce per-user storage cap before appending.
+        if self.user_id and self.user_id != "default":
+            enforce_storage_cap(
+                self.user_id,
+                personal_memory_dir(self.user_id),
+                incoming_bytes=len(line.encode("utf-8")) + 1,
+            )
         with path.open("a", encoding="utf-8") as file:
             file.write(line + "\n")
             file.flush()

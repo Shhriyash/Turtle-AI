@@ -1,6 +1,6 @@
 # Turtle Personal Assistant
 
-A multi-agent personal assistant with persistent personal memory, web search, URL analysis, email capabilities, and a web chat UI — built with Pydantic AI.
+A multi-agent personal assistant with persistent personal memory, web search, URL analysis, email capabilities, a web chat UI, and multi-channel messaging support — built with Pydantic AI.
 
 ## Features
 
@@ -10,6 +10,10 @@ A multi-agent personal assistant with persistent personal memory, web search, UR
 - **Web Search**: Real-time information retrieval using DuckDuckGo
 - **URL Analysis**: Custom content extraction from web pages
 - **Email Integration**: Automated email sending with professional formatting
+- **Multi-Channel Messaging**: WhatsApp (Twilio), iMessage (SendBlue), Slack (Events API), and Twilio Voice
+- **Graph Orchestration**: Intent-routed graph executor with parallel multi-step planning
+- **Router Agent**: Fast Groq-based intent classifier routing turns to the correct graph
+- **Identity Management**: Per-channel user identity mapping to a canonical internal user ID
 - **Multi-Agent Architecture**: Specialized agents for different tasks
 - **LLM Fallback**: OpenRouter key rotation plus optional Groq primary/fallback models
 
@@ -20,12 +24,32 @@ A multi-agent personal assistant with persistent personal memory, web search, UR
 ### Core Components
 
 ```
+Router Agent (core/router.py — Groq llama-3.1-8b-instant, ~150ms)
+  └─► Graph Executor (core/graph.py — select_graph by intent)
+        |-- CHITCHAT_GRAPH   → single LLM call
+        |-- WEB_SEARCH_GRAPH → LLM + search_web tool
+        |-- URL_GRAPH        → fetch URL + summarise
+        |-- EMAIL_GRAPH      → extract → validate → send (SMTP)
+        |-- CALENDAR_GRAPH   → create / list via Google Calendar API
+        |-- MEMORY_RECALL_GRAPH → history_tool (RAG)
+        `-- MULTI_STEP_GRAPH → Planner → parallel tool execution → synthesise
+
 Main Assistant (Pydantic AI + core/llm_client model selection)
 |-- Web Search Tool (DuckDuckGo HTML + parser)
 |-- Email Specialist Agent
 |-- Custom URL Tools (BeautifulSoup + httpx)
 |-- RAG Memory System (FAISS + Cohere embeddings)
 `-- Personal Memory System (journal + topic markdown files)
+
+Channel Adapters (apps/channels/)
+|-- WhatsApp  → Twilio Cloud API (POST /channels/whatsapp)
+|-- iMessage  → SendBlue API    (POST /channels/imessage)
+|-- Slack     → Events API      (POST /channels/slack/events)
+`-- Voice     → Twilio Media Streams WebSocket (/channels/twilio/voice/stream)
+      STT: Groq Whisper · TTS: Deepgram μ-law 8 kHz
+
+Identity Manager (core/identity.py)
+`-- SQLite mapping: (channel, channel_user_id) → canonical user_id
 ```
 
 ---
@@ -196,11 +220,23 @@ turtle/
 |-- apps/
 |   |-- turtle_voice.py          # CLI voice assistant entry point
 |   |-- turtle_server.py         # FastAPI web server + WebSocket backend
-|   `-- websearch_cli.py         # Web search CLI
+|   |-- auth.py                  # WebSocket / HTTP authentication
+|   |-- websearch_cli.py         # Web search CLI
+|   `-- channels/
+|       |-- __init__.py          # TurtleEvent / TurtleResponse types + dispatch wiring
+|       |-- whatsapp.py          # WhatsApp adapter — Twilio Cloud API webhook
+|       |-- imessage.py          # iMessage adapter — SendBlue webhook
+|       |-- slack.py             # Slack adapter — Events API (app_mention + DM)
+|       `-- twilio_voice.py      # Voice adapter — Twilio Media Streams WebSocket
 |-- core/
 |   |-- env.py                   # .env loader (shared)
+|   |-- config.py                # Centralised pydantic-settings config (TurtleSettings)
 |   |-- llm_client.py            # Model selection + fallback chain
 |   |-- paths.py                 # Standard data/output paths
+|   |-- router.py                # A1: fast intent router (Groq llama-3.1-8b-instant)
+|   |-- graph.py                 # A2/A3/A4: graph executor + topologies
+|   |-- graph_store.py           # Graph state persistence
+|   |-- identity.py              # F5: channel → canonical user_id (SQLite)
 |   |-- personal_memory_store.py # Markdown-backed topic file store
 |   |-- memory_journal.py        # Append-only JSONL event log
 |   |-- memory_replayer.py       # Journal → topic markdown projection
@@ -209,19 +245,33 @@ turtle/
 |   |-- personal_memory_schema.py   # MemoryEvent dataclass
 |   |-- confirmation_gate.py     # User confirmation queue + silence
 |   |-- dream_pass.py            # Batch LLM review (Stage C)
+|   |-- periodic_reflector.py    # Mid-session Stage B + dream pass runner
+|   |-- episodic_summarizer.py   # Episodic conversation summarisation
+|   |-- email_flow.py            # A3: email extraction + SMTP send helpers
 |   |-- session_store.py         # Session file lifecycle
 |   |-- retrieval_broker.py      # Routes queries to RAG or personal memory
 |   |-- memory_extractor.py      # Legacy extraction utilities
 |   |-- memory_store.py          # Legacy JSON/JSONL shim
 |   |-- openrouter_tts.py        # OpenRouter TTS client
+|   |-- streaming_tts.py         # Streaming TTS helpers
 |   |-- stt_fastrtc.py           # FastRTC STT integration
 |   |-- output_clean.py          # Response text cleanup
 |   |-- task_history.py          # Task history logging
 |   |-- web_search.py            # DuckDuckGo search
+|   |-- background_tasks.py      # App-level background task registration
+|   |-- observability.py         # Logfire / tracing helpers
+|   |-- latency_budgets.py       # Per-intent latency targets
+|   |-- worker.py                # Background worker utilities
+|   |-- storage/
+|   |   |-- local/sqlite_store.py
+|   |   |-- local/faiss_store.py
+|   |   |-- local/fact_store.py
+|   |   `-- local/blob_store.py
 |   `-- system_prompts/
 |       |-- main_assistant.txt
 |       |-- email_agent.txt
-|       `-- rag_agent.txt
+|       |-- planner.txt
+|       `-- router.txt
 |-- rag/
 |   |-- embedder/embedding_model.py   # Cohere embedding wrapper
 |   |-- chunking/json_chunking.py     # Conversation chunking
@@ -246,7 +296,8 @@ turtle/
 |-- config/
 |   `-- turtle_config.json       # Runtime config (dream pass model, flush intervals)
 |-- test/
-|   `-- *.py                     # Unit/integration tests
+|   `-- *.py                     # Unit/integration tests+
+
 |-- requirements.txt
 `-- README.md
 ```
@@ -296,6 +347,24 @@ TURTLE_EMAIL_PASSKEY="your_app_password"
 TURTLE_PERSONAL_MEMORY_ENABLED=1
 TURTLE_PERSONAL_MEMORY_DREAM_PASS_ENABLED=0
 
+# Channel adapters — Twilio (WhatsApp + Voice)
+TWILIO_ACCOUNT_SID="your_twilio_account_sid"
+TWILIO_AUTH_TOKEN="your_twilio_auth_token"
+TWILIO_WHATSAPP_NUMBER="whatsapp:+14155238886"   # Twilio sandbox or purchased number
+TWILIO_VOICE_NUMBER="+15005550006"               # Twilio voice number
+
+# Channel adapters — iMessage via SendBlue
+SENDBLUE_API_KEY="your_sendblue_api_key"
+SENDBLUE_API_SECRET="your_sendblue_api_secret"
+
+# Channel adapters — Slack
+SLACK_BOT_TOKEN="xoxb-your-slack-bot-token"
+SLACK_SIGNING_SECRET="your_slack_signing_secret"
+
+# Channel adapters — Google Calendar (optional)
+GOOGLE_CALENDAR_CREDENTIALS_JSON='{"installed":{"client_id":"..."}}'
+GOOGLE_CALENDAR_TOKEN_JSON='{"token":"..."}'
+
 # Optional monitoring
 LOGFIRE_TOKEN=your_logfire_token
 ```
@@ -324,6 +393,88 @@ The server runs with autoreload by default in development. Set `TURTLE_SERVER_RE
 ```bash
 python apps/turtle_voice.py
 ```
+
+### Channel Adapters (webhook setup)
+
+All channel routes are mounted on `turtle_server.py`. Expose the server publicly (e.g. via ngrok) and configure each platform with the corresponding webhook URL:
+
+| Channel | Webhook URL | Platform setup |
+|---------|-------------|---------------|
+| WhatsApp | `POST /channels/whatsapp` | Twilio Console → Messaging → WhatsApp sandbox |
+| iMessage | `POST /channels/imessage` | SendBlue dashboard → Webhook URL |
+| Slack | `POST /channels/slack/events` | api.slack.com/apps → Event Subscriptions |
+| Voice | `POST /channels/twilio/voice/incoming` | Twilio Console → Phone Numbers → Voice |
+
+Adapters operate without credentials in dev mode (signature verification is skipped), so they can be tested locally without real API keys.
+
+---
+
+## Graph Orchestration
+
+Every user turn passes through a two-stage routing layer before reaching the main agent.
+
+### Router Agent (A1)
+
+`core/router.py` — a fast Groq `llama-3.1-8b-instant` call (~150 ms p50) classifies the turn into one of eight intents and returns a `RouterDecision`:
+
+| Intent | Description |
+|--------|-------------|
+| `chitchat` | Conversational, no tools needed |
+| `web` | Real-time web search required |
+| `url` | URL fetch + summarise |
+| `email` | Send an email |
+| `calendar` | Create or list calendar events |
+| `memory_recall` | Retrieve from conversation history |
+| `multi_step` | Multiple parallel tool calls needed |
+| `clarify` | Ambiguous — ask for clarification |
+
+Falls back to a keyword heuristic when `GROQ_API_KEY` is absent.
+
+### Graph Executor (A2/A3/A4)
+
+`core/graph.py` — `select_graph(intent)` returns a `TurtleGraph` that executes the appropriate topology:
+
+- **`multi_step` intent** — runs the A4 parallel pipeline: Planner (fast Groq model) emits a typed `PlannerOutput`, independent steps execute concurrently via `asyncio.gather`, then a synthesis LLM call combines all results.
+- **All other intents** — delegate directly to `run_agent_with_fallbacks` with the tools appropriate to that graph.
+
+---
+
+## Channel Adapters
+
+All channel adapters normalise inbound payloads to a `TurtleEvent` and call the shared `dispatch_event()` handler. Replies are sent back asynchronously via the respective platform API.
+
+### WhatsApp (`apps/channels/whatsapp.py`)
+
+- Transport: Twilio Cloud API webhook — `POST /channels/whatsapp`
+- Auth: HMAC-SHA1 `X-Twilio-Signature` verified on every request (403 on failure)
+- Idempotency: `MessageSid` cached for 60 s to deduplicate Twilio retries
+- Reply: Twilio Messages REST API (`From: whatsapp:<TWILIO_WHATSAPP_NUMBER>`)
+
+### iMessage (`apps/channels/imessage.py`)
+
+- Transport: SendBlue webhook — `POST /channels/imessage`
+- Auth: HMAC-SHA256 `X-SendBlue-Signature`
+- Reply: `POST https://api.sendblue.co/api/send-message`
+
+### Slack (`apps/channels/slack.py`)
+
+- Transport: Slack Events API — `POST /channels/slack/events`
+- Auth: HMAC-SHA256 `X-Slack-Signature` with 5-minute replay protection
+- Events handled: `app_mention`, `message.im` (direct messages)
+- Reply: `chat.postMessage` as a threaded reply; response sent as a background task to satisfy Slack's 3-second acknowledgement requirement
+
+### Twilio Voice (`apps/channels/twilio_voice.py`)
+
+- Transport: Twilio Media Streams over WebSocket (`/channels/twilio/voice/stream`)
+- Call entry: `POST /channels/twilio/voice/incoming` returns TwiML `<Connect><Stream>`
+- Audio format: PCMU G.711 μ-law, 8 kHz, 20 ms frames
+- VAD: energy-based silence detection (800 ms threshold)
+- STT: Groq Whisper (`whisper-large-v3-turbo`)
+- TTS: Deepgram Aura (linear16 → transcoded to μ-law 8 kHz)
+
+### Identity Manager (`core/identity.py`)
+
+Maps `(channel, channel_user_id)` to a stable internal `user_id` stored in `data/users.sqlite`. A new canonical ID is auto-created on first contact from any channel.
 
 ---
 
@@ -358,6 +509,13 @@ openai             # OpenRouter client dependency
 groq               # Optional primary/fallback LLM + Whisper STT
 deepgram-sdk       # Primary TTS provider
 fastrtc            # RTC + VAD
+```
+
+### Channel Adapters
+```
+twilio             # WhatsApp + Voice (optional)
+aiosqlite          # Identity manager (users.sqlite)
+pydantic-settings  # Centralised TurtleSettings config
 ```
 
 ### Voice Stack
@@ -412,6 +570,9 @@ Turtle: Got it — I'll default to bullet points going forward.
 - **RAG Memory**: Requires internet for Cohere embeddings; English-optimized; storage grows with volume
 - **Personal Memory Stage C**: Dream Pass is OFF by default; requires a capable LLM (70B+) for quality results
 - **Model Dependencies**: OpenRouter rate limits, Groq model availability, API costs for production use
+- **Twilio Voice VAD**: Uses simple energy-based silence detection (800 ms threshold); full Silero VAD is not yet wired
+- **Channel Adapters**: All adapters require the server to be publicly reachable over HTTPS/WSS; not suitable for local-only setups without a tunnel (e.g. ngrok)
+- **iMessage via SendBlue**: Requires a US phone number and SendBlue account; Apple-native iMessage delivery is not guaranteed for non-Apple hardware
 
 ---
 
@@ -434,6 +595,17 @@ Turtle: Got it — I'll default to bullet points going forward.
 ### Email Not Sending
 - Verify credentials in environment
 - Check Gmail app password setup
+
+### WhatsApp / iMessage / Slack Not Responding
+- Confirm `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_WHATSAPP_NUMBER` are set
+- For iMessage: confirm `SENDBLUE_API_KEY` and `SENDBLUE_API_SECRET`
+- For Slack: confirm `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET`; ensure bot is invited to the channel
+- Check server logs for `403 Invalid * signature` — mismatch between configured secret and platform secret
+
+### Twilio Voice Call Gets No Audio
+- Confirm `DEEPGRAM_API_KEY` (TTS) and `GROQ_API_KEY` (STT Whisper)
+- Ensure the server is reachable over HTTPS/WSS (Twilio requires TLS for Media Streams)
+- Check logs for `[TwilioVoice] STT failed` or `[TwilioVoice] TTS failed`
 
 ### Debug Commands
 ```bash

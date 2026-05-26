@@ -12,6 +12,7 @@ ALLOWED_MEMORY_TYPES = frozenset(
         "contact",
         "project",
         "correction",
+        "relation",
         "index",
         "log",
     }
@@ -26,6 +27,7 @@ ALLOWED_METADATA_FIELDS = frozenset(
         "confidence",
         "updated_at",
         "last_confirmed_at",
+        "source",
         "source_session_id",
         "version",
         "tags",

@@ -22,6 +22,7 @@ TOPIC_TITLES = {
     "contacts": "Contacts",
     "projects": "Projects",
     "corrections": "Corrections",
+    "relations": "Relations",
 }
 
 TOPIC_SUMMARIES = {
@@ -31,6 +32,7 @@ TOPIC_SUMMARIES = {
     "contacts": "Frequent recipients and confirmed aliases",
     "projects": "Project context and recurring work references",
     "corrections": "User corrections and how to apply them",
+    "relations": "People in the user's life and their roles",
 }
 
 LINE_SORT_ORDER = [
@@ -55,7 +57,7 @@ LINE_SORT_ORDER = [
     "Correction",
 ]
 
-ALL_TOPICS = ("identity", "preferences", "workflow", "contacts", "projects", "corrections")
+ALL_TOPICS = ("identity", "preferences", "workflow", "contacts", "projects", "corrections", "relations")
 
 
 @dataclass(frozen=True)
@@ -239,6 +241,32 @@ def _render_event_lines(event: MemoryEvent) -> list[str]:
         except Exception:
             return []
 
+    # D4: routines — emit a parseable single-line summary so the profile
+    # snapshot can read them back without re-touching the journal.
+    if key in {"workflow.morning_routine", "workflow.daily_briefing"} or key.startswith("workflow.recurring_request"):
+        routine = _clean_text(value.get("routine") or value.get("name"))
+        if not routine:
+            return []
+        cadence = _clean_text(value.get("cadence") or value.get("frequency") or "daily")
+        clock = _clean_text(value.get("time"))
+        tz = _clean_text(value.get("timezone"))
+        items_field = value.get("items") or value.get("steps") or []
+        if isinstance(items_field, str):
+            items_field = [items_field]
+        items = [_clean_text(i) for i in items_field if _clean_text(i)] if isinstance(items_field, list) else []
+
+        schedule_parts = [cadence] if cadence else []
+        if clock:
+            schedule_parts.append(clock)
+        if tz:
+            schedule_parts.append(tz)
+        schedule = " ".join(schedule_parts) or "daily"
+
+        line = f"- Routine: {routine} | {schedule}"
+        if items:
+            line += f" | items: {', '.join(items)}"
+        return [line]
+
     if key.startswith("contacts.frequent_recipient."):
         email = _clean_text(value.get("email"))
         if not email:
@@ -259,6 +287,14 @@ def _render_event_lines(event: MemoryEvent) -> list[str]:
         if summary:
             return [f"- Project: {name} — {summary}"]
         return [f"- Project: {name}"]
+
+    if event.topic == "relations" and key.startswith("relations."):
+        role = _clean_text(value.get("role") or key.split(".", 1)[-1])
+        name = _clean_text(value.get("name"))
+        if not name:
+            return []
+        label = role.replace("_", " ").title() if role else "Person"
+        return [f"- {label}: {name}"]
 
     if event.topic == "corrections":
         summary = _clean_text(value.get("summary") or value.get("text"))

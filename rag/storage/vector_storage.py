@@ -19,16 +19,30 @@ from core.io_atomic import atomic_write_json
 class VectorStorage:
     """FAISS-based vector storage for conversation chunks"""
     
-    def __init__(self, storage_dir: Optional[str] = None, embedding_dimension: int = 1024):
+    def __init__(
+        self,
+        user_id: Optional[str] = None,
+        *,
+        storage_dir: Optional[str] = None,
+        embedding_dimension: int = 1024,
+    ):
         """
-        Initialize FAISS vector storage
-        
+        Initialize FAISS vector storage.
+
         Args:
-            storage_dir: Directory to store FAISS index and metadata
-            embedding_dimension: Dimension of embeddings (1024 for Cohere embed-english-v3.0)
+            user_id: Tenant identifier. Required unless ``storage_dir`` is set.
+            storage_dir: Explicit directory for tests / single-tenant callers.
+                When provided, ``user_id`` may be omitted.
+            embedding_dimension: Dimension of embeddings (1024 for Cohere embed-english-v3.0).
         """
         ensure_dirs()
-        self.storage_dir = Path(storage_dir) if storage_dir else rag_vector_dir("default")
+        if storage_dir is not None:
+            self.storage_dir = Path(storage_dir)
+        else:
+            if not user_id:
+                raise ValueError("VectorStorage requires either user_id or storage_dir")
+            self.storage_dir = rag_vector_dir(user_id)
+        self.user_id = user_id
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
         self.embedding_dimension = embedding_dimension
@@ -406,23 +420,33 @@ class VectorStorage:
         return total_size / (1024 * 1024)  # Convert to MB
 
 
-# Global vector storage instance
-vector_storage = None
+# Per-tenant vector storage cache (one VectorStorage per user_id). Naive
+# unbounded dict for now — swap for an LRU when we have many active users.
+_vector_storage_by_user: Dict[str, VectorStorage] = {}
 
-def get_vector_storage() -> VectorStorage:
-    """Get global vector storage instance"""
-    global vector_storage
-    if vector_storage is None:
-        vector_storage = VectorStorage()
-    return vector_storage
 
-def add_to_vector_db(chunks: List[Dict[str, Any]], embeddings: np.ndarray):
-    """Convenience function to add chunks to vector storage"""
-    storage = get_vector_storage()
-    storage.add_chunks(chunks, embeddings)
+def get_vector_storage(user_id: str) -> VectorStorage:
+    """Return the cached VectorStorage for ``user_id`` (constructed on first use)."""
+    if not user_id:
+        raise ValueError("get_vector_storage requires a user_id")
+    store = _vector_storage_by_user.get(user_id)
+    if store is None:
+        store = VectorStorage(user_id=user_id)
+        _vector_storage_by_user[user_id] = store
+    return store
 
-def search_vector_db(query_embedding: np.ndarray, top_k: int = 5, threshold: float = 0.7) -> List[Dict[str, Any]]:
-    """Convenience function to search vector storage"""
-    storage = get_vector_storage()
-    return storage.search_similar(query_embedding, top_k, threshold)
+
+def add_to_vector_db(user_id: str, chunks: List[Dict[str, Any]], embeddings: np.ndarray):
+    """Convenience function to add chunks to a user's vector storage."""
+    get_vector_storage(user_id).add_chunks(chunks, embeddings)
+
+
+def search_vector_db(
+    user_id: str,
+    query_embedding: np.ndarray,
+    top_k: int = 5,
+    threshold: float = 0.7,
+) -> List[Dict[str, Any]]:
+    """Convenience function to search a user's vector storage."""
+    return get_vector_storage(user_id).search_similar(query_embedding, top_k, threshold)
 

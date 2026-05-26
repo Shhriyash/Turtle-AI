@@ -3,19 +3,39 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
+from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
+)
+from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.groq import GroqModel
 from pydantic_ai.models.openrouter import OpenRouterModel
+from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.settings import ModelSettings
 
-OPENROUTER_DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b:free"
+try:
+    import logfire as _logfire  # type: ignore
+except Exception:
+    _logfire = None  # type: ignore
+
+OPENROUTER_DEFAULT_MODEL = "google/gemini-2.5-flash"
 GROQ_DEFAULT_PRIMARY_MODEL = "llama-3.3-70b-versatile"
 GROQ_DEFAULT_FALLBACK_MODEL = "llama-3.1-8b-instant"
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
 OPENROUTER_KEY_ENV_VARS = [
     "OPEN_ROUTER_API_KEY_1",
     "OPEN_ROUTER_API_KEY_2",
     "OPEN_ROUTER_API_KEY_3",
+]
+GEMINI_KEY_ENV_VARS = [
+    "GEMINI_API_KEY",
+    "GEMINI_API_KEY_2",
+    "GEMINI_API_KEY_3",
 ]
 
 
@@ -59,6 +79,38 @@ def get_openrouter_models(model_name: str | None = None, settings: ModelSettings
     return models
 
 
+def get_gemini_keys() -> list[str]:
+    """Direct Google AI Studio (generativelanguage.googleapis.com) keys."""
+    keys: list[str] = []
+    for name in GEMINI_KEY_ENV_VARS:
+        value = os.getenv(name)
+        if value:
+            keys.append(value)
+    # Optional Google-canonical alias for the single-key case.
+    single_key = os.getenv("GOOGLE_API_KEY")
+    if single_key and single_key not in keys:
+        keys.append(single_key)
+    return keys
+
+
+def get_google_models(
+    model_name: str | None = None,
+    settings: ModelSettings | None = None,
+) -> list[GoogleModel]:
+    """One GoogleModel per available Gemini API key.
+
+    Going direct to Google avoids the OpenRouter latency hop and is materially
+    cheaper than the same model via OpenRouter. Returned in env-var order so
+    callers can stack them as round-robin fallbacks.
+    """
+    model = model_name or os.getenv("GEMINI_MODEL", GEMINI_DEFAULT_MODEL)
+    models: list[GoogleModel] = []
+    for api_key in get_gemini_keys():
+        provider = GoogleProvider(api_key=api_key)
+        models.append(GoogleModel(model, provider=provider, settings=settings))
+    return models
+
+
 def get_groq_model(model_name: str | None = None, settings: ModelSettings | None = None) -> GroqModel | None:
     api_key = os.getenv("GROQ_API_KEY") or os.getenv("GROQ_API_KEY2")
     if not api_key:
@@ -91,6 +143,12 @@ def is_key_failure_error(exc: Exception) -> bool:
         "render tokens with harmony",
         "harmonyerror",
         "encodingerror",
+        # Gemini direct is strict about function-call / function-response
+        # adjacency in message_history. Groq/OpenRouter tolerate gaps; Google
+        # 400s. Treat as a provider-compat failure so the cascade can skip past
+        # Gemini-direct rungs to a more lenient backend (Groq llama).
+        "function response turn comes immediately after a function call",
+        "function call turn",
     ]
     if isinstance(exc, ModelHTTPError):
         if exc.status_code in {401, 403, 404, 429}:
@@ -146,6 +204,102 @@ def _is_retryable_upstream_error(exc: Exception) -> bool:
     return any(token in message for token in ["connection", "timeout", "eof", "reset", "service unavailable"])
 
 
+def _is_output_validation_error(exc: Exception) -> bool:
+    """True when pydantic_ai gave up on a model's structured output / tool-call args.
+
+    The model returned syntactically OK content that didn't match the declared
+    schema, and pydantic_ai exhausted its in-band retries. Falling over to a
+    different provider is the right move — same-model retries rarely fix
+    schema-shape problems, but a different provider's serializer often will.
+    """
+    if isinstance(exc, UnexpectedModelBehavior):
+        return True
+    message = str(exc).lower()
+    return (
+        "exceeded maximum retries" in message
+        and "output validation" in message
+    )
+
+
+def _sanitize_message_history(messages: list[ModelMessage] | None) -> list[ModelMessage] | None:
+    """Phase 5 / A5: drop ToolCallPart entries with empty tool_name.
+
+    pydantic-ai's message round-tripping can occasionally serialize a tool
+    call whose function name is the empty string (observed against Groq's
+    Harmony tool-render path → 400 'tools should have a name'). One such
+    message in the history wipes the *entire* fallback chain — every
+    OpenAI-compat provider rejects the same body. This sanitizer drops the
+    broken part and any orphaned ToolReturnPart that refers to its
+    tool_call_id, so the cascade survives the bug regardless of which model
+    is downstream.
+
+    Returns the (possibly trimmed) list, or the original `messages` value
+    when no change is needed.
+    """
+    if not messages:
+        return messages
+
+    dropped_tool_call_ids: set[str] = set()
+    changed = False
+    cleaned: list[ModelMessage] = []
+
+    for msg in messages:
+        if isinstance(msg, ModelResponse):
+            new_parts = []
+            for part in msg.parts:
+                if isinstance(part, ToolCallPart) and not (part.tool_name or "").strip():
+                    if part.tool_call_id:
+                        dropped_tool_call_ids.add(part.tool_call_id)
+                    changed = True
+                    if _logfire is not None:
+                        try:
+                            _logfire.error(
+                                "tool_call_missing_name",
+                                tool_call_id=part.tool_call_id,
+                                args=str(part.args)[:200],
+                            )
+                        except Exception:
+                            pass
+                    print(
+                        f"LOG: sanitizer dropped ToolCallPart with empty tool_name "
+                        f"(tool_call_id={part.tool_call_id!r})"
+                    )
+                    continue
+                new_parts.append(part)
+            if not new_parts:
+                # Empty response after sanitization — drop the whole message
+                # rather than emit a malformed empty ModelResponse.
+                continue
+            if len(new_parts) != len(msg.parts):
+                cleaned.append(ModelResponse(parts=new_parts))
+            else:
+                cleaned.append(msg)
+        elif isinstance(msg, ModelRequest):
+            new_parts = []
+            for part in msg.parts:
+                if (
+                    isinstance(part, ToolReturnPart)
+                    and part.tool_call_id in dropped_tool_call_ids
+                ):
+                    changed = True
+                    print(
+                        f"LOG: sanitizer dropped orphan ToolReturnPart "
+                        f"(tool_call_id={part.tool_call_id!r})"
+                    )
+                    continue
+                new_parts.append(part)
+            if not new_parts:
+                continue
+            if len(new_parts) != len(msg.parts):
+                cleaned.append(ModelRequest(parts=new_parts))
+            else:
+                cleaned.append(msg)
+        else:
+            cleaned.append(msg)
+
+    return cleaned if changed else messages
+
+
 async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any], *args: Any, **kwargs: Any):
     """Run the primary agent, falling over to fallbacks on key/rate/tool-render failures.
 
@@ -154,16 +308,39 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
     - 5xx / transient network → model swap
     - Other 400 (bad args, validation) → propagate immediately; caller handles
       semantically (clarify, ask again) rather than burning another model.
+
+    A2: agents in cooldown (recent transient/deterministic failure) are
+    skipped; only fully-cooled-down agents are attempted.
     """
+    from core import health_tracker
+
+    # A5: sanitize outgoing message_history before any provider sees it.
+    if "message_history" in kwargs:
+        kwargs["message_history"] = _sanitize_message_history(kwargs["message_history"])
+
     agents = [primary_agent] + (fallback_agents or [])
+    eligible = [a for a in agents if not health_tracker.is_cooling(a)]
+    if not eligible:
+        # Every model is cooling — bypass cooldowns rather than fail outright,
+        # but warn so the operator sees it.
+        print("LOG: all agents in cooldown; bypassing health tracker for this call")
+        eligible = agents
+
     last_exc: Exception | None = None
-    for idx, agent in enumerate(agents):
+    for idx, agent in enumerate(eligible):
         try:
-            return await agent.run(*args, **kwargs)
+            result = await agent.run(*args, **kwargs)
+            health_tracker.mark_success(agent)
+            return result
         except Exception as exc:
             last_exc = exc
-            should_fallback = is_key_failure_error(exc) or _is_retryable_upstream_error(exc)
-            if idx < len(agents) - 1 and should_fallback:
+            health_tracker.mark_failure(agent, exc)
+            should_fallback = (
+                is_key_failure_error(exc)
+                or _is_retryable_upstream_error(exc)
+                or _is_output_validation_error(exc)
+            )
+            if idx < len(eligible) - 1 and should_fallback:
                 _fallback_log(exc)
                 continue
             raise
@@ -174,15 +351,32 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
 
 def run_agent_sync_with_fallbacks(primary_agent: Any, fallback_agents: list[Any], *args: Any, **kwargs: Any):
     """Sync variant — same fallback strategy as run_agent_with_fallbacks."""
+    from core import health_tracker
+
+    if "message_history" in kwargs:
+        kwargs["message_history"] = _sanitize_message_history(kwargs["message_history"])
+
     agents = [primary_agent] + (fallback_agents or [])
+    eligible = [a for a in agents if not health_tracker.is_cooling(a)]
+    if not eligible:
+        print("LOG: all agents in cooldown; bypassing health tracker for this call")
+        eligible = agents
+
     last_exc: Exception | None = None
-    for idx, agent in enumerate(agents):
+    for idx, agent in enumerate(eligible):
         try:
-            return agent.run_sync(*args, **kwargs)
+            result = agent.run_sync(*args, **kwargs)
+            health_tracker.mark_success(agent)
+            return result
         except Exception as exc:
             last_exc = exc
-            should_fallback = is_key_failure_error(exc) or _is_retryable_upstream_error(exc)
-            if idx < len(agents) - 1 and should_fallback:
+            health_tracker.mark_failure(agent, exc)
+            should_fallback = (
+                is_key_failure_error(exc)
+                or _is_retryable_upstream_error(exc)
+                or _is_output_validation_error(exc)
+            )
+            if idx < len(eligible) - 1 and should_fallback:
                 _fallback_log(exc)
                 continue
             raise

@@ -321,9 +321,9 @@ OUTPUT_RETRIES = 3
 SESSION_RESTORE_MODE = os.getenv("SESSION_RESTORE_MODE", "strict_new")
 ACTIVE_HISTORY_MAX_TURNS = int(os.getenv("TURTLE_HISTORY_MAX_TURNS", os.getenv("ACTIVE_HISTORY_MAX_TURNS", "12")))
 ACTIVE_HISTORY_MAX_MESSAGES = int(os.getenv("ACTIVE_HISTORY_MAX_MESSAGES", "40"))
-ACTIVE_HISTORY_MAX_TOKENS = int(os.getenv("TURTLE_HISTORY_MAX_TOKENS", "12000"))
-MEMORY_FLUSH_TURNS = int(os.getenv("TURTLE_MEMORY_FLUSH_TURNS", "20"))
-MEMORY_FLUSH_TOKENS = int(os.getenv("TURTLE_MEMORY_FLUSH_TOKENS", "20000"))
+ACTIVE_HISTORY_MAX_TOKENS = int(os.getenv("TURTLE_HISTORY_MAX_TOKENS", "4000"))
+MEMORY_FLUSH_TURNS = int(os.getenv("TURTLE_MEMORY_FLUSH_TURNS", "8"))
+MEMORY_FLUSH_TOKENS = int(os.getenv("TURTLE_MEMORY_FLUSH_TOKENS", "6000"))
 MEMORY_PROFILE_MAX_LINES = int(os.getenv("TURTLE_MEMORY_PROFILE_MAX_LINES", "6"))
 PERSONAL_MEMORY_ENABLED = os.getenv("TURTLE_PERSONAL_MEMORY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 PERSONAL_MEMORY_MAX_BYTES = int(os.getenv("TURTLE_PERSONAL_MEMORY_MAX_BYTES", "2048"))
@@ -437,7 +437,7 @@ def _maybe_handle_confirmation_turn(state: SharedState, user_text: str) -> str |
         return None
 
     if _wants_preview(user_text):
-        preview = state.confirmation_gate.preview_pending(prompt.event_id)
+        preview = state.confirmation_gate.preview_pending(list(prompt.all_event_ids))
         if preview:
             return preview
 
@@ -445,9 +445,14 @@ def _maybe_handle_confirmation_turn(state: SharedState, user_text: str) -> str |
     if accepted is None:
         return f"Quick check: {prompt.question} Please answer yes or no, or say 'show me' to see what I'd save."
 
-    state.confirmation_gate.record_response(prompt.event_id, accepted=accepted)
+    for event_id in prompt.all_event_ids:
+        state.confirmation_gate.record_response(event_id, accepted=accepted)
     if accepted:
+        if len(prompt.all_event_ids) > 1:
+            return "Got it. I will remember those."
         return "Got it. I will remember that."
+    if len(prompt.all_event_ids) > 1:
+        return "Understood. I will not store those."
     return "Understood. I will not store that preference."
 
 
@@ -1621,7 +1626,7 @@ async def voice_chat():
             ),
         )
         task_history_store = TaskHistoryStore(TASK_HISTORY_FILE)
-        rag_system = TurtleRAGSystem()
+        rag_system = TurtleRAGSystem(user_id="local_voice_user")
         retrieval_broker = RetrievalBroker(
             store=personal_memory_store,
             task_store=task_history_store,
@@ -1856,7 +1861,7 @@ async def text_mode_chat():
             ),
         )
         task_history_store = TaskHistoryStore(TASK_HISTORY_FILE)
-        rag_system = TurtleRAGSystem()
+        rag_system = TurtleRAGSystem(user_id="local_voice_user")
         retrieval_broker = RetrievalBroker(
             store=personal_memory_store,
             task_store=task_history_store,

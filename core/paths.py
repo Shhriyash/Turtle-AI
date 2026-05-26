@@ -10,7 +10,11 @@ OUTPUT_DIR = ROOT_DIR / "output"
 MEMORY_DIR = DATA_DIR / "memory"
 PERSONAL_MEMORY_DIR = MEMORY_DIR / "personal"
 PERSONAL_MEMORY_SNAPSHOTS_DIR = PERSONAL_MEMORY_DIR / "snapshots"
-# Deprecated globals (will migrate to dynamic methods)
+# Deprecated single-tenant memory paths. Retained only for the legacy voice
+# CLI (apps/turtle_voice.py), the offline eval, and the one-shot migration
+# script. The web server (apps/turtle_server.py) no longer instantiates the
+# old MemoryStore on these paths — per-user state lives under
+# personal_memory_dir(user_id).
 MEMORY_PROFILE_FILE = MEMORY_DIR / "profile.json"
 MEMORY_EVENTS_FILE = MEMORY_DIR / "events.jsonl"
 MEMORY_EPISODES_FILE = MEMORY_DIR / "episodes.jsonl"
@@ -26,7 +30,9 @@ ACTIVE_SESSION_DIR = SESSIONS_DIR / "active"
 SESSION_ARCHIVE_DIR = SESSIONS_DIR / "archive"
 
 def personal_memory_dir(user_id: str) -> Path:
-    path = PERSONAL_MEMORY_DIR
+    if not user_id:
+        raise ValueError("user_id is required")
+    path = PERSONAL_MEMORY_DIR / user_id
     path.mkdir(parents=True, exist_ok=True)
     return path
 

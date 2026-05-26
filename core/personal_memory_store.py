@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Any
 
 from core.io_atomic import atomic_write_text
 from core.worker import queue_service
+from core.guardrails import enforce_storage_cap
 from core.paths import personal_memory_dir, personal_memory_file
 from core.personal_memory_schema import (
     MarkdownMemoryDocument,
@@ -49,6 +51,7 @@ class PersonalMemoryStore:
             "contacts": personal_memory_file(user_id, "contacts.md"),
             "projects": personal_memory_file(user_id, "projects.md"),
             "corrections": personal_memory_file(user_id, "corrections.md"),
+            "relations": personal_memory_file(user_id, "relations.md"),
             "working_style": personal_memory_file(user_id, "working_style.md"),
             "communication_style": personal_memory_file(user_id, "communication_style.md"),
             "tool_preferences": personal_memory_file(user_id, "tool_preferences.md"),
@@ -118,6 +121,13 @@ class PersonalMemoryStore:
 
         lines = content if isinstance(content, str) else list(content)
         serialized = serialize_markdown_memory(normalized_metadata, lines)
+        # Phase 6: enforce per-user storage cap before writing.
+        try:
+            existing_size = path.stat().st_size if path.exists() else 0
+        except OSError:
+            existing_size = 0
+        delta = max(0, len(serialized.encode("utf-8")) - existing_size)
+        enforce_storage_cap(self.user_id, self.base_dir, incoming_bytes=delta)
         atomic_write_text(path, serialized)
         
         # D5/G3: Enqueue embedding job
@@ -213,6 +223,7 @@ class PersonalMemoryStore:
                 profile["preferences"]["email_tone"] = content.split(":", 1)[1].strip() or None
 
         workflow = self.load_topic("workflow")
+        routines: list[dict[str, Any]] = []
         for line in workflow.lines:
             content = self._strip_bullet(line)
             lowered = content.lower()
@@ -227,6 +238,11 @@ class PersonalMemoryStore:
                     pass
             elif lowered.startswith("preferred primary model:"):
                 profile["tool_preferences"]["primary_llm"] = content.split(":", 1)[1].strip() or None
+            elif lowered.startswith("routine:"):
+                parsed = self._parse_routine_line(content)
+                if parsed is not None:
+                    routines.append(parsed)
+        profile["workflow"]["routines"] = routines
 
         contacts = self.load_topic("contacts")
         recipients: list[str] = []
@@ -274,6 +290,40 @@ class PersonalMemoryStore:
             atomic_write_text(self.index_path, "")
 
     @staticmethod
+    def _parse_routine_line(content: str) -> dict[str, Any] | None:
+        """D4: parse a `Routine: <name> | <schedule> | items: a, b` line.
+
+        Schedule is `<cadence>[ <HH:MM>][ <timezone>]`. Items section is optional.
+        Returns a dict with keys: routine, cadence, time?, timezone?, items?.
+        """
+        body = content.split(":", 1)[1].strip() if ":" in content else ""
+        if not body:
+            return None
+        parts = [p.strip() for p in body.split("|")]
+        if not parts or not parts[0]:
+            return None
+        routine = parts[0]
+        out: dict[str, Any] = {"routine": routine}
+        if len(parts) >= 2 and parts[1]:
+            tokens = parts[1].split()
+            if tokens:
+                out["cadence"] = tokens[0].lower()
+            for tok in tokens[1:]:
+                if re.match(r"^([01]?\d|2[0-3]):[0-5]\d$", tok):
+                    hh, mm = tok.split(":")
+                    out["time"] = f"{int(hh):02d}:{mm}"
+                elif "/" in tok or tok == "UTC":
+                    out["timezone"] = tok
+        for seg in parts[2:]:
+            low = seg.lower()
+            if low.startswith("items:"):
+                items_raw = seg.split(":", 1)[1]
+                items = [i.strip() for i in items_raw.split(",") if i.strip()]
+                if items:
+                    out["items"] = items
+        return out
+
+    @staticmethod
     def _strip_bullet(line: str) -> str:
         stripped = str(line).strip()
         if stripped.startswith("- "):
@@ -292,7 +342,7 @@ class PersonalMemoryStore:
     @staticmethod
     def _topic_to_schema_type(topic_name: str) -> str:
         topic = topic_name
-        if topic.endswith("s") and topic[:-1] in {"preference", "contact", "project", "correction"}:
+        if topic.endswith("s") and topic[:-1] in {"preference", "contact", "project", "correction", "relation"}:
             return topic[:-1]
         return topic
 

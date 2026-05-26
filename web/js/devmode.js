@@ -44,17 +44,28 @@ export function toggleDevPanel() {
 /** Load current config and model lists from the server */
 export async function loadDevConfig() {
     try {
-        const [modelsRes, configRes] = await Promise.all([
+        const [modelsRes, configRes, agentsRes] = await Promise.all([
             fetch('/api/models'),
             fetch('/api/config'),
+            fetch('/api/agents'),
         ]);
         const models = await modelsRes.json();
         const cfg = await configRes.json();
+        const agentsPayload = await agentsRes.json().catch(() => ({ agents: [] }));
+        renderAgentsList(agentsPayload.agents || []);
 
         // Agent model overrides (prefixed: "groq:..." or "openrouter:...")
         populateSelect('dev-main-agent-model', models.all_models, cfg.MAIN_AGENT_MODEL);
         populateSelect('dev-email-agent-model', models.all_models, cfg.EMAIL_AGENT_MODEL);
         populateSelect('dev-dream-agent-model', models.all_models, cfg.DREAM_PASS_AGENT_MODEL);
+
+        // Router uses AsyncGroq directly — Groq-only list, prefixed with "groq:" for consistency.
+        const groqPrefixed = (models.groq_models || []).map(m => `groq:${m}`);
+        populateSelect('dev-router-agent-model', groqPrefixed, cfg.ROUTER_AGENT_MODEL);
+
+        // Dream Pass enabled toggle
+        const dreamToggle = document.getElementById('dev-dream-pass-enabled');
+        if (dreamToggle) dreamToggle.checked = !!cfg.PERSONAL_MEMORY_DREAM_PASS_ENABLED;
 
         // Fallback pools
         populateSelect('dev-openrouter-model', models.openrouter_models, cfg.OPEN_ROUTER_MODEL);
@@ -78,6 +89,23 @@ export async function loadDevConfig() {
         bindTtsSpeedPreview();
     } catch (e) {
         showToast('Failed to load config', true);
+    }
+}
+
+/** Render the read-only runtime agents list */
+function renderAgentsList(agents) {
+    const container = document.getElementById('dev-agents-list');
+    if (!container) return;
+    container.innerHTML = '';
+    for (const a of agents) {
+        const row = document.createElement('div');
+        row.className = 'dev-agent-row';
+        const editableTag = a.editable ? '' : ' (read-only)';
+        row.innerHTML = `
+            <div class="dev-agent-label">${a.label}<span class="dev-agent-status" data-status="${a.status}">${a.status}${editableTag}</span></div>
+            <div class="dev-agent-model">${a.model}</div>
+        `;
+        container.appendChild(row);
     }
 }
 
@@ -109,6 +137,8 @@ export async function applyDevConfig() {
         MAIN_AGENT_MODEL: document.getElementById('dev-main-agent-model').value,
         EMAIL_AGENT_MODEL: document.getElementById('dev-email-agent-model').value,
         DREAM_PASS_AGENT_MODEL: document.getElementById('dev-dream-agent-model').value,
+        ROUTER_AGENT_MODEL: document.getElementById('dev-router-agent-model').value,
+        PERSONAL_MEMORY_DREAM_PASS_ENABLED: document.getElementById('dev-dream-pass-enabled').checked,
         OPEN_ROUTER_MODEL: document.getElementById('dev-openrouter-model').value,
         GROQ_PRIMARY_MODEL: document.getElementById('dev-groq-model').value,
         GROQ_FALLBACK_MODEL: document.getElementById('dev-groq-fallback').value,
@@ -138,9 +168,11 @@ export async function applyDevConfig() {
 /** Reset all fields to defaults and apply */
 export async function resetDevDefaults() {
     const defaults = {
-        MAIN_AGENT_MODEL: 'openrouter:openai/gpt-oss-120b',
+        MAIN_AGENT_MODEL: 'groq:openai/gpt-oss-120b',
         EMAIL_AGENT_MODEL: 'groq:llama-3.3-70b-versatile',
         DREAM_PASS_AGENT_MODEL: '',
+        ROUTER_AGENT_MODEL: 'groq:llama-3.1-8b-instant',
+        PERSONAL_MEMORY_DREAM_PASS_ENABLED: false,
         OPEN_ROUTER_MODEL: 'nvidia/llama-3.1-nemotron-70b-instruct:free',
         GROQ_PRIMARY_MODEL: 'llama-3.3-70b-versatile',
         GROQ_FALLBACK_MODEL: 'llama-3.1-8b-instant',

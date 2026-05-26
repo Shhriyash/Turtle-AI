@@ -36,3 +36,7 @@ websockets>=15.0
 # Observability
 logfire==4.27.0
 
+# Scheduler (Phase 4 / E1)
+apscheduler>=3.10.4
+sqlalchemy>=2.0
+

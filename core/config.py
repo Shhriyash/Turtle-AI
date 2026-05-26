@@ -16,9 +16,13 @@ from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_ENV_FILE = _PROJECT_ROOT / ".env"
+
+
 class TurtleSettings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -75,14 +79,56 @@ class TurtleSettings(BaseSettings):
     tts_debug: bool = Field(default=False, alias="TTS_DEBUG")
     tool_output_max_chars: int = Field(default=4000, alias="TURTLE_TOOL_OUTPUT_MAX_CHARS")
 
+    # Branding — bot's outbound email identity (used by the email agent
+    # prompt and the magic-link onboarding sender).
+    bot_email: str = Field(default="iamturtleai@gmail.com", alias="TURTLE_BOT_EMAIL")
+
+    # Dev-only escape hatch: when set, WebSocket connections without a token
+    # resolve to a shared local_dev_user instead of being rejected. Must NEVER
+    # be enabled in cloud / shared deployments.
+    dev_anon: bool = Field(default=False, alias="TURTLE_DEV_ANON")
+
+    # Magic-link onboarding (Phase 4)
+    magic_link_jwt_ttl_minutes: int = Field(
+        default=15, alias="TURTLE_MAGIC_LINK_TTL_MINUTES"
+    )
+    session_cookie_ttl_days: int = Field(
+        default=90, alias="TURTLE_SESSION_COOKIE_TTL_DAYS"
+    )
+    public_base_url: str = Field(
+        default="http://127.0.0.1:8765", alias="TURTLE_PUBLIC_BASE_URL"
+    )
+    onboarding_rate_limit_per_hour: int = Field(
+        default=5, alias="TURTLE_ONBOARDING_RATE_LIMIT_PER_HOUR"
+    )
+
+    # Phase 6: production guardrails
+    # Hard cap on bytes stored under personal_memory_dir(user_id). Writes that
+    # would push the directory past this cap raise StorageCapExceededError so
+    # the UI can prompt the user to trim. 0 disables the cap.
+    user_storage_cap_mb: int = Field(
+        default=50, alias="TURTLE_USER_STORAGE_CAP_MB"
+    )
+    # Per-user WebSocket message rate limits. 0 disables.
+    ws_messages_per_hour: int = Field(
+        default=60, alias="TURTLE_WS_MESSAGES_PER_HOUR"
+    )
+    ws_messages_per_day: int = Field(
+        default=1000, alias="TURTLE_WS_MESSAGES_PER_DAY"
+    )
+    # Phase 7: gate /admin/* endpoints. None = endpoints return 503.
+    admin_token: Optional[SecretStr] = Field(default=None, alias="TURTLE_ADMIN_TOKEN")
+
     # -----------------------------------------------------------------------
     # Memory Subsystem
     # -----------------------------------------------------------------------
     personal_memory_enabled: bool = Field(
         default=True, alias="TURTLE_PERSONAL_MEMORY_ENABLED"
     )
+    # Phase 6: dream pass disabled by default in prod until observed on
+    # 2-3 real users' journals. Re-enable explicitly via env when ready.
     personal_memory_dream_pass_enabled: bool = Field(
-        default=True, alias="TURTLE_PERSONAL_MEMORY_DREAM_PASS_ENABLED"
+        default=False, alias="TURTLE_PERSONAL_MEMORY_DREAM_PASS_ENABLED"
     )
     personal_memory_stage_b_enabled: bool = Field(
         default=True, alias="TURTLE_PERSONAL_MEMORY_STAGE_B_ENABLED"
@@ -112,6 +158,18 @@ class TurtleSettings(BaseSettings):
     reflect_idle_seconds: int = Field(default=1800, alias="TURTLE_REFLECT_IDLE_SECONDS")
     reflect_max_consecutive_failures: int = Field(
         default=3, alias="TURTLE_REFLECT_MAX_CONSECUTIVE_FAILURES"
+    )
+
+    # Phase 1 / A3: cap on planner cascade size. With 3 Gemini + 3 OpenRouter
+    # keys the unbounded pool reaches 7 attempts per planner call, which is
+    # the dominant cost of a single news/search turn. 4 = primary + 3 fallbacks.
+    planner_max_agents: int = Field(default=4, alias="TURTLE_PLANNER_MAX_AGENTS")
+
+    # Phase 2 / B1+B2: per-turn memory extraction looks at the last N user+
+    # assistant messages so multi-turn flows ("save as routine" -> "every day"
+    # -> "8 am") can be parsed coherently. 6 = roughly 3 user turns + 3 replies.
+    memory_extract_window_turns: int = Field(
+        default=6, alias="TURTLE_MEMORY_EXTRACT_WINDOW_TURNS"
     )
 
     @property

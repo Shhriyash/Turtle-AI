@@ -39,7 +39,27 @@ class IdentityManager:
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
                 )'''
             )
+            await db.execute(
+                '''CREATE TABLE IF NOT EXISTS claimed_tokens (
+                    jti TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )'''
+            )
             await db.commit()
+
+    async def mark_token_claimed(self, jti: str, user_id: str) -> bool:
+        """Insert jti into claimed_tokens. Returns True on first claim, False if already present."""
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                await db.execute(
+                    "INSERT INTO claimed_tokens (jti, user_id) VALUES (?, ?)",
+                    (jti, user_id),
+                )
+                await db.commit()
+                return True
+            except aiosqlite.IntegrityError:
+                return False
 
     async def resolve_user(self, channel: str, channel_user_id: str) -> str:
         """Resolve a channel user ID to a canonical internal UserId. Creates one if missing."""

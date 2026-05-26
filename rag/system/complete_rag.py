@@ -36,19 +36,34 @@ load_env()
 class TurtleRAGSystem:
     """Complete RAG system for Turtle conversation history"""
     
-    def __init__(self, storage_dir: Optional[str] = None):
-        """Initialize the complete RAG system"""
+    def __init__(self, user_id: Optional[str] = None, storage_dir: Optional[str] = None):
+        """Initialize the complete RAG system for a specific tenant.
+
+        Args:
+            user_id: Tenant identifier. Required unless ``storage_dir`` is
+                provided (tests pass ``storage_dir`` directly and inject a
+                mocked vector store).
+            storage_dir: Override for the per-session JSON staging directory.
+        """
         ensure_dirs()
-        self.storage_dir = Path(storage_dir) if storage_dir else RAG_DATA_DIR
+        if storage_dir is not None:
+            self.storage_dir = Path(storage_dir)
+        else:
+            self.storage_dir = RAG_DATA_DIR
         self.storage_dir.mkdir(parents=True, exist_ok=True)
-        
+        self.user_id = user_id
+
         # Temp JSON file for current session
         self.temp_session_file = self.storage_dir / "current_session.json"
-        
+
         # Initialize components
         self.embedder = get_embedding_model()
         self.chunker = get_chunker()
-        self.vector_store = get_vector_storage()
+        if user_id:
+            self.vector_store = get_vector_storage(user_id)
+        else:
+            # Test / legacy path — caller is expected to mock vector_store.
+            self.vector_store = None
         self._vector_lock = threading.Lock()
         
         # Current session tracking

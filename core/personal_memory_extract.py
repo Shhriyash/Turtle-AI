@@ -15,6 +15,66 @@ from core.memory_extractor import extract_memory_event_specs
 
 
 
+_ROUTINE_KEY_PREFIXES = ("workflow.morning_routine", "workflow.daily_briefing", "workflow.recurring_request")
+_IANA_TZ_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+\-]*(?:/[A-Za-z][A-Za-z0-9_+\-]*)+$|^UTC$")
+_CLOCK_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+_VALID_CADENCES = {"daily", "weekly", "weekday", "weekdays", "weekend", "weekends", "monthly", "hourly"}
+
+
+def is_routine_key(key: str) -> bool:
+    return any(key == p or key.startswith(p + ".") or key.startswith(p + ":") for p in _ROUTINE_KEY_PREFIXES)
+
+
+def _validate_routine_value(value: dict[str, Any]) -> dict[str, Any] | None:
+    """D1: validate the extended routine value shape.
+
+    Required: routine (or name) AND cadence.
+    Optional but validated when present: time (HH:MM), timezone (IANA-ish).
+    items normalized to a list of strings.
+    Returns the normalized dict, or None if the shape is unusable.
+    """
+    if not isinstance(value, dict):
+        return None
+    routine = value.get("routine") or value.get("name")
+    cadence_raw = value.get("cadence") or value.get("frequency")
+    if not (isinstance(routine, str) and routine.strip()):
+        return None
+    if not (isinstance(cadence_raw, str) and cadence_raw.strip()):
+        return None
+    cadence = cadence_raw.strip().lower()
+    if cadence not in _VALID_CADENCES:
+        # Unknown cadence: allow through but normalize whitespace; the scheduler
+        # in Phase 4 will reject anything it can't translate to a cron trigger.
+        cadence = cadence_raw.strip().lower()
+
+    normalized: dict[str, Any] = {"routine": routine.strip(), "cadence": cadence}
+
+    items = value.get("items") or value.get("steps") or []
+    if isinstance(items, str):
+        items = [items]
+    if isinstance(items, list):
+        norm_items = [str(i).strip() for i in items if str(i).strip()]
+        if norm_items:
+            normalized["items"] = norm_items
+
+    time_raw = value.get("time")
+    if isinstance(time_raw, str) and time_raw.strip():
+        t = time_raw.strip()
+        if _CLOCK_RE.match(t):
+            # Zero-pad single-digit hours so "8:00" stays "08:00".
+            hh, mm = t.split(":")
+            normalized["time"] = f"{int(hh):02d}:{mm}"
+        # Silently drop invalid clock strings rather than half-store.
+
+    tz_raw = value.get("timezone") or value.get("tz")
+    if isinstance(tz_raw, str) and tz_raw.strip():
+        tz = tz_raw.strip()
+        if _IANA_TZ_RE.match(tz):
+            normalized["timezone"] = tz
+
+    return normalized
+
+
 def _detect_task_type(user_text: str) -> str:
     lowered = user_text.lower()
     if "email" in lowered or "mail" in lowered:
@@ -48,6 +108,11 @@ class PersonalMemoryCandidate:
     evidence: str
     source: str
     extraction_source: str
+    # Structured payload for keys whose journal event needs a dict (e.g.
+    # workflow.morning_routine carries cadence/time/timezone). When set, the
+    # candidate→event converter uses this verbatim instead of wrapping the
+    # flat descriptor `value` in a single-field object.
+    value_struct: dict[str, Any] | None = None
 
 
 def _unwrap_user_request(user_text: str) -> str:
@@ -251,17 +316,31 @@ def _event_to_candidates(
         primary_llm = str(value["primary_llm"]).strip()
         add("workflow", "primary_llm", primary_llm, f"- Preferred primary model: {primary_llm}", "replace")
     elif key in {"workflow.morning_routine", "workflow.daily_briefing"} or key.startswith("workflow.recurring_request"):
-        routine = str(value.get("routine") or value.get("name") or key.split(".", 1)[-1]).strip()
-        items = value.get("items") or value.get("steps") or []
-        if isinstance(items, str):
-            items = [items]
-        cadence = str(value.get("cadence") or value.get("frequency") or "daily").strip()
-        items_str = ", ".join(str(i).strip() for i in items if str(i).strip())
-        if routine:
-            descriptor = f"{routine} ({cadence})" if cadence else routine
+        normalized = _validate_routine_value(value)
+        if normalized is not None:
+            routine = normalized["routine"]
+            cadence = normalized["cadence"]
+            items_str = ", ".join(normalized.get("items") or [])
+            descriptor = f"{routine} ({cadence})"
             if items_str:
                 descriptor = f"{descriptor}: {items_str}"
-            add("workflow", key.split(".", 1)[-1], descriptor, f"- Routine: {descriptor}", "replace")
+            cand_key = key.split(".", 1)[-1]
+            candidates.append(
+                PersonalMemoryCandidate(
+                    topic="workflow",
+                    key=cand_key,
+                    value=descriptor,
+                    line=f"- Routine: {descriptor}",
+                    overwrite_policy="replace",
+                    confidence=confidence,
+                    sensitivity=sensitivity,
+                    source_session_id=session_id,
+                    evidence=evidence,
+                    source=source,
+                    extraction_source=extraction_source,
+                    value_struct=normalized,
+                )
+            )
     elif key == "workflow.common_recipient" and value.get("recipient"):
         recipient = str(value["recipient"]).strip().lower()
         add("contacts", f"frequent_recipient:{recipient}", recipient, f"- Frequent recipient: {recipient}", "append_unique")
@@ -279,6 +358,173 @@ def _dedupe_candidates(candidates: list[PersonalMemoryCandidate]) -> list[Person
         seen.add(dedupe_key)
         ordered.append(candidate)
     return ordered
+
+
+# ---------------------------------------------------------------------------
+# Deterministic routine extractor (D1 fix)
+# ---------------------------------------------------------------------------
+_ROUTINE_INTENT_RE = re.compile(
+    r"\b("
+    r"every\s+(?P<freq>morning|day|night|evening|afternoon|weekday|weekdays|weekend|weekends|week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"|daily|weekly|each\s+(?P<freq2>morning|day|night|evening|afternoon|weekday|weekend|week)"
+    r")\b",
+    re.IGNORECASE,
+)
+_ROUTINE_TIME_RE = re.compile(
+    r"\bat\s+(?P<hh>[01]?\d|2[0-3])(?::(?P<mm>[0-5]\d))?\s*(?P<ampm>am|pm|a\.m\.|p\.m\.)?\b",
+    re.IGNORECASE,
+)
+
+_CADENCE_NORMALIZE: dict[str, str] = {
+    "morning": "daily", "day": "daily", "night": "daily",
+    "evening": "daily", "afternoon": "daily",
+    "weekday": "weekday", "weekdays": "weekday",
+    "weekend": "weekend", "weekends": "weekend",
+    "week": "weekly",
+    "monday": "weekly", "tuesday": "weekly", "wednesday": "weekly",
+    "thursday": "weekly", "friday": "weekly",
+    "saturday": "weekly", "sunday": "weekly",
+}
+
+_DEFAULT_HOUR_FOR_PART: dict[str, int] = {
+    "morning": 8, "day": 9, "afternoon": 14, "evening": 19, "night": 21,
+}
+
+
+def _slug_action(text: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    return text[:48] or "routine"
+
+
+def _extract_routine_candidate(
+    user_text: str,
+    *,
+    session_id: str | None,
+    profile: dict[str, Any] | None,
+    evidence: str,
+) -> PersonalMemoryCandidate | None:
+    """Detect 'every (morning|day|...) at HH[:MM][am|pm]...' style routines."""
+    if not user_text:
+        return None
+    m_freq = _ROUTINE_INTENT_RE.search(user_text)
+    if not m_freq:
+        return None
+    freq = (m_freq.group("freq") or m_freq.group("freq2") or "").lower()
+    if not freq:
+        token = m_freq.group(1).lower()
+        freq = "day" if token == "daily" else ("week" if token == "weekly" else "")
+    cadence = _CADENCE_NORMALIZE.get(freq, "daily")
+
+    hh: int | None = None
+    mm: int = 0
+    m_time = _ROUTINE_TIME_RE.search(user_text)
+    if m_time:
+        hh = int(m_time.group("hh"))
+        mm = int(m_time.group("mm") or 0)
+        ampm = (m_time.group("ampm") or "").lower().replace(".", "")
+        if ampm.startswith("p") and hh < 12:
+            hh += 12
+        elif ampm.startswith("a") and hh == 12:
+            hh = 0
+    elif freq in _DEFAULT_HOUR_FOR_PART:
+        hh = _DEFAULT_HOUR_FOR_PART[freq]
+
+    if hh is None:
+        return None  # need a clock time for the scheduler to register
+
+    # Build a name + items from the surrounding action ("send me a daily news brief").
+    text_lower = user_text.lower()
+    action = re.sub(_ROUTINE_INTENT_RE, " ", text_lower)
+    action = re.sub(_ROUTINE_TIME_RE, " ", action)
+    action = re.sub(r"\b(please|kindly|hey turtle|turtle|me|i\b)", " ", action)
+    action = re.sub(r"\s+", " ", action).strip(" ,.!?")
+
+    if "news" in text_lower or "brief" in text_lower or "digest" in text_lower:
+        key_suffix = "daily_briefing"
+        routine_name = "daily briefing"
+        items = ["news brief"]
+    elif freq in {"morning"} and hh < 12:
+        key_suffix = "morning_routine"
+        routine_name = "morning routine"
+        items = [action] if action else []
+    else:
+        key_suffix = f"recurring_request.{_slug_action(action)}"
+        routine_name = action or "recurring task"
+        items = [action] if action else []
+
+    tz = "UTC"
+    if profile:
+        identity = profile.get("identity") if isinstance(profile, dict) else None
+        if isinstance(identity, dict):
+            tz_val = identity.get("timezone")
+            if isinstance(tz_val, str) and tz_val.strip():
+                tz = tz_val.strip()
+
+    value_struct = {
+        "routine": routine_name,
+        "cadence": cadence,
+        "time": f"{hh:02d}:{mm:02d}",
+        "timezone": tz,
+    }
+    if items:
+        value_struct["items"] = items
+
+    descriptor = f"{routine_name} ({cadence}) {value_struct['time']} {tz}"
+    if items:
+        descriptor += " : " + ", ".join(items)
+
+    return PersonalMemoryCandidate(
+        topic="workflow",
+        key=key_suffix,
+        value=descriptor,
+        line=f"- Routine: {descriptor}",
+        overwrite_policy="replace",
+        # Routines need explicit user confirmation before they fire on a
+        # schedule. Keep confidence at "inferred" so _should_auto_apply_event
+        # leaves them pending in the confirmation gate.
+        confidence="inferred",
+        sensitivity="normal",
+        source_session_id=session_id,
+        evidence=evidence,
+        source="inferred",
+        extraction_source="deterministic",
+        value_struct=value_struct,
+    )
+
+
+_RELATION_RE = re.compile(
+    r"\bmy\s+(?P<rel>best\s+friend|wife|husband|partner|girlfriend|boyfriend|mother|father|mom|dad|brother|sister|son|daughter|boss|manager|cofounder|co-founder|friend|colleague)\s+(?:is\s+|named\s+|called\s+)?(?P<name>[A-Z][\w''.-]+(?:\s+[A-Z][\w''.-]+)?)",
+    re.IGNORECASE,
+)
+
+
+def _extract_relation_candidate(
+    user_text: str,
+    *,
+    session_id: str | None,
+    evidence: str,
+) -> PersonalMemoryCandidate | None:
+    m = _RELATION_RE.search(user_text)
+    if not m:
+        return None
+    rel = re.sub(r"\s+", "_", m.group("rel").strip().lower())
+    rel = rel.replace("co-founder", "cofounder")
+    name = m.group("name").strip().rstrip(".,!?;:")
+    if not name or name.lower() in {"me", "you", "him", "her", "them"}:
+        return None
+    return PersonalMemoryCandidate(
+        topic="relations",
+        key=rel,
+        value=name,
+        line=f"- {rel.replace('_', ' ').title()}: {name}",
+        overwrite_policy="replace",
+        confidence="confirmed",
+        sensitivity="normal",
+        source_session_id=session_id,
+        evidence=evidence,
+        source="explicit",
+        extraction_source="deterministic",
+    )
 
 
 def extract_memory_candidates_from_messages(
@@ -320,6 +566,23 @@ def extract_memory_candidates_from_messages(
                         session_id=session_id,
                     )
                 )
+            # D1 fix: deterministic routine pass — emits a structured workflow
+            # candidate when the user describes a cadence + clock time
+            # ("every morning at 8am ...").
+            routine_candidate = _extract_routine_candidate(
+                user_text,
+                session_id=session_id,
+                profile=profile,
+                evidence=user_text,
+            )
+            if routine_candidate is not None:
+                candidates.append(routine_candidate)
+            # D1 fix: deterministic relations pass.
+            relation_candidate = _extract_relation_candidate(
+                user_text, session_id=session_id, evidence=user_text,
+            )
+            if relation_candidate is not None:
+                candidates.append(relation_candidate)
 
     return _dedupe_candidates(candidates)
 
@@ -482,9 +745,12 @@ async def run_stage_b_session_extractor(
         "request (\"every morning\", \"every day\", \"when I start my day\", \"I like to ... "
         "first\", \"always\", \"usually\", \"daily/weekly\"), emit a workflow event with key "
         "workflow.morning_routine, workflow.daily_briefing, or workflow.recurring_request:<slug>. "
-        "Value should include what to do and cadence, e.g. "
-        "{\"routine\": \"morning briefing\", \"items\": [\"city news\", \"AI engineer jobs\"], \"cadence\": \"daily\"}. "
-        "Treat these as preferences, not one-off tasks.\n"
+        "Value MUST include what to do, cadence, AND a clock time + IANA timezone when "
+        "the user specified one (or one can be inferred from their stated location). Example: "
+        "{\"routine\": \"morning briefing\", \"items\": [\"Indore news\"], \"cadence\": \"daily\", "
+        "\"time\": \"08:00\", \"timezone\": \"Asia/Kolkata\"}. "
+        "time is 24-hour HH:MM. timezone is an IANA name. Omit time/timezone only when the "
+        "user genuinely did not state one. Treat these as preferences, not one-off tasks.\n"
         f"- Max candidates: {max_candidates}.\n\n"
         f"Current profile snapshot:\n{json.dumps(profile, ensure_ascii=False, indent=2)}\n\n"
         f"Session turns:\n{json.dumps(turns, ensure_ascii=False, indent=2)}"
@@ -527,6 +793,13 @@ async def run_stage_b_session_extractor(
             continue
         if not key or not isinstance(value, dict):
             continue
+        # D1: validate the routine value shape; drop half-formed entries
+        # rather than half-storing them. Non-routine workflow events pass through.
+        if topic == "workflow" and is_routine_key(key):
+            validated = _validate_routine_value(value)
+            if validated is None:
+                continue
+            value = validated
         if source not in {"inferred", "synthesized"}:
             source = "inferred"
         confidence = max(0.0, min(1.0, confidence))
