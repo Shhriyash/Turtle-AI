@@ -76,13 +76,22 @@ class RagTenancyTests(unittest.TestCase):
         # Two different user_ids never produce the same backing object.
         # We bypass the on-disk dir collision by clearing the cache and
         # asserting only on identity, not contents.
+        # rag_vector_dir is redirected to the test tmp dir so this never
+        # creates/writes index files under the real data/ tree.
+        import unittest.mock as mock
+
         vs_module._vector_storage_by_user.clear()
         try:
-            a = get_vector_storage("usr_alice")
-            b = get_vector_storage("usr_bob")
-            self.assertIsNot(a, b)
-            # Repeated calls for the same user_id return the cached store.
-            self.assertIs(get_vector_storage("usr_alice"), a)
+            with mock.patch.object(
+                vs_module,
+                "rag_vector_dir",
+                side_effect=lambda user_id: self.tmp / "cache" / user_id,
+            ):
+                a = get_vector_storage("usr_alice")
+                b = get_vector_storage("usr_bob")
+                self.assertIsNot(a, b)
+                # Repeated calls for the same user_id return the cached store.
+                self.assertIs(get_vector_storage("usr_alice"), a)
         finally:
             vs_module._vector_storage_by_user.clear()
 

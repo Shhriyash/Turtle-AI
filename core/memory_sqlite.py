@@ -138,18 +138,36 @@ def _flatten_value(value: Any) -> str:
     return " ".join(parts)[:_FLATTEN_MAX_CHARS]
 
 
-def _escape_fts_query(query: str) -> str:
+_FTS_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "is", "are", "was", "were", "be", "been",
+        "do", "does", "did", "i", "im", "my", "me", "mine",
+        "you", "your", "yours", "we", "our", "us",
+        "what", "whats", "who", "whos", "where", "when", "which", "how", "why",
+        "to", "of", "in", "on", "at", "for", "and", "or",
+        "it", "its", "this", "that", "these", "those",
+        "have", "has", "had", "can", "could", "should", "would", "will",
+        "please", "tell", "about",
+    }
+)
+
+
+def _escape_fts_query(query: str, *, operator: str = "AND") -> str:
     """Turn a free-text query into a safe FTS5 MATCH expression.
 
     Each whitespace-separated word becomes a double-quoted token (so reserved
-    FTS5 syntax in user text can't break the parse), joined with implicit AND
-    via OR-less juxtaposition. We use OR so partial overlap still returns rows;
-    BM25 ranks the better matches first.
+    FTS5 syntax in user text can't break the parse). Stopwords are removed for
+    precision, with an all-stopword fallback so short queries still work. The
+    search path uses AND first for precision; callers may retry with OR for
+    recall when AND finds nothing.
     """
     words = [w for w in "".join(c if c.isalnum() else " " for c in query).split() if w]
     if not words:
         return ""
-    return " OR ".join(f'"{w}"' for w in words)
+    filtered = [w for w in words if w.lower() not in _FTS_STOPWORDS]
+    terms = filtered or words
+    joiner = f" {operator.upper()} "
+    return joiner.join(f'"{w}"' for w in terms)
 
 
 class MemorySQLiteIndex:
@@ -212,30 +230,69 @@ class MemorySQLiteIndex:
         limit: int = 10,
     ) -> list[MemoryEventRow]:
         """FTS5 MATCH with optional topic filter, BM25-ranked (best first)."""
-        match_expr = _escape_fts_query(query)
+        requested_limit = int(limit)
+        if requested_limit <= 0:
+            return []
+
+        def _run(match_expr: str) -> list[Any]:
+            sql = [
+                "SELECT e.event_id, e.topic, e.key, e.value_text, e.value_json,",
+                "       e.evidence_text, e.confidence, e.source, e.observed_at,",
+                "       e.applied, bm25(events_fts) AS rank",
+                "FROM events_fts",
+                "JOIN events e ON e.rowid = events_fts.rowid",
+                "WHERE events_fts MATCH ?",
+            ]
+            params: list[Any] = [match_expr]
+            if applied_only:
+                sql.append("AND e.applied = 1")
+            if topic:
+                sql.append("AND e.topic = ?")
+                params.append(topic)
+            sql.append("AND e.rejected = 0")
+            sql.append("ORDER BY rank ASC")
+            sql.append("LIMIT ?")
+            # Over-fetch so the latest-per-key collapse below has material.
+            params.append(max(requested_limit * 4, requested_limit))
+
+            return self._conn.execute("\n".join(sql), params).fetchall()
+
+        # AND-first for precision (stopwords stripped); OR fallback for recall.
+        match_expr = _escape_fts_query(query, operator="AND")
         if not match_expr:
             return []
 
-        sql = [
-            "SELECT e.event_id, e.topic, e.key, e.value_text, e.value_json,",
-            "       e.evidence_text, e.confidence, e.source, e.observed_at,",
-            "       e.applied, bm25(events_fts) AS rank",
-            "FROM events_fts",
-            "JOIN events e ON e.rowid = events_fts.rowid",
-            "WHERE events_fts MATCH ?",
-        ]
-        params: list[Any] = [match_expr]
-        if applied_only:
-            sql.append("AND e.applied = 1")
-        if topic:
-            sql.append("AND e.topic = ?")
-            params.append(topic)
-        sql.append("AND e.rejected = 0")
-        sql.append("ORDER BY rank ASC")
-        sql.append("LIMIT ?")
-        params.append(int(limit))
+        rows = _run(match_expr)
+        if not rows:
+            or_expr = _escape_fts_query(query, operator="OR")
+            if or_expr and or_expr != match_expr:
+                rows = _run(or_expr)
 
-        rows = self._conn.execute("\n".join(sql), params).fetchall()
+        # A superseded event must never outrank (or accompany) its correction.
+        superseded = {
+            row["supersedes"]
+            for row in self._conn.execute(
+                "SELECT supersedes FROM events WHERE supersedes IS NOT NULL"
+            ).fetchall()
+        }
+        rows = [row for row in rows if row["event_id"] not in superseded]
+
+        # Collapse to the latest event per (topic, key) — retrieval must serve
+        # the current value of a fact, not its whole history.
+        latest_by_key: dict[tuple[str, str], Any] = {}
+        for row in rows:
+            key = (row["topic"], row["key"])
+            current = latest_by_key.get(key)
+            if current is None:
+                latest_by_key[key] = row
+                continue
+            if row["observed_at"] > current["observed_at"]:
+                latest_by_key[key] = row
+            elif row["observed_at"] == current["observed_at"] and row["rank"] < current["rank"]:
+                latest_by_key[key] = row
+
+        survivors = set(id(row) for row in latest_by_key.values())
+        rows = [row for row in rows if id(row) in survivors][:requested_limit]
         results: list[MemoryEventRow] = []
         for row in rows:
             try:
@@ -264,11 +321,30 @@ class MemorySQLiteIndex:
         existing = self._conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"]
         for event in journal_store.iter_events():
             self.index_event(event)
+        # Honor journal rejection tombstones so a rebuilt index reproduces the
+        # served state instead of resurrecting rejected facts.
+        for event in journal_store.iter_events():
+            rejected_event_id = event.value.get("rejected_event_id")
+            if rejected_event_id:
+                self._conn.execute(
+                    "UPDATE events SET rejected = 1 WHERE event_id = ?",
+                    (rejected_event_id,),
+                )
+        self._conn.commit()
         # ``index_event`` uses INSERT OR IGNORE, so re-runs against an already
         # populated DB simply skip duplicates. Report rows now present minus the
         # count we started with to give an accurate "newly inserted" number.
         total = self._conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"]
         return max(0, total - existing)
+
+    def mark_rejected(self, event_id: str) -> None:
+        """Flag one event rejected in the index (pair with a journal tombstone
+        via JournalStore.append_rejection so rebuilds stay consistent)."""
+        self._conn.execute(
+            "UPDATE events SET rejected = 1 WHERE event_id = ?",
+            (event_id,),
+        )
+        self._conn.commit()
 
     def count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"])

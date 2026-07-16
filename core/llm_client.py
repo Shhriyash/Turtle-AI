@@ -15,6 +15,7 @@ from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.models.groq import GroqModel
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.google import GoogleProvider
+from pydantic_ai.providers.groq import GroqProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.settings import ModelSettings
 
@@ -90,9 +91,17 @@ def get_openrouter_models(model_name: str | None = None, settings: ModelSettings
     app_title = os.getenv("OPENROUTER_APP_TITLE")
     models: list[OpenRouterModel] = []
 
+    or_settings = dict(settings) if settings else {}
+    # The same gemini-2.5-flash served via OpenRouter runs with thinking enabled;
+    # a small max_tokens budget gets consumed by hidden reasoning, yielding
+    # empty/truncated replies on exactly the rungs that serve during
+    # Gemini-direct cooldowns. 2048 is the production-surviving floor
+    # documented in problems/2026-05-30.
+    or_settings["max_tokens"] = max(2048, int(or_settings.get("max_tokens", 0) or 0))
+
     for api_key in get_openrouter_keys():
         provider = OpenRouterProvider(api_key=api_key, app_url=app_url, app_title=app_title)
-        models.append(OpenRouterModel(model, provider=provider, settings=settings))
+        models.append(OpenRouterModel(model, provider=provider, settings=ModelSettings(**or_settings)))
 
     return models
 
@@ -145,14 +154,19 @@ def get_groq_model(model_name: str | None = None, settings: ModelSettings | None
     if not api_key:
         return None
     model = model_name or os.getenv("GROQ_PRIMARY_MODEL", GROQ_DEFAULT_PRIMARY_MODEL)
-    return GroqModel(model, settings=settings)
+    return GroqModel(model, provider=GroqProvider(api_key=api_key), settings=settings)
 
 
 def get_groq_fallback_model(model_name: str | None = None, settings: ModelSettings | None = None) -> GroqModel | None:
+    # Prefer KEY2 so the fallback rung really is a separate quota bucket.
     api_key = os.getenv("GROQ_API_KEY2") or os.getenv("GROQ_API_KEY")
     if not api_key:
         return None
-    return GroqModel(model_name or os.getenv("GROQ_FALLBACK_MODEL", GROQ_DEFAULT_FALLBACK_MODEL), settings=settings)
+    return GroqModel(
+        model_name or os.getenv("GROQ_FALLBACK_MODEL", GROQ_DEFAULT_FALLBACK_MODEL),
+        provider=GroqProvider(api_key=api_key),
+        settings=settings,
+    )
 
 
 def is_rate_limit_error(exc: Exception) -> bool:

@@ -381,7 +381,7 @@ class RetrievalBroker:
             )
             return ""
 
-        merged = self._combine(fts_hits, vec_hits)
+        merged = self._combine(fts_hits, vec_hits, query=normalized)
         chosen = "both" if (fts_hits and vec_hits) else ("fts" if fts_hits else "vector")
         self._log_recall(
             query=query, normalized=normalized, fts_hits=fts_hits,
@@ -408,16 +408,29 @@ class RetrievalBroker:
             return False
         return True
 
-    def _combine(self, fts_hits: list[MemoryEventRow], vec_hits: list[Any]) -> str:
+    def _combine(
+        self,
+        fts_hits: list[MemoryEventRow],
+        vec_hits: list[Any],
+        *,
+        query: str = "",
+    ) -> str:
         """Simple union: FTS hits first (precise), then novel vector hits.
 
         No normalized score merge — BM25 and cosine are opposite-direction,
         different-scale distributions. Dedupe by topic+text. Capped at 8 lines.
+
+        Only called on the weak-lexical path, so both arms apply a relevance
+        floor: confidently-wrong beats honestly-empty was the production
+        failure ("what editor do I use" returned taekwondo); below the floor we
+        return nothing so the tool reports no relevant information.
         """
         lines: list[str] = []
         seen: set[str] = set()
 
         for row in fts_hits:
+            if query and _token_overlap(query, _row_searchable_text(row)) < 0.3:
+                continue
             text = (row.value_text or "").strip()
             if not text:
                 continue
@@ -433,6 +446,9 @@ class RetrievalBroker:
         for hit in vec_hits:
             if len(lines) >= 8:
                 break
+            score = getattr(hit, "score", None)
+            if isinstance(score, (int, float)) and score < 0.35:
+                continue
             text = str(getattr(hit, "text", "") or "").strip()
             if not text:
                 continue

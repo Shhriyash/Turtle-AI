@@ -172,24 +172,25 @@ async def _extract_with_llm(
     prompt = f"{system_prompt}{profile_ctx}\n\nConversation message:\n{user_text[:1000]}"
 
     try:
+        from core.config import settings as _cfg
         from groq import AsyncGroq
         client = AsyncGroq(api_key=api_key)
         response = await asyncio.wait_for(
             client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model=_cfg.personal_memory_turn_extractor_model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=512,
                 temperature=0.0,
                 response_format={"type": "json_object"},
             ),
-            timeout=6.0,
+            timeout=10.0,
         )
         raw = response.choices[0].message.content or ""
     except Exception as exc:
         print(f"LOG: LLM memory extractor failed: {exc}")
         return []
 
-    # Parse the returned JSON array
+    # primary contract: {"facts": [...]}; bare-array and items kept for tolerance
     try:
         data = json.loads(raw)
         items: list[dict] = data if isinstance(data, list) else data.get("facts", data.get("items", []))
@@ -670,6 +671,16 @@ def _extract_stage_b_json_array(raw_text: str) -> list[dict[str, object]]:
     return []
 
 
+def _evidence_supports_value(value: dict, evidence: dict) -> bool:
+    """Explicit facts must be grounded: every leaf string of the value must
+    appear (case-insensitively) in the evidence text, else downgrade."""
+    evidence_text = json.dumps(evidence, ensure_ascii=False).lower()
+    leaves = [str(v).strip().lower() for v in value.values() if isinstance(v, (str, int, float)) and str(v).strip()]
+    if not leaves:
+        return False
+    return all(leaf in evidence_text for leaf in leaves)
+
+
 def _stage_b_turns_from_messages(
     message_history: list[ModelMessage], max_turns: int
 ) -> list[dict[str, str]]:
@@ -679,7 +690,8 @@ def _stage_b_turns_from_messages(
             for part in message.parts:
                 if not isinstance(part, UserPromptPart):
                     continue
-                text = str(part.content).strip()
+                # Drop injected memory context before session extraction.
+                text = _unwrap_user_request(str(part.content)).strip()
                 if not text:
                     continue
                 turns.append({"role": "user", "text": text})
@@ -707,8 +719,8 @@ async def run_stage_b_session_extractor(
     Returns number of events written.
     """
     from core.config import settings as _settings
-    from core.llm_client import get_groq_model
-    from core.memory_journal import make_event
+    from core.llm_client import get_google_models, get_groq_model, get_openrouter_models
+    from core.memory_journal import ALLOWED_TOPICS, make_event
 
     if not _settings.personal_memory_enabled or not _settings.personal_memory_stage_b_enabled:
         return 0
@@ -719,7 +731,8 @@ async def run_stage_b_session_extractor(
         model_name=_settings.personal_memory_stage_b_model,
         settings=model_settings,
     )
-    if stage_b_model is None:
+    stage_b_models = [m for m in [stage_b_model, *get_google_models(), *get_openrouter_models()] if m is not None]
+    if not stage_b_models:
         print(f"LOG: Stage B skipped for {session_id} (Groq unavailable)")
         return 0
 
@@ -736,9 +749,9 @@ async def run_stage_b_session_extractor(
         "Return ONLY JSON array. No prose.\n"
         "Each item must include: kind, topic, key, value, confidence, source, evidence.\n"
         "Rules:\n"
-        "- source must be inferred or synthesized (never explicit).\n"
+        "- source: explicit ONLY when the user stated the fact in their own words and evidence quotes them verbatim; otherwise inferred or synthesized.\n"
         "- confidence in [0,1].\n"
-        "- topic in: identity, preferences, workflow, contacts, projects, corrections.\n"
+        "- topic in: identity, preferences, workflow, contacts, relations, projects, corrections, working_style, communication_style, tool_preferences, decision_style.\n"
         "- key should be stable dotted path.\n"
         "- value must be an object.\n"
         "- Recurring patterns: when the user describes a habit, routine, or scheduled "
@@ -756,18 +769,26 @@ async def run_stage_b_session_extractor(
         f"Session turns:\n{json.dumps(turns, ensure_ascii=False, indent=2)}"
     )
 
-    extractor_agent = Agent(
-        stage_b_model,
-        deps_type=type(state),
-        output_type=str,
-        output_retries=1,
-        instructions="Return only valid JSON array.",
-    )
+    result = None
+    last_error: Exception | None = None
+    for model in stage_b_models:
+        extractor_agent = Agent(
+            model,
+            deps_type=type(state),
+            output_type=str,
+            output_retries=1,
+            instructions="Return only valid JSON array.",
+        )
 
-    try:
-        result = await extractor_agent.run(prompt, deps=state)
-    except Exception as e:
-        print(f"LOG: Stage B skipped for {session_id} (model unavailable: {e})")
+        try:
+            result = await extractor_agent.run(prompt, deps=state)
+            break
+        except Exception as e:
+            last_error = e
+            print(f"LOG: Stage B model hop ({e.__class__.__name__}), trying next")
+
+    if result is None:
+        print(f"LOG: Stage B skipped for {session_id} (model unavailable: {last_error})")
         return 0
 
     raw_items = _extract_stage_b_json_array(result.output)
@@ -789,7 +810,7 @@ async def run_stage_b_session_extractor(
 
         if kind not in {"fact", "preference", "behavior", "correction", "contradiction"}:
             continue
-        if topic not in {"identity", "preferences", "workflow", "contacts", "projects", "corrections"}:
+        if topic not in ALLOWED_TOPICS:
             continue
         if not key or not isinstance(value, dict):
             continue
@@ -800,7 +821,9 @@ async def run_stage_b_session_extractor(
             if validated is None:
                 continue
             value = validated
-        if source not in {"inferred", "synthesized"}:
+        if source not in {"inferred", "synthesized", "explicit"}:
+            source = "inferred"
+        if source == "explicit" and not _evidence_supports_value(value, evidence):
             source = "inferred"
         confidence = max(0.0, min(1.0, confidence))
         if not isinstance(evidence, dict):
@@ -818,9 +841,14 @@ async def run_stage_b_session_extractor(
             json.dumps(payload_for_id, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
 
-        # Phase 1: confidence-tiered auto-apply for non-identity topics
+        # Phase 1: confidence-tiered auto-apply. Identity auto-applies only for
+        # evidence-grounded explicit statements at very high confidence — in
+        # production the correct stage-B name fix sat gated while regex garbage
+        # auto-applied; this closes that inversion without opening it to guesses.
         auto_apply_topics = {"preferences", "workflow", "projects"}
         applied = topic in auto_apply_topics and confidence >= 0.85
+        if topic == "identity" and source == "explicit" and confidence >= 0.95:
+            applied = True
 
         events.append(
             make_event(

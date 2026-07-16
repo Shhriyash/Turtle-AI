@@ -51,7 +51,9 @@ class SQLiteSessionStore(SessionStoreProtocol):
             )
             await db.commit()
 
-    async def list_sessions(self, status_filter: str | None = None) -> list[Session]:
+    async def list_sessions(
+        self, status_filter: str | None = None, user_id: str | None = None
+    ) -> list[Session]:
         sessions = []
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("SELECT session_id, data FROM sessions") as cursor:
@@ -59,6 +61,10 @@ class SQLiteSessionStore(SessionStoreProtocol):
                     try:
                         data = json.loads(row[1])
                         if status_filter and data.get("status") != status_filter:
+                            continue
+                        # user_id lives inside the data JSON; no schema migration.
+                        # Legacy rows have no user_id and only match user_id="".
+                        if user_id is not None and data.get("user_id", "") != user_id:
                             continue
                         sessions.append(Session(session_id=row[0], data=data))
                     except Exception:

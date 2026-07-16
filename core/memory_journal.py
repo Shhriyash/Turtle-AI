@@ -200,6 +200,32 @@ class JournalStore:
             recent_sigs.add(sig)
         return results
 
+    def append_rejection(self, original: "MemoryEvent") -> "MemoryEvent":
+        """Append a tombstone that permanently rejects *original*.
+
+        Rejection must live in the journal (source of truth), not only as an
+        out-of-band index flag — otherwise any index rebuild resurrects the
+        rejected fact. ``MemorySQLiteIndex.backfill_from_journal`` honors
+        these tombstones.
+        """
+        tombstone = MemoryEvent(
+            event_id=generate_event_id(),
+            session_id=original.session_id,
+            turn_id=f"{original.turn_id}_rejected",
+            observed_at=_utc_now(),
+            kind="contradiction",
+            topic=original.topic,
+            key=original.key,
+            value={"rejected_event_id": original.event_id},
+            confidence=1.0,
+            source="explicit",
+            extractor="deterministic",
+            evidence={"note": "rejection tombstone"},
+            supersedes=original.event_id,
+            applied=False,
+        )
+        return self.append(tombstone)
+
     def iter_events(self) -> Iterator[MemoryEvent]:
         if not self.journal_dir.exists():
             return

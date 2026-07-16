@@ -164,8 +164,11 @@ class OnboardingEndpointTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         token = self.email_tool.sent[0]["body"].split("token=", 1)[1].split('"', 1)[0]
 
+        # /claim intentionally returns a 200 HTML page with JS/meta-refresh
+        # navigation instead of a 303 — email-client link rewriters and
+        # prefetchers don't reliably follow Location headers.
         resp = self.client.get(f"/onboarding/claim?token={token}", follow_redirects=False)
-        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.status_code, 200)
         cookie = resp.cookies.get("turtle_uid")
         self.assertIsNotNone(cookie)
 

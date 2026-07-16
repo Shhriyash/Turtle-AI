@@ -145,6 +145,11 @@ class TurtleSettings(BaseSettings):
     personal_memory_stage_b_max_candidates: int = Field(
         default=8, alias="TURTLE_PERSONAL_MEMORY_STAGE_B_MAX_CANDIDATES"
     )
+    # Per-turn LLM extractor (Stage A2). 8B misclassified roles/names in
+    # production; 70B is the floor for open-vocabulary extraction.
+    personal_memory_turn_extractor_model: str = Field(
+        default="llama-3.3-70b-versatile", alias="TURTLE_PERSONAL_MEMORY_TURN_EXTRACTOR_MODEL"
+    )
     personal_memory_max_bytes: int = Field(
         default=1024 * 1024, alias="TURTLE_PERSONAL_MEMORY_MAX_BYTES"
     )

@@ -99,6 +99,7 @@ from core.dream_pass import DreamPass
 from core.memory_journal import JournalStore, make_event
 from core.memory_extractor import extract_memory_event_specs
 from core.memory_replayer import replay
+from core.observability import trace_sink
 from core.personal_memory_extract import (
     PersonalMemoryCandidate,
     extract_memory_candidates_from_messages,
@@ -220,18 +221,11 @@ def _build_main_assistant_prompt(
     """Inject runtime context into the main assistant system prompt (C2).
 
     The {runtime_context} and {user_greeting_block} placeholders in
-    main_assistant.txt are replaced with live values so prompt caching still
-    works on the static parts of the block. Dynamic content is isolated to
-    these small substitutions.
+    main_assistant.txt are retained for compatibility. Per-turn runtime values
+    now come from _build_turn_instructions so the static prompt never bakes a
+    frozen clock or timezone.
     """
-    import datetime
-    now_utc = datetime.datetime.now(datetime.UTC).strftime("%A, %d %B %Y, %H:%M UTC")
-    runtime_lines = [
-        f"Current date and time: {now_utc}",
-        f"User timezone: {timezone}",
-        f"Active channel: {channel}",
-    ]
-    runtime_context = "\n".join(runtime_lines)
+    runtime_context = "Runtime context (current date/time, timezone, user memory) is provided in per-turn instructions."
     return (
         _MAIN_ASSISTANT_PROMPT_TEMPLATE
         .replace("{runtime_context}", runtime_context)
@@ -270,6 +264,39 @@ def _build_user_greeting_block(user_id: str) -> str:
         "You don't yet know this user's name. If they haven't introduced "
         "themselves and the moment is right, ask once — naturally."
     )
+
+
+def _build_turn_instructions(state: "SharedState") -> str:
+    """Per-turn dynamic instructions: greeting, live clock/timezone, and the
+    memory block. Runs on every model call (including fallback rungs), so the
+    model always sees the CURRENT memory snapshot exactly once — never baked
+    into persisted user turns where stale copies accumulate and contradict
+    corrections."""
+    import datetime as _dt
+    uid = state.user_id if state is not None else ""
+    parts: list[str] = [_build_user_greeting_block(uid)]
+    tz_name = "UTC"
+    try:
+        identity = PersonalMemoryStore(user_id=uid).load_topic("identity") if uid else None
+        if identity is not None:
+            for raw in identity.lines:
+                line = str(raw).strip().lstrip("-").strip()
+                if line.lower().startswith("timezone:"):
+                    tz_name = line.split(":", 1)[1].strip() or "UTC"
+                    break
+    except Exception:
+        pass
+    now_utc = _dt.datetime.now(_dt.UTC).strftime("%A, %d %B %Y, %H:%M UTC")
+    parts.append(f"Current date and time: {now_utc}")
+    parts.append(f"User timezone: {tz_name}")
+    memory_block = (state.memory_context or "").strip() if state is not None else ""
+    if memory_block:
+        parts.append(
+            "Current user memory (authoritative; this is the only current copy — "
+            "any memory blocks inside older conversation turns are stale snapshots):\n"
+            + memory_block
+        )
+    return "\n".join(p for p in parts if p)
 
 
 # Static fallback used by AgentManager.rebuild (agents are built at startup);
@@ -335,6 +362,9 @@ class SharedState:
     # to expose only the tools relevant to this turn (a chitchat turn ships no
     # tool contracts at all). Set per-turn by the handlers before graph.run.
     intent: str = ""
+    # Phase 1: the memory block for the current turn. Delivered to the model
+    # via per-turn instructions (never inside the persisted user prompt).
+    memory_context: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1476,6 +1506,27 @@ def _runtime_agent_registry() -> list[dict[str, Any]]:
 # pushed gpt-oss over Groq's 8k TPM cap (see problems/2026-05-30-*). An intent
 # absent from this map (incl. multi_step, where the planner may dispatch
 # anything, and any unknown/router-failure value) gets the full toolset.
+from pydantic import BaseModel as _RememberBaseModel, Field as _RememberField
+
+
+class RememberArgs(_RememberBaseModel):
+    topic: str = _RememberField(
+        ...,
+        description=(
+            "Memory topic: identity|preferences|workflow|contacts|relations|projects|"
+            "corrections|working_style|communication_style|tool_preferences|decision_style"
+        ),
+    )
+    key: str = _RememberField(
+        ...,
+        description="Short snake_case identifier, e.g. favourite_editor.",
+    )
+    value: str = _RememberField(
+        ...,
+        description="The fact as stated by the user.",
+    )
+
+
 # Memory tools are infrastructure, not an intent: recall/history_tool stay
 # visible on every route so misroutes can't strip memory access (the email
 # flow in particular needs stored contacts at exactly the moment it runs).
@@ -1705,12 +1756,11 @@ class AgentManager:
         # SharedState (which carries the resolved user_id).
         def _attach_user_greeting(target_agent: Agent) -> None:
             @target_agent.instructions
-            async def _user_greeting(ctx: RunContext[SharedState]) -> str:
+            async def _turn_instructions(ctx: RunContext[SharedState]) -> str:
                 try:
-                    uid = ctx.deps.user_id if ctx.deps is not None else ""
+                    return _build_turn_instructions(ctx.deps)
                 except Exception:
-                    uid = ""
-                return _build_user_greeting_block(uid)
+                    return ""
 
         _attach_user_greeting(agent)
         for fb in self.main_assistant_fallbacks:
@@ -1768,6 +1818,16 @@ class AgentManager:
             pending_email = ctx.deps.session_store.get_pending_email()
             deterministic = extract_deterministic_email_details(query)
 
+            known_contacts: dict[str, Any] = {}
+            try:
+                _snapshot = ctx.deps.personal_memory_store.load_profile_snapshot()
+                known_contacts = {
+                    "contacts": _snapshot.get("contacts") or {},
+                    "relations": _snapshot.get("relations") or {},
+                }
+            except Exception:
+                known_contacts = {}
+
             extraction_prompt = (
                 "Extract only email send fields from the latest user request.\n"
                 "Rules:\n"
@@ -1776,7 +1836,9 @@ class AgentManager:
                 "- Return cc_recipients as a list of email strings when user specifies cc.\n"
                 "- Return bcc_recipients as a list of email strings when user specifies bcc.\n"
                 "- Return empty strings for missing subject/content.\n"
-                "- send_intent should be true only when user asks to send now.\n\n"
+                "- send_intent should be true only when user asks to send now.\n"
+                "- If the user names a person (e.g. 'my manager', 'Keshav') and Known contacts below contains a matching address, use it; never invent addresses.\n\n"
+                f"Known contacts:\n{json.dumps(known_contacts, ensure_ascii=False)}\n\n"
                 f"Current pending email state:\n{json.dumps(pending_email, ensure_ascii=False)}\n\n"
                 f"Deterministic extraction hints:\n{json.dumps(deterministic, ensure_ascii=False)}\n\n"
                 f"Latest user request:\n{query}"
@@ -1864,7 +1926,10 @@ class AgentManager:
             # previously-captured-but-unenforced prefers_draft_before_send.)
             authored_this_turn = not content_before_compose and bool(merged["content"])
             prefers_draft = bool((profile.get("workflow") or {}).get("prefers_draft_before_send"))
-            if authored_this_turn and prefers_draft:
+            # Hold for confirmation when Turtle authored the body this turn and
+            # the user prefers drafts, OR when the user never actually said to
+            # send (send_intent was extracted but previously ignored).
+            if (authored_this_turn and prefers_draft) or not merged.get("send_intent"):
                 await ctx.deps.session_store.set_pending_email(
                     recipients=merged["recipients"], cc_recipients=merged["cc_recipients"],
                     bcc_recipients=merged["bcc_recipients"], subject=merged["subject"], content=merged["content"],
@@ -1874,6 +1939,8 @@ class AgentManager:
                     + format_email_draft(merged)
                     + "\n\nReply \"send\" to send it, or tell me what to change."
                 )
+
+            from pydantic_ai.exceptions import ModelRetry as _ModelRetry
 
             try:
                 validate_send_email_args(
@@ -1896,6 +1963,10 @@ class AgentManager:
 
                 send_result = send_email_now(merged)
                 record_invocation(idem_key, send_result)
+            except _ModelRetry:
+                # pydantic_ai's retry protocol — swallowing it hands the model
+                # a prose failure instead of a structured retry.
+                raise
             except Exception as e:
                 await ctx.deps.session_store.set_pending_email(
                     recipients=merged["recipients"], cc_recipients=merged["cc_recipients"],
@@ -1914,6 +1985,19 @@ class AgentManager:
                     recipients=merged["recipients"], cc_recipients=merged["cc_recipients"],
                     bcc_recipients=merged["bcc_recipients"], subject=merged["subject"], content=merged["content"],
                 )
+            try:
+                # recall(scope="tasks") finally has data: record the action.
+                ctx.deps.task_history_store.record(
+                    session_id=ctx.deps.session_store.session_id or "unknown_session",
+                    turn_id=f"email_{int(time.time())}",
+                    task_type="email",
+                    status="completed" if send_result.startswith("Email sent successfully") else "failed",
+                    query=query[:200],
+                    tool_used="send_email_assistant",
+                    outcome=send_result[:200],
+                )
+            except Exception as _e:
+                print(f"LOG: task history record failed: {_e}")
             return clean_text_for_model(send_result)
 
 
@@ -1988,6 +2072,47 @@ class AgentManager:
             result = await list_upcoming_events(inner)
             return result.to_agent_string()
 
+        async def remember(ctx: RunContext[SharedState], args: RememberArgs) -> str:
+            """Explicitly store a user-stated fact in personal memory. See tool contract."""
+            from core.memory_journal import ALLOWED_TOPICS, generate_event_id, make_event
+            from core.memory_replayer import replay as _replay
+
+            topic = args.topic.strip().lower()
+            key_slug = args.key.strip().lower()
+            value_text = args.value.strip()
+
+            if topic not in ALLOWED_TOPICS:
+                return ToolResult.invalid(
+                    f"topic must be one of: {', '.join(sorted(ALLOWED_TOPICS))}"
+                ).to_agent_string()
+            if not key_slug or not value_text:
+                return ToolResult.invalid("key and value must not be empty").to_agent_string()
+
+            import re as _re
+            key_slug = _re.sub(r"[^a-z0-9]+", "_", key_slug).strip("_") or "note"
+
+            try:
+                event = make_event(
+                    event_id=generate_event_id(),
+                    kind="fact",
+                    topic=topic,
+                    key=f"{topic}.{key_slug}",
+                    value={"value": value_text},
+                    confidence=1.0,
+                    source="explicit",
+                    extractor="deterministic",
+                    session_id=ctx.deps.session_store.session_id or "unknown_session",
+                    turn_id=f"remember_{generate_event_id()[:8]}",
+                    evidence={"note": "user asked Turtle to remember this"},
+                    applied=True,
+                )
+                ctx.deps.journal_store.append_many([event])
+                _replay(ctx.deps.journal_store.load_all(), store=ctx.deps.personal_memory_store)
+            except Exception as e:
+                return ToolResult.upstream_error(f"Could not store the memory: {e}").to_agent_string()
+
+            return ToolResult.ok(f"Stored: {topic}.{key_slug} = {value_text}").to_agent_string()
+
         # Register the identical toolset on every rung of the cascade:
         # run_agent_with_fallbacks swaps Agent objects on failure, and a rung
         # without tools silently loses every capability while the shared
@@ -2000,6 +2125,7 @@ class AgentManager:
             ("recall", recall),
             ("calendar_create", calendar_create),
             ("calendar_list", calendar_list),
+            ("remember", remember),
         ]
         for _target_agent in [self.main_assistant, *self.main_assistant_fallbacks]:
             for _contract_name, _tool_fn in _tool_registry:
@@ -2405,7 +2531,8 @@ async def websocket_endpoint(ws: WebSocket):
 
     # Build SharedState for this connection
     async with httpx.AsyncClient() as client:
-        session_store = SessionStore()
+        # Tenant-scoped: resume/sweep must never see another user's sessions.
+        session_store = SessionStore(user_id=user_id)
         restore_result = await session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
         # Legacy single-tenant MemoryStore intentionally not constructed here —
         # personal memory now lives under personal_memory_dir(user_id).
@@ -2485,6 +2612,10 @@ async def websocket_endpoint(ws: WebSocket):
                     await _run_dream_pass_if_needed(state, session_id=pending_sid)
                 except Exception as _e:
                     print(f"LOG: Dream pass error for pending session {pending_sid}: {_e}")
+            try:
+                await session_store.mark_finalized(pending_sid)
+            except Exception as _e:
+                print(f"LOG: mark_finalized failed for {pending_sid}: {_e}")
         if state.sqlite_index is not None:
             try:
                 state.sqlite_index.checkpoint()
@@ -2601,6 +2732,14 @@ async def websocket_endpoint(ws: WebSocket):
             # Capture messages before archive_active() clears them.
             final_messages = list(state.session_store.message_history)
             await state.session_store.archive_active(status="pending_finalization")
+            try:
+                # Index this session's conversations into the per-user episodic
+                # store NOW — end_session was previously only reachable from the
+                # next start_session in the same process, so no web session was
+                # ever indexed and cross-session recall returned nothing.
+                await state.rag_system.end_session()
+            except Exception as _e:
+                print(f"LOG: episodic end_session failed for {session_id}: {_e}")
             if session_id and final_messages:
                 _sync_personal_memory_from_messages(
                     state, session_id=session_id, message_history=final_messages,
@@ -2615,6 +2754,13 @@ async def websocket_endpoint(ws: WebSocket):
                     await _run_dream_pass_if_needed(state, session_id=session_id)
                 except Exception as _e:
                     print(f"LOG: Dream pass error on session end for {session_id}: {_e}")
+            if session_id:
+                try:
+                    # Extraction just ran on final_messages; without this flip the
+                    # next connect re-extracts the same session.
+                    await state.session_store.mark_finalized(session_id)
+                except Exception as _e:
+                    print(f"LOG: mark_finalized failed for {session_id}: {_e}")
             if state.sqlite_index is not None:
                 try:
                     state.sqlite_index.checkpoint()
@@ -2719,8 +2865,10 @@ async def _handle_text_message(
         router_start = time.time()
         router_task = asyncio.create_task(_route_turn(user_text, model_name=str(config.get("ROUTER_AGENT_MODEL") or "")))
 
-        memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=user_text)
-        prompt_input = _compose_prompt_with_memory(user_text, memory_context)
+        state.memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=user_text)
+        # Memory travels via per-turn instructions (_build_turn_instructions);
+        # the persisted user turn stays the user's bare words.
+        prompt_input = user_text
         turn_id = _new_turn_id(state)
 
         # Await router (likely already done by now)
@@ -2738,15 +2886,26 @@ async def _handle_text_message(
         state.intent = task_type  # 3b: scope tools to this turn's intent
 
         llm_start = time.time()
-        response = await graph.run(
-            agents_mgr.main_assistant,
-            prompt_input,
-            fallback_agents=agents_mgr.main_assistant_fallbacks,
-            deps=state,
-            message_history=message_history,
-            usage=RunUsage(),
-            usage_limits=agents_mgr.usage_limits,
-        )
+        # Phase 1: one local span per turn — the record that makes "why did
+        # Turtle answer X" answerable from disk (data/traces/traces.jsonl).
+        with trace_sink.span(
+            "turtle.turn",
+            user_id=state.user_id,
+            session_id=state.session_store.session_id or "",
+            turn_id=turn_id,
+            intent=task_type,
+            memory_context_chars=len(state.memory_context or ""),
+            tools_scoped=",".join(sorted(_TOOL_NAMES_BY_INTENT.get(task_type, {"unscoped"}))),
+        ):
+            response = await graph.run(
+                agents_mgr.main_assistant,
+                prompt_input,
+                fallback_agents=agents_mgr.main_assistant_fallbacks,
+                deps=state,
+                message_history=message_history,
+                usage=RunUsage(),
+                usage_limits=agents_mgr.usage_limits,
+            )
         timings["llm_ms"] = round((time.time() - llm_start) * 1000)
 
         final_output = clean_text_for_model(response.output)
@@ -2875,8 +3034,8 @@ async def _handle_audio_message(
         router_start = time.time()
         router_task = asyncio.create_task(_route_turn(transcription, model_name=str(config.get("ROUTER_AGENT_MODEL") or "")))
 
-        memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=transcription)
-        prompt_input = _compose_prompt_with_memory(transcription, memory_context)
+        state.memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=transcription)
+        prompt_input = transcription
         turn_id = _new_turn_id(state)
 
         try:

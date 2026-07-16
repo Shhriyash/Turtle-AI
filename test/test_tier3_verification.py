@@ -50,7 +50,7 @@ class TestChannelBaseTypes:
             result = await dispatch_text("hello", user_id="usr_test", channel="whatsapp")
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert "not ready" in result.lower() or isinstance(result, str)
         ch._dispatch_fn = original
         print("[PASS] dispatch_text returns stub when handler not wired")
@@ -71,7 +71,7 @@ class TestChannelBaseTypes:
             ev = TurtleEvent(user_id="u", channel="slack", modality="text", content="ping")
             return await dispatch_event(ev)
 
-        resp = asyncio.get_event_loop().run_until_complete(run())
+        resp = asyncio.run(run())
         assert resp.content == "wired!"
         ch._dispatch_fn = original
         print("[PASS] set_channel_dispatch correctly wires handler")
@@ -128,7 +128,7 @@ class TestF1WhatsApp:
                 s.twilio_whatsapp_number = None
                 await _send_whatsapp_reply("+1234567890", "hello")  # must not raise
 
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
         print("[PASS] _send_whatsapp_reply logs and returns gracefully when creds not configured")
 
     def test_webhook_endpoint_exists_on_router(self):
@@ -179,7 +179,7 @@ class TestF2iMessage:
                 s.sendblue_api_secret = None
                 await _send_imessage_reply("+1234567890", "test reply")
 
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
         print("[PASS] _send_imessage_reply handles missing creds gracefully")
 
     def test_webhook_endpoint_exists_on_router(self):
@@ -279,7 +279,7 @@ class TestF3Slack:
             with mock.patch("apps.channels.slack._bot_token", return_value=""):
                 await _post_slack_message("C123", "hello")  # must not raise
 
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
         print("[PASS] _post_slack_message handles missing token gracefully")
 
 
@@ -363,7 +363,7 @@ class TestE5TwilioVoice:
                 result = await _synthesize_ulaw("Hello world")
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result == b""
         print("[PASS] _synthesize_ulaw returns empty bytes when no Deepgram key")
 
@@ -378,7 +378,7 @@ class TestE5TwilioVoice:
                 result = await _transcribe_audio(b"fake_wav")
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result == ""
         print("[PASS] _transcribe_audio returns empty string when no Groq key")
 
@@ -431,7 +431,7 @@ class TestF4CalendarTool:
             ct.settings = real_settings
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result.status == "invalid"
         assert "credentials" in result.error_message.lower() or result.error_code == "credentials_missing"
         print("[PASS] create_calendar_event returns invalid when credentials not configured")
@@ -452,7 +452,7 @@ class TestF4CalendarTool:
             ct.settings = real_settings
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result.status == "invalid"
         print("[PASS] list_upcoming_events returns invalid when credentials not configured")
 
@@ -522,9 +522,20 @@ class TestChannelConfig:
 
     def test_all_channel_fields_default_to_none(self):
         import unittest.mock as mock, os
-        with mock.patch.dict(os.environ, {}, clear=False):
+        channel_vars = (
+            "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN",
+            "SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET",
+            "SENDBLUE_API_KEY", "SENDBLUE_API_SECRET",
+            "GOOGLE_CALENDAR_CREDENTIALS_JSON",
+        )
+        # Test the declared field defaults, not whatever the developer's local
+        # .env / shell happens to contain: drop the channel vars from the
+        # environment and disable the dotenv source.
+        with mock.patch.dict(os.environ):
+            for var in channel_vars:
+                os.environ.pop(var, None)
             from core.config import TurtleSettings
-            s = TurtleSettings()
+            s = TurtleSettings(_env_file=None)
         for field in (
             "twilio_account_sid", "twilio_auth_token",
             "slack_bot_token", "slack_signing_secret",

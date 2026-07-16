@@ -4,6 +4,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+import pytest
+
 from core.personal_memory_store import PersonalMemoryStore
 from core.retrieval_broker import (
     DEFAULT_BUDGET,
@@ -123,12 +125,22 @@ class HistoryTriggerTests(unittest.TestCase):
 
 class RetrievalBrokerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
         self.base = Path("test") / "_tmp" / f"broker_{uuid.uuid4().hex}"
         self.base.mkdir(parents=True, exist_ok=True)
         self.store = _make_store(self.base)
         self.task_store = TaskHistoryStore(self.base / "tasks" / "history.jsonl")
+        # write_topic inside a running loop enqueues embed_personal_memory,
+        # which would hit the live Cohere API and write the real
+        # data/memory/personal/default/vector index. No-op it for tests.
+        self._embed_patcher = patch(
+            "core.personal_memory_store.queue_service.enqueue", new=AsyncMock()
+        )
+        self._embed_patcher.start()
 
     def tearDown(self) -> None:
+        self._embed_patcher.stop()
         shutil.rmtree(self.base, ignore_errors=True)
 
     def _make_broker(self, rag_system=None, budget=DEFAULT_BUDGET) -> RetrievalBroker:
@@ -164,7 +176,7 @@ class RetrievalBrokerTests(unittest.IsolatedAsyncioTestCase):
                 self.store.update_index_entry("preferences", f"Summary for topic {i} with extra text to push tokens")
             except Exception:
                 pass
-        budget = RetrievalBudget(index_tokens=5, topic_tokens=200, episodic_tokens=100, task_tokens=40, total_tokens=400)
+        budget = RetrievalBudget(index_tokens=5, summary_tokens=150, total_tokens=400)
         broker = self._make_broker(budget=budget)
         result = await broker.build_context(task_type="general", query="hello")
         # Index section should be heavily truncated
@@ -199,6 +211,7 @@ class RetrievalBrokerTests(unittest.IsolatedAsyncioTestCase):
         result = await broker.build_context(task_type="general", query="what is my name?")
         self.assertNotIn("[Past Conversations]", result)
 
+    @pytest.mark.skip(reason="stale: episodic tier moved from build_context to the recall tool (scope='episodic') by design — 2026-07-16 Phase 1 triage")
     async def test_history_trigger_includes_episodic(self) -> None:
         rag = _FakeRagSystem(
             response='[{"content": "We discussed the Turtle project", "timestamp": "2026-01-01"}]'
@@ -219,6 +232,7 @@ class RetrievalBrokerTests(unittest.IsolatedAsyncioTestCase):
         result = await broker.build_context(task_type="general", query="do you remember last week?")
         self.assertNotIn("[Past Conversations]", result)
 
+    @pytest.mark.skip(reason="stale: task-history tier moved from build_context to the recall tool (scope='tasks') by design — 2026-07-16 Phase 1 triage")
     async def test_task_tier_fires_on_history_trigger(self) -> None:
         # Record a task so the task store has something to return
         self.task_store.record(
@@ -366,20 +380,17 @@ class PersonalTierTests(unittest.IsolatedAsyncioTestCase):
 
 class RetrievalBudgetTests(unittest.TestCase):
     def test_default_budget_values(self) -> None:
+        # Current API: prompt-time injection is index + rolling-summary only;
+        # episodic/task tiers moved behind the recall tool.
         b = DEFAULT_BUDGET
-        self.assertEqual(b.index_tokens, 60)
-        self.assertEqual(b.topic_tokens, 200)
-        self.assertEqual(b.episodic_tokens, 100)
-        self.assertEqual(b.task_tokens, 40)
-        self.assertEqual(b.total_tokens, 400)
-        self.assertEqual(
-            b.index_tokens + b.topic_tokens + b.episodic_tokens + b.task_tokens,
-            b.total_tokens,
-        )
+        self.assertEqual(b.index_tokens, 240)
+        self.assertEqual(b.summary_tokens, 150)
+        self.assertEqual(b.total_tokens, 390)
+        self.assertEqual(b.index_tokens + b.summary_tokens, b.total_tokens)
 
     def test_custom_budget(self) -> None:
-        b = RetrievalBudget(index_tokens=30, topic_tokens=100, episodic_tokens=50, task_tokens=20, total_tokens=200)
-        self.assertEqual(b.total_tokens, 200)
+        b = RetrievalBudget(index_tokens=30, summary_tokens=20, total_tokens=50)
+        self.assertEqual(b.total_tokens, 50)
 
 
 if __name__ == "__main__":

@@ -101,7 +101,10 @@ def normalize_spoken_email_text(text: str) -> str:
     for pattern, replacement in replacements:
         normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\s*@\s*", "@", normalized)
-    normalized = re.sub(r"\s*\.\s*", ".", normalized)
+    # Only join dots inside email-ish tokens (lowercase continuation): a
+    # production send misdelivered to "gmail.com.In" after a sentence
+    # boundary ("...@gmail.com. In the mail...") was glued into a TLD.
+    normalized = re.sub(r"(?<=[A-Za-z0-9])\s*\.\s*(?=[a-z0-9])", ".", normalized)
     return normalized
 
 

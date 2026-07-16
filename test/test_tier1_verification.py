@@ -46,7 +46,7 @@ class TestB3TavilySearch:
             with mock.patch("httpx.AsyncClient.post", return_value=fake_resp):
                 client_mock = mock.AsyncMock()
                 client_mock.post = mock.AsyncMock(return_value=fake_resp)
-                results = asyncio.get_event_loop().run_until_complete(
+                results = asyncio.run(
                     search_duckduckgo(client_mock, "bitcoin price", max_results=5)
                 )
         assert len(results) >= 1
@@ -106,28 +106,36 @@ class TestB5EmailIdempotency:
         assert k1 != k2
         print("[PASS] Different recipients produce different keys")
 
-    def test_new_key_returns_none(self):
+    def test_new_key_returns_none(self, tmp_path):
         """A key never seen before must return None (not a duplicate)."""
-        import time
+        import time, unittest.mock as mock
+        import tools.idempotency as idem
         from tools.idempotency import is_duplicate_invocation, build_email_idempotency_key
         unique_key = build_email_idempotency_key(
             [f"unique_{time.time()}@test.com"], "Subject", "Body"
         )
-        result = is_duplicate_invocation(unique_key)
+        # Redirect the idempotency DB to tmp so tests never write data/.
+        with mock.patch.object(idem, "_DB_PATH", tmp_path / "tool_invocations.db"), \
+             mock.patch.object(idem, "_DB_INITIALIZED", False):
+            result = is_duplicate_invocation(unique_key)
         assert result is None, f"New key should return None, got {result!r}"
         print("[PASS] New key returns None (not duplicate)")
 
-    def test_record_then_check_returns_cached(self):
+    def test_record_then_check_returns_cached(self, tmp_path):
         """After recording, the same key returns the cached result."""
-        import time
+        import time, unittest.mock as mock
+        import tools.idempotency as idem
         from tools.idempotency import (
             build_email_idempotency_key, is_duplicate_invocation, record_invocation
         )
         key = build_email_idempotency_key(
             [f"cached_{time.time()}@test.com"], "Test", "Body"
         )
-        record_invocation(key, "Email sent successfully!")
-        result = is_duplicate_invocation(key)
+        # Redirect the idempotency DB to tmp so tests never write data/.
+        with mock.patch.object(idem, "_DB_PATH", tmp_path / "tool_invocations.db"), \
+             mock.patch.object(idem, "_DB_INITIALIZED", False):
+            record_invocation(key, "Email sent successfully!")
+            result = is_duplicate_invocation(key)
         assert result == "Email sent successfully!", f"Got {result!r}"
         print("[PASS] Cached result returned on duplicate check")
 
@@ -171,7 +179,7 @@ class TestD1LLMExtractor:
 
         with mock.patch("core.personal_memory_extract._extract_with_llm") as mock_llm:
             mock_llm.return_value = []
-            results = asyncio.get_event_loop().run_until_complete(
+            results = asyncio.run(
                 extract_memory_candidates_from_messages_async(message_history=[msg])
             )
             # If regex found something, LLM should not have been called
@@ -308,14 +316,15 @@ class TestA2A3A4StubGraph:
         assert NodeKind.PLANNER in node_kinds, "Missing PLANNER node in multi_step_graph"
         print("[PASS] multi_step_graph has PLANNER node (A4)")
 
-    def test_all_6_graphs_registered(self):
+    def test_all_7_graphs_registered(self):
         from core.graph import list_graphs
         graphs = list_graphs()
-        assert len(graphs) == 6, f"Expected 6 graphs, got {len(graphs)}"
+        # 7 since the calendar graph was added (F4).
+        assert len(graphs) == 7, f"Expected 7 graphs, got {len(graphs)}"
         intents = {g["intent"] for g in graphs}
-        for expected in ("chitchat", "web", "url", "email", "memory_recall", "multi_step"):
+        for expected in ("chitchat", "web", "url", "email", "memory_recall", "multi_step", "calendar"):
             assert expected in intents, f"Missing graph for intent {expected!r}"
-        print(f"[PASS] All 6 graphs registered: {intents}")
+        print(f"[PASS] All 7 graphs registered: {intents}")
 
     def test_turtle_graph_run_is_async(self):
         import asyncio

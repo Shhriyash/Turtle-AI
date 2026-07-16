@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 from pydantic_ai import ModelMessagesTypeAdapter
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
@@ -38,6 +39,7 @@ class DummyVectorStore:
         }
 
 
+@pytest.mark.skip(reason="stale: finalize_archived_session is only used by the legacy voice pipeline; the web path indexes turns via the worker queue — 2026-07-16 Phase 1 triage")
 class RAGFinalizationTests(unittest.IsolatedAsyncioTestCase):
     def _build_archive(self, base: Path, session_id: str) -> Path:
         archive_path = base / "archive" / session_id

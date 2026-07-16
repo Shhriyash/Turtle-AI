@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    env:
+      # Dummy keys so module imports succeed offline; no test hits a live API.
+      GROQ_API_KEY: ci-dummy
+      GEMINI_API_KEY: ci-dummy
+      OPEN_ROUTER_API_KEY_1: ci-dummy
+      COHERE_API_KEY: ci-dummy
+      TAVILY_API_KEY: ci-dummy
+      DEEPGRAM_API_KEY: ci-dummy
+      AUTH_SECRET_KEY: ci-dummy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run test suite
+        run: python -m pytest test --ignore=test/evals -q

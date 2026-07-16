@@ -308,14 +308,24 @@ class DreamPassShouldRunTests(unittest.TestCase):
 
 class DreamPassRunTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
         self.base = Path("test") / "_tmp" / f"dreamp_run_{uuid.uuid4().hex}"
         self.base.mkdir(parents=True, exist_ok=True)
         self.store = _make_store(self.base)
         self.journal = JournalStore(journal_dir=self.base / "journal")
         self.gate = _make_gate(self.base, self.journal, self.store)
         self.dp = _make_dream_pass(self.base, self.journal, self.store, self.gate)
+        # dp.run() writes topics inside the running loop, which enqueues
+        # embed_personal_memory — a live Cohere embed call that writes the
+        # real data/memory/personal/default/vector index. No-op it for tests.
+        self._embed_patcher = patch(
+            "core.personal_memory_store.queue_service.enqueue", new=AsyncMock()
+        )
+        self._embed_patcher.start()
 
     def tearDown(self) -> None:
+        self._embed_patcher.stop()
         shutil.rmtree(self.base, ignore_errors=True)
 
     def _queue_candidate(self, key: str, value: dict, turn_id: str = "t1") -> str:

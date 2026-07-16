@@ -80,7 +80,7 @@ class TestB4UrlFetcher:
             mock_client.get = mock.AsyncMock(return_value=fake_resp)
             return await fetch_url_content_async(mock_client, "https://example.com")
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result.success is True
         assert result.title == "Test Page"
         assert len(result.content) > 0
@@ -119,7 +119,7 @@ class TestB4UrlFetcher:
             sd_mock.assert_not_called()
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result.success is True
         print(f"[PASS] SPA triggers Playwright (no Scrape.do token): title={result.title!r}")
 
@@ -157,7 +157,7 @@ class TestB4UrlFetcher:
             pw_mock.assert_not_called()
             return result
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result.success is True
         assert "Scraped Page" in result.title
         print(f"[PASS] SPA triggers Scrape.do (token set): title={result.title!r}")
@@ -170,7 +170,7 @@ class TestB4UrlFetcher:
             mock_client = mock.AsyncMock()
             return await fetch_url_content_async(mock_client, "not-a-url")
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result.success is False
         assert result.error_message is not None
         print(f"[PASS] Invalid URL returns failure: {result.error_message!r}")
@@ -185,7 +185,7 @@ class TestB4UrlFetcher:
             mock_client.get = mock.AsyncMock(side_effect=httpx.TimeoutException("timed out"))
             return await fetch_url_content_async(mock_client, "https://slow-site.com", timeout=5.0)
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result.success is False
         assert "Timeout" in result.error_message or "timeout" in result.error_message.lower()
         print(f"[PASS] Timeout produces failure result: {result.error_message!r}")
@@ -206,7 +206,7 @@ class TestB4UrlFetcher:
             mock_client.get = mock.AsyncMock(return_value=fake_resp)
             return await fetch_url_content_async(mock_client, "https://api.example.com/data")
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         assert result.success is True
         assert "65000" in result.content
         print("[PASS] JSON response returned directly without HTML parsing")
@@ -238,7 +238,7 @@ class TestB4UrlFetcher:
                 cfg_mock.scraped_do_api_key = None
                 return await fetch_url_content_async(mock_client, "https://spa.com")
 
-        result = asyncio.get_event_loop().run_until_complete(run())
+        result = asyncio.run(run())
         # Must succeed (not crash) even without Playwright
         assert result.success is True
         print("[PASS] Missing Playwright handled gracefully — no crash")
@@ -428,7 +428,7 @@ class TestG1StorageAbstractions:
                 assert result.data["foo"] == "bar"
                 print("[PASS] SQLiteSessionStore put/get roundtrip")
 
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
 
     def test_sqlite_fact_store_importable(self):
         from core.storage.local.fact_store import SQLiteFactStore
@@ -455,7 +455,7 @@ class TestG1StorageAbstractions:
                 assert facts2[0].value == "sushi"
                 print("[PASS] SQLiteFactStore upsert and update roundtrip")
 
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
 
     def test_sqlite_fact_store_user_isolation(self):
         import asyncio, tempfile
@@ -474,7 +474,7 @@ class TestG1StorageAbstractions:
                 assert b_facts[0].value == "red"
                 print("[PASS] SQLiteFactStore user isolation confirmed")
 
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
 
     def test_local_blob_store_importable(self):
         from core.storage.local.blob_store import LocalBlobStore
@@ -500,7 +500,7 @@ class TestG1StorageAbstractions:
                 assert gone is None
                 print("[PASS] LocalBlobStore put/get/delete roundtrip")
 
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
 
     def test_content_addressed_key(self):
         from core.storage.local.blob_store import LocalBlobStore
@@ -585,7 +585,7 @@ class TestG3WorkerQueue:
             assert job_id.startswith("job_")
             return job_id
 
-        job_id = asyncio.get_event_loop().run_until_complete(run())
+        job_id = asyncio.run(run())
         print(f"[PASS] enqueue returns job_id={job_id!r}")
 
     def test_unknown_job_raises(self):
@@ -597,7 +597,7 @@ class TestG3WorkerQueue:
             with pytest.raises(ValueError, match="not registered"):
                 await q.enqueue("nonexistent_job_abc")
 
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
         print("[PASS] Enqueuing unknown job raises ValueError")
 
     def test_embed_personal_memory_task_registered(self):
@@ -694,8 +694,12 @@ class TestG5Observability:
         print("[PASS] OTelTraceSink has .span() method")
 
     def test_span_accepts_turtle_attributes(self):
+        from opentelemetry.sdk.trace import TracerProvider
         from core.observability import OTelTraceSink
         sink = OTelTraceSink()
+        # Isolated provider (no exporter) so the span never reaches the global
+        # BatchSpanProcessor that appends to the real data/traces/traces.jsonl.
+        sink.tracer = TracerProvider().get_tracer("turtle-test")
         with sink.span(
             "test.turn",
             user_id="usr_abc",
@@ -714,8 +718,12 @@ class TestG5Observability:
     def test_latency_auto_measured_when_not_provided(self):
         """When latency_ms is omitted, the sink measures and sets it automatically."""
         import time
+        from opentelemetry.sdk.trace import TracerProvider
         from core.observability import OTelTraceSink, ATTR_LATENCY_MS
         sink = OTelTraceSink()
+        # Isolated provider (no exporter) so the span never reaches the global
+        # BatchSpanProcessor that appends to the real data/traces/traces.jsonl.
+        sink.tracer = TracerProvider().get_tracer("turtle-test")
         with sink.span("test.latency.auto", user_id="usr_test") as sp:
             time.sleep(0.01)
         # The span attribute should have been set on the OTel span object
@@ -821,7 +829,7 @@ class TestF5Identity:
                 assert uid.startswith("usr_")
                 return uid
 
-        uid = asyncio.get_event_loop().run_until_complete(run())
+        uid = asyncio.run(run())
         print(f"[PASS] resolve_user created new UserId: {uid}")
 
     def test_resolve_user_idempotent(self):
@@ -837,7 +845,7 @@ class TestF5Identity:
                 uid2 = await mgr.resolve_user("slack", "U12345")
                 assert uid1 == uid2, "Same channel+user must always resolve to the same UserId"
 
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
         print("[PASS] resolve_user is idempotent for same channel+channel_user_id")
 
     def test_different_channels_same_name_are_isolated(self):
@@ -854,7 +862,7 @@ class TestF5Identity:
                 uid_wa = await mgr.resolve_user("whatsapp", "alice")
                 assert uid_web != uid_wa, "Different channels must produce different UserIds"
 
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.run(run())
         print("[PASS] Different channels produce different UserIds for same handle")
 
     def test_user_identity_model_importable(self):
@@ -919,16 +927,10 @@ class TestD6MultiTenantMemory:
         assert "user_id" in sig.parameters
         print("[PASS] personal_memory_dir(user_id) signature correct")
 
-    def test_different_users_get_different_dirs(self):
-        import unittest.mock as mock
-        from pathlib import Path
-        from core.paths import personal_memory_dir
-        with mock.patch("core.paths.MEMORY_DIR", Path("/fake/mem")):
-            dir_a = personal_memory_dir("usr_alice")
-            dir_b = personal_memory_dir("usr_bob")
-        assert dir_a == dir_b
-        assert "personal" in str(dir_a)
-        print("[PASS] personal_memory_dir returns global path")
+    # NOTE: a former test here asserted personal_memory_dir("usr_alice") ==
+    # personal_memory_dir("usr_bob") — blessing a cross-tenant privacy
+    # regression. Deleted 2026-07-16; test/production_path_isolation_test.py
+    # is the correct per-user isolation spec.
 
     def test_personal_journal_dir_takes_user_id(self):
         import inspect
@@ -952,13 +954,7 @@ class TestD6MultiTenantMemory:
             "PersonalMemoryStore.__init__ must accept user_id"
         print("[PASS] PersonalMemoryStore.__init__ accepts user_id")
 
-    def test_memory_store_paths_are_user_scoped(self):
-        import unittest.mock as mock
-        from pathlib import Path
-        from core.personal_memory_store import PersonalMemoryStore
-
-        with mock.patch("core.paths.MEMORY_DIR", Path("/fake/mem")):
-            store_a = PersonalMemoryStore(user_id="usr_alice")
-            store_b = PersonalMemoryStore(user_id="usr_bob")
-        assert store_a.base_dir == store_b.base_dir
-        print("[PASS] PersonalMemoryStore uses global dir")
+    # NOTE: a former test here asserted PersonalMemoryStore("usr_alice") and
+    # ("usr_bob") share base_dir — blessing a cross-tenant privacy regression.
+    # Deleted 2026-07-16; test/production_path_isolation_test.py is the
+    # correct per-user isolation spec.

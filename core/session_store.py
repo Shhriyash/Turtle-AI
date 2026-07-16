@@ -20,6 +20,24 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _strip_legacy_memory_wrappers(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """Old builds persisted 'Relevant user memory:\\n…\\nUser request:\\n…' inside
+    user turns; unwrap so restored history carries only what the user said."""
+    import re as _re
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    pattern = _re.compile(r"^Relevant user memory:.*?\nUser request:\n", flags=_re.DOTALL)
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if isinstance(part, UserPromptPart) and isinstance(part.content, str):
+                new_content = pattern.sub("", part.content)
+                if new_content != part.content:
+                    part.content = new_content
+    return messages
+
+
 class SessionRestoreResult:
     def __init__(
         self,
@@ -37,11 +55,18 @@ class SessionRestoreResult:
 
 
 class SessionStore:
-    def __init__(self, backend: SessionStoreProtocol | None = None) -> None:
+    PENDING_EMAIL_TTL_SECONDS = 3600
+
+    def __init__(
+        self, backend: SessionStoreProtocol | None = None, *, user_id: str = ""
+    ) -> None:
         self.backend = backend or SQLiteSessionStore()
+        # Sessions are tenant-scoped; empty string = legacy/unowned.
+        self.user_id = user_id
         self.session_id: str | None = None
         self.message_history: list[ModelMessage] = []
         self.pending_email: dict[str, Any] = self._default_pending_email()
+        self._pending_email_updated_at: str = ""
         self.current_status: str | None = None
         self.rolling_summary: list[dict[str, Any]] = []
 
@@ -67,8 +92,10 @@ class SessionStore:
         
         data = {
             "status": self.current_status or "active",
+            "user_id": self.user_id,
             "messages": msgs_json,
             "pending_email": self.pending_email,
+            "pending_email_updated_at": self._pending_email_updated_at,
             "summary": self.rolling_summary,
             "updated_at": _utc_now()
         }
@@ -78,11 +105,13 @@ class SessionStore:
         self.session_id = session.session_id
         self.current_status = "active"
         self.pending_email = session.data.get("pending_email", self._default_pending_email())
+        self._pending_email_updated_at = session.data.get("pending_email_updated_at", "")
         summary = session.data.get("summary", [])
         self.rolling_summary = summary if isinstance(summary, list) else []
         raw_messages = session.data.get("messages", [])
         try:
             self.message_history = ModelMessagesTypeAdapter.validate_python(raw_messages)
+            self.message_history = _strip_legacy_memory_wrappers(self.message_history)
         except Exception:
             self.message_history = []
         return SessionRestoreResult(
@@ -104,6 +133,11 @@ class SessionStore:
             ts = ts.replace(tzinfo=UTC)
         return (datetime.now(UTC) - ts).total_seconds()
 
+    async def _list_sessions_for_user(self, status_filter: str) -> list[Session]:
+        sessions = await getattr(self.backend, "list_sessions")(status_filter=status_filter)
+        # Custom backends may not accept user_id, so enforce tenant filtering here.
+        return [s for s in sessions if s.data.get("user_id", "") == self.user_id]
+
     async def start_or_restore(
         self, mode: str = "strict_new", resume_window_seconds: int = 1800
     ) -> SessionRestoreResult:
@@ -112,20 +146,30 @@ class SessionStore:
         if mode == "resume_if_active":
             if hasattr(self.backend, "list_sessions"):
                 # 1) A still-active session (e.g. a second concurrent tab, or a
-                #    crash that skipped the disconnect finalizer).
-                active_sessions = await getattr(self.backend, "list_sessions")(status_filter="active")
+                #    crash that skipped the disconnect finalizer). Resumable
+                #    only within the recency window.
+                active_sessions = await self._list_sessions_for_user("active")
                 if active_sessions:
                     active_sessions.sort(key=lambda s: s.data.get("updated_at", ""), reverse=True)
-                    return self._restore_from_session(active_sessions[0])
+                    latest = active_sessions[0]
+                    age = self._seconds_since(latest.data.get("updated_at", ""))
+                    if age <= resume_window_seconds:
+                        return self._restore_from_session(latest)
+
+                    for session in active_sessions:
+                        if self._seconds_since(session.data.get("updated_at", "")) > resume_window_seconds:
+                            # A crash-orphaned "active" from weeks ago must never be
+                            # resumed as today's conversation; production had a
+                            # 47-day-old one waiting.
+                            session.data["status"] = "pending_finalization"
+                            await self.backend.put(session)
 
                 # 2) A recently-disconnected session. The WS finalizer archives
                 #    every session as "pending_finalization" on disconnect, so a
                 #    reconnect (drop, refresh, watchdog) finds nothing "active".
                 #    Resume the most recent one within the window and flip it
                 #    back to active so the connect-time finalizer skips it.
-                pending = await getattr(self.backend, "list_sessions")(
-                    status_filter="pending_finalization"
-                )
+                pending = await self._list_sessions_for_user("pending_finalization")
                 if pending:
                     pending.sort(key=lambda s: s.data.get("updated_at", ""), reverse=True)
                     latest = pending[0]
@@ -139,7 +183,7 @@ class SessionStore:
 
         previous_session_id = None
         if hasattr(self.backend, "list_sessions"):
-            active_sessions = await getattr(self.backend, "list_sessions")(status_filter="active")
+            active_sessions = await self._list_sessions_for_user("active")
             for session in active_sessions:
                 session.data["status"] = "pending_finalization"
                 await self.backend.put(session)
@@ -185,8 +229,14 @@ class SessionStore:
             return []
         pending = await getattr(self.backend, "list_sessions")(status_filter="pending_finalization")
         result = []
+        allowed_user_ids = {self.user_id, ""}
         for s in pending:
             if not (hasattr(s, "data") and s.data):
+                continue
+            # The sweep extracts into the CONNECTING user's journal; processing
+            # another user's transcript would cross-contaminate memory. Legacy
+            # unowned rows (no user_id) stay eligible for one-time finalization.
+            if s.data.get("user_id", "") not in allowed_user_ids:
                 continue
             raw_messages = s.data.get("messages", [])
             try:
@@ -196,17 +246,37 @@ class SessionStore:
             result.append((s.session_id, messages))
         return result
 
+    async def mark_finalized(self, session_id: str) -> None:
+        """Flip a session to completed exactly once so the connect-time sweep
+        stops re-running LLM extraction over the same transcript forever."""
+        if not hasattr(self.backend, "get"):
+            return
+        session = await self.backend.get(session_id)
+        if session is None:
+            return
+        session.data["status"] = "completed"
+        session.data["updated_at"] = _utc_now()
+        await self.backend.put(session)
+
     def get_pending_email(self) -> dict[str, Any]:
+        # A draft abandoned an hour ago must not gap-fill recipients/subject
+        # into a brand-new email request (stale-merge production bug).
+        if self._pending_email_updated_at:
+            if self._seconds_since(self._pending_email_updated_at) > self.PENDING_EMAIL_TTL_SECONDS:
+                self.pending_email = self._default_pending_email()
+                self._pending_email_updated_at = ""
         return self.pending_email
 
     async def set_pending_email(self, **kwargs: Any) -> None:
         for k, v in kwargs.items():
             if v is not None:
                 self.pending_email[k] = v if isinstance(v, str) else list(v)
+        self._pending_email_updated_at = _utc_now()
         await self._sync_to_backend()
 
     async def clear_pending_email(self) -> None:
         self.pending_email = self._default_pending_email()
+        self._pending_email_updated_at = ""
         await self._sync_to_backend()
 
     def get_summary_tail(self, max_entries: int = 20) -> list[dict[str, Any]]:

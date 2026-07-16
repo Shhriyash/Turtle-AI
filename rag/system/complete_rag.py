@@ -49,7 +49,9 @@ class TurtleRAGSystem:
         if storage_dir is not None:
             self.storage_dir = Path(storage_dir)
         else:
-            self.storage_dir = RAG_DATA_DIR
+            # Per-user staging: one global staging file destroyed each user's
+            # previous session on every start (and interleaved tenants).
+            self.storage_dir = RAG_DATA_DIR / user_id if user_id else RAG_DATA_DIR
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.user_id = user_id
 
@@ -425,6 +427,13 @@ class TurtleRAGSystem:
                     self.current_session_id = existing_session_id
                     self.session_conversations = session_data.get("conversations", [])
                     return self.current_session_id
+                if existing_session_id:
+                    # Leftover staging from a crashed/previous run: index it
+                    # instead of silently overwriting — this is how every
+                    # pre-fix session's conversations were destroyed.
+                    self.current_session_id = existing_session_id
+                    self.session_conversations = session_data.get("conversations", [])
+                    await self.end_session()
             except Exception:
                 pass
 

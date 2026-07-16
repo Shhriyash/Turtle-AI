@@ -22,8 +22,11 @@ class GraphStoreTests(unittest.TestCase):
             }
             graph = store.rebuild_from_profile(profile)
             store.save_graph(graph)
+            # max_lines=8: the deprecated store emits edges in insertion order
+            # (has_email, timezone, 3 preference edges) before the recipient
+            # "emails" edge, so a cap of 4 can never surface it.
             lines = store.query_context(
-                GraphContextQuery(query="who do I usually email", task_type="email", max_lines=4)
+                GraphContextQuery(query="who do I usually email", task_type="email", max_lines=8)
             )
             self.assertTrue(any("emails" in line for line in lines))
             self.assertTrue(graph_path.exists())

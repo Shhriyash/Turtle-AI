@@ -24,15 +24,19 @@ Do NOT extract:
 </task>
 
 <output_format>
-Return a JSON array of objects. Each object has:
+Return a single JSON object with a "facts" array. Each facts item has:
 {
-  "topic": "<identity|preferences|contacts|projects|corrections|workflow|working_style|communication_style|tool_preferences|decision_style>",
-  "key": "<specific fact key, e.g. 'name', 'primary_email', 'project:finae'>",
-  "value": "<the extracted value as a string>",
-  "confidence": "<confirmed|inferred>",
-  "source": "<explicit|inferred>",
-  "evidence": "<exact user quote or paraphrase>"
+  "facts": [
+    {
+      "topic": "<identity|preferences|contacts|relations|projects|corrections|workflow|working_style|communication_style|tool_preferences|decision_style>",
+      "key": "<specific fact key, e.g. 'name', 'primary_email', 'project:finae'>",
+      "value": "<the extracted value as a string>",
+      "confidence": "<confirmed|inferred>",
+      "source": "<explicit|inferred>",
+      "evidence": "<exact user quote or paraphrase>"
+    }
+  ]
 }
 
-Return [] if nothing extractable is found. Return ONLY valid JSON, no prose.
+Return {"facts": []} if nothing extractable is found. Return ONLY valid JSON, no prose.
 </output_format>

@@ -88,12 +88,12 @@ def build_email_idempotency_key(
     cc: list[str] | None = None,
     bcc: list[str] | None = None,
 ) -> str:
-    """Build a deterministic sha1 idempotency key for an email send attempt.
+    """Build a stable idempotency key for an email send.
 
-    Includes a minute-bucket so keys expire naturally even if the SQLite row
-    is somehow not pruned (belt-and-suspenders).
+    The created_at_s window in is_duplicate_invocation already bounds the
+    dedup horizon; a wall-clock bucket in the key made dedup fail exactly when
+    retries straddled a minute boundary.
     """
-    minute_bucket = int(time.time()) // 60  # Same minute = same bucket
     sorted_recipients = sorted(r.lower().strip() for r in recipients)
     sorted_cc = sorted(r.lower().strip() for r in (cc or []))
     sorted_bcc = sorted(r.lower().strip() for r in (bcc or []))
@@ -104,7 +104,6 @@ def build_email_idempotency_key(
         f"|bcc:{','.join(sorted_bcc)}"
         f"|sub:{(subject or '').strip()}"
         f"|body:{body_prefix}"
-        f"|min:{minute_bucket}"
     )
     return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
 
@@ -136,6 +135,10 @@ def is_duplicate_invocation(idempotency_key: str) -> Optional[str]:
 
 def record_invocation(idempotency_key: str, result: str) -> None:
     """Persist the result of a completed tool invocation."""
+    if not str(result).startswith("Email sent successfully"):
+        # Only successful sends are idempotency-cached; a failure must not
+        # no-op the user's retry.
+        return
     try:
         conn = _ensure_db()
         conn.execute(
