@@ -60,7 +60,8 @@ class _RepairedHistoryResult:
         responses = [m for m in inner_messages if isinstance(m, ModelResponse)]
         reply_messages = responses[-1:] if responses else []
         real_user_turn = ModelRequest(parts=[UserPromptPart(content=user_prompt)])
-        self._messages = list(prior_history) + [real_user_turn] + reply_messages
+        self._new_messages = [real_user_turn] + reply_messages
+        self._messages = list(prior_history) + self._new_messages
 
     @property
     def output(self) -> Any:
@@ -68,6 +69,12 @@ class _RepairedHistoryResult:
 
     def all_messages(self) -> list[Any]:
         return self._messages
+
+    def new_messages(self) -> list[Any]:
+        # A real method wins over __getattr__: proxying new_messages() to the
+        # inner synthesis run would leak the internal synthesis prompt as a
+        # user turn into persisted history.
+        return list(self._new_messages)
 
     def __getattr__(self, name: str) -> Any:
         # Proxy any other attribute access (e.g. usage) to the wrapped result.

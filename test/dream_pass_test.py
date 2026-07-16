@@ -160,9 +160,24 @@ class DecayReplayerTests(unittest.TestCase):
         self.assertIn("- Response style: concise", text)
 
     def test_stale_event_excluded(self) -> None:
+        # Phase 0: explicit user statements are decay-exempt (pinned in
+        # test/phase0_decay_render_test.py), so staleness is exercised with an
+        # inferred event — the class decay still applies to.
         now = datetime.now(UTC)
         observed_at = (now - timedelta(days=31)).isoformat(timespec="seconds").replace("+00:00", "Z")
-        event = self._pref_event(observed_at)
+        event = make_event(
+            kind="preference",
+            topic="preferences",
+            key="preferences.response_style",
+            value={"response_style": "concise"},
+            confidence=0.9,
+            source="inferred",
+            extractor="llm_turn",
+            session_id="s1",
+            turn_id="t1",
+            observed_at=observed_at,
+            applied=True,
+        )
         result = replay([event], store=self.store, reference_time=now)
         self.assertNotIn("preferences", result.written_topics)
         self.assertFalse((self.base / "preferences.md").exists())

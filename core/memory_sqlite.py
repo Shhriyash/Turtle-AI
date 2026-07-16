@@ -273,7 +273,21 @@ class MemorySQLiteIndex:
     def count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"])
 
+    def checkpoint(self) -> None:
+        """Fold the WAL into the main database file (TRUNCATE mode).
+
+        Called from session-finalization and shutdown paths so a copy of
+        ``memory.sqlite`` alone is complete. Failures (e.g. cross-thread close
+        during interpreter shutdown) are non-fatal by design.
+        """
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            self._conn.commit()
+        except Exception:
+            pass
+
     def close(self) -> None:
+        self.checkpoint()
         try:
             self._conn.close()
         except Exception:

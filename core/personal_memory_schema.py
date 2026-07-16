@@ -15,6 +15,11 @@ ALLOWED_MEMORY_TYPES = frozenset(
         "relation",
         "index",
         "log",
+        # Style topics project under their journal names (no singular alias).
+        "working_style",
+        "communication_style",
+        "tool_preferences",
+        "decision_style",
     }
 )
 ALLOWED_CONFIDENCE_LEVELS = frozenset({"confirmed", "inferred", "weak_signal"})

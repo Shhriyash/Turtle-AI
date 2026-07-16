@@ -23,6 +23,10 @@ TOPIC_TITLES = {
     "projects": "Projects",
     "corrections": "Corrections",
     "relations": "Relations",
+    "working_style": "Working Style",
+    "communication_style": "Communication Style",
+    "tool_preferences": "Tool Preferences",
+    "decision_style": "Decision Style",
 }
 
 TOPIC_SUMMARIES = {
@@ -33,6 +37,10 @@ TOPIC_SUMMARIES = {
     "projects": "Project context and recurring work references",
     "corrections": "User corrections and how to apply them",
     "relations": "People in the user's life and their roles",
+    "working_style": "How the user approaches tasks",
+    "communication_style": "How the user likes to receive information",
+    "tool_preferences": "Tools, languages, and environments the user favours",
+    "decision_style": "How the user makes decisions",
 }
 
 LINE_SORT_ORDER = [
@@ -57,7 +65,19 @@ LINE_SORT_ORDER = [
     "Correction",
 ]
 
-ALL_TOPICS = ("identity", "preferences", "workflow", "contacts", "projects", "corrections", "relations")
+ALL_TOPICS = (
+    "identity",
+    "preferences",
+    "workflow",
+    "contacts",
+    "projects",
+    "corrections",
+    "relations",
+    "working_style",
+    "communication_style",
+    "tool_preferences",
+    "decision_style",
+)
 
 
 @dataclass(frozen=True)
@@ -298,9 +318,36 @@ def _render_event_lines(event: MemoryEvent) -> list[str]:
 
     if event.topic == "corrections":
         summary = _clean_text(value.get("summary") or value.get("text"))
-        return [f"- Correction: {summary}"] if summary else []
+        if summary:
+            return [f"- Correction: {summary}"]
+        # fall through to the generic renderer for corrections whose value
+        # carries structured fields instead of a summary/text string
 
-    return []
+    # Generic fallback: an applied event must never be invisible just because
+    # its key is missing from the whitelist above (that is how the confirmed
+    # corrections.name_role and preferences.sport facts vanished).
+    label_source = key.rsplit(".", 1)[-1] if "." in key else (key or event.topic)
+    label = _clean_text(label_source.replace("_", " ")).title() or event.topic.title()
+
+    parts: list[str] = []
+
+    def _collect(node: object) -> None:
+        if isinstance(node, dict):
+            for item in node.values():
+                _collect(item)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                _collect(item)
+        elif isinstance(node, bool):
+            parts.append("true" if node else "false")
+        elif isinstance(node, (str, int, float)):
+            text = _clean_text(node)
+            if text:
+                parts.append(text)
+
+    _collect(value)
+    flattened = ", ".join(parts)
+    return [f"- {label}: {flattened}"] if flattened else []
 
 
 def _clean_text(value: object) -> str:
@@ -332,10 +379,14 @@ def _is_decayed(event: MemoryEvent, reference_time: datetime) -> bool:
     Exemptions:
     - ``topic in _DECAY_EXEMPT_TOPICS`` (identity facts never expire)
     - ``source == _DECAY_EXEMPT_SOURCE`` (migration events are authoritative)
+    - ``source == "explicit"`` (explicit user statements persist until
+      superseded or corrected; decay is for inferred behavioral signals)
     """
     if event.topic in _DECAY_EXEMPT_TOPICS:
         return False
     if event.source == _DECAY_EXEMPT_SOURCE:
+        return False
+    if event.source == "explicit":
         return False
     if not event.observed_at:
         return False

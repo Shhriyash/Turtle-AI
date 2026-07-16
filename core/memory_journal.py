@@ -15,7 +15,21 @@ from core.paths import personal_journal_dir, personal_memory_dir
 
 ALLOWED_KINDS = frozenset({"fact", "preference", "behavior", "correction", "contradiction"})
 ALLOWED_TOPICS = frozenset(
-    {"identity", "preferences", "workflow", "contacts", "projects", "corrections", "relations"}
+    {
+        "identity",
+        "preferences",
+        "workflow",
+        "contacts",
+        "projects",
+        "corrections",
+        "relations",
+        # The LLM extractor prompt requests these four; rejecting them used to
+        # raise mid-batch and void every sibling candidate in the same turn.
+        "working_style",
+        "communication_style",
+        "tool_preferences",
+        "decision_style",
+    }
 )
 ALLOWED_SOURCES = frozenset({"explicit", "inferred", "synthesized", "migration"})
 ALLOWED_EXTRACTORS = frozenset({"deterministic", "llm_turn", "dream_pass", "migration"})
@@ -156,8 +170,11 @@ class JournalStore:
         return event
 
     def append_many(self, events: Iterable[MemoryEvent]) -> list[MemoryEvent]:
-        # Phase 1: dedup-on-append. Skip events whose (topic, kind, normalized
-        # value) matches one of the last 50 events with an identical value.
+        # Phase 1: dedup-on-append. Skip only true duplicates: same topic,
+        # kind, KEY, APPLIED flag, and normalized value as one of the last 50
+        # events. Key and applied are part of the signature so an applied=True
+        # event is never suppressed by a lingering applied=False candidate —
+        # restating a fact the gate is still holding must always journal.
         recent: list[MemoryEvent] = []
         try:
             all_events = self.load_all()
@@ -165,12 +182,12 @@ class JournalStore:
         except Exception:
             recent = []
 
-        def _signature(ev: MemoryEvent) -> tuple[str, str, str]:
+        def _signature(ev: MemoryEvent) -> tuple[str, str, str, bool, str]:
             try:
                 normalized = json.dumps(ev.value, ensure_ascii=False, sort_keys=True)
             except Exception:
                 normalized = str(ev.value)
-            return (str(ev.topic), str(ev.kind), normalized)
+            return (str(ev.topic), str(ev.kind), str(ev.key), bool(ev.applied), normalized)
 
         recent_sigs = {_signature(ev) for ev in recent}
 

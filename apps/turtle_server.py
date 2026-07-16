@@ -508,6 +508,23 @@ def _trim_history_for_context(history: list[ModelMessage]) -> list[ModelMessage]
     return trimmed or history[-ACTIVE_HISTORY_MAX_MESSAGES:]
 
 
+def _persist_history(prior: list[ModelMessage] | None, response: Any) -> list[ModelMessage]:
+    """Persistence must never shrink the conversation of record.
+
+    history_processors trim the per-call view, and pydantic_ai writes the
+    processed list back into run state, so ``response.all_messages()`` returns
+    the TRIMMED history. Persisting that erases old turns before the
+    reflector / session-end extraction ever read them. Append only this run's
+    new messages to the untouched prior history instead.
+    """
+    prior_list = list(prior or [])
+    try:
+        new_msgs = list(response.new_messages())
+    except Exception:
+        return list(response.all_messages())
+    return prior_list + new_msgs
+
+
 def _sanitize_tool_pairs(history: list[ModelMessage]) -> list[ModelMessage]:
     """Drop orphan tool-call / tool-return parts so Gemini accepts the history.
 
@@ -666,6 +683,7 @@ def _normalize_url_for_cache(url: str) -> str:
 
 def _parse_confirmation_answer(user_text: str) -> bool | None:
     text = " ".join((user_text or "").strip().lower().split())
+    text = text.rstrip("!.?,")
     if not text:
         return None
 
@@ -693,15 +711,26 @@ def _parse_confirmation_answer(user_text: str) -> bool | None:
         "negative",
     )
 
-    if any(text == token or text.startswith(f"{token} ") for token in yes_prefixes):
+    if text in yes_prefixes:
         return True
-    if any(text == token or text.startswith(f"{token} ") for token in no_prefixes):
+    if text in no_prefixes:
         return False
+
+    words = text.split()
+    single_word_yes = {token for token in yes_prefixes if " " not in token}
+    single_word_no = {token for token in no_prefixes if " " not in token}
+    # Bare-only confirmations: instruction-bearing turns must fall through to the agent.
+    if len(words) <= 2 and words:
+        if words[0] in single_word_yes:
+            return True
+        if words[0] in single_word_no:
+            return False
     return None
 
 
 def _wants_preview(user_text: str) -> bool:
     text = " ".join(str(user_text or "").strip().lower().split())
+    text = text.rstrip("!.?,")
     if not text:
         return False
     triggers = (
@@ -711,7 +740,8 @@ def _wants_preview(user_text: str) -> bool:
         "preview", "details", "more info", "more context",
         "which memory", "the exact",
     )
-    return any(trigger in text for trigger in triggers)
+    # Substring matching hijacked ordinary requests containing words like "details".
+    return text in triggers
 
 
 def _maybe_handle_confirmation_turn(state: SharedState, user_text: str) -> str | None:
@@ -839,25 +869,45 @@ def _journal_and_queue_candidates(
     if not candidates:
         return 0
 
+    applied_events = []
     pending_events = []
     for idx, candidate in enumerate(candidates):
-        event = _candidate_to_journal_event(
-            candidate=candidate,
-            session_id=session_id,
-            ordinal=idx,
-        )
+        try:
+            event = _candidate_to_journal_event(
+                candidate=candidate,
+                session_id=session_id,
+                ordinal=idx,
+            )
+        except Exception as exc:
+            print(f"LOG: candidate->event conversion failed ({exc.__class__.__name__}: {exc}) for topic={candidate.topic!r} key={candidate.key!r}")
+            continue
+
         if event is None:
             continue
-        if event.applied:
-            continue
-        if event.source == "explicit":
-            continue
-        pending_events.append(event)
 
-    if not pending_events:
+        if candidate.extraction_source == "llm_turn" and event.applied:
+            value_text = str(candidate.value).strip().lower()
+            evidence_text = str(candidate.evidence or "").lower()
+            if value_text not in evidence_text:
+                event = _dc_replace(event, applied=False)
+
+        if event.applied:
+            applied_events.append(event)
+        else:
+            pending_events.append(event)
+
+    events = applied_events + pending_events
+    if not events:
         return 0
 
-    state.journal_store.append_many(pending_events)
+    state.journal_store.append_many(events)
+    if applied_events:
+        result = replay(state.journal_store.load_all(), store=state.personal_memory_store)
+        if result.written_topics:
+            print(f"LOG: Per-turn memory applied for {session_id}: {result.written_topics}")
+            if "workflow" in result.written_topics:
+                _register_user_routines_safe(state)
+
     queued = 0
     for event in pending_events:
         if state.confirmation_gate.queue_candidate(event):
@@ -1083,7 +1133,16 @@ def _candidate_to_journal_event(
         event_key = f"decision_style.{slug}"
         event_value = {"note": value_text}
     else:
-        return None
+        # Generic fallback: any candidate whose topic the journal accepts is
+        # persistable — silently dropping unknown keys is how facts like
+        # preferences.favourite_editor vanished. Unknown topics still bail.
+        import re
+        from core.memory_journal import ALLOWED_TOPICS
+        if topic not in ALLOWED_TOPICS or not value_text:
+            return None
+        slug = re.sub(r"[^a-z0-9]+", "_", str(key or "note").strip().lower()).strip("_") or "note"
+        event_key = f"{topic}.{slug}"
+        event_value = {"value": value_text}
 
     stable_payload = {
         "session": session_id,
@@ -1417,12 +1476,15 @@ def _runtime_agent_registry() -> list[dict[str, Any]]:
 # pushed gpt-oss over Groq's 8k TPM cap (see problems/2026-05-30-*). An intent
 # absent from this map (incl. multi_step, where the planner may dispatch
 # anything, and any unknown/router-failure value) gets the full toolset.
+# Memory tools are infrastructure, not an intent: recall/history_tool stay
+# visible on every route so misroutes can't strip memory access (the email
+# flow in particular needs stored contacts at exactly the moment it runs).
 _TOOL_NAMES_BY_INTENT: dict[str, set[str]] = {
-    "chitchat": set(),
-    "web": {"search_web", "search_url"},
-    "url": {"search_url", "search_web"},
-    "email": {"send_email_assistant"},
-    "calendar": {"calendar_create", "calendar_list"},
+    "chitchat": {"recall", "history_tool"},
+    "web": {"search_web", "search_url", "recall", "history_tool"},
+    "url": {"search_url", "search_web", "recall", "history_tool"},
+    "email": {"send_email_assistant", "recall", "history_tool"},
+    "calendar": {"calendar_create", "calendar_list", "recall", "history_tool"},
     "memory_recall": {"recall", "history_tool"},
 }
 
@@ -1621,7 +1683,7 @@ class AgentManager:
         )
 
     def _register_tools(self) -> None:
-        """Register all tools on self.main_assistant with typed args + rich contracts."""
+        """Register all tools on the main assistant and every fallback rung."""
         from pathlib import Path as _Path
 
         def _load_tool_contract(name: str) -> str:
@@ -1654,7 +1716,6 @@ class AgentManager:
         for fb in self.main_assistant_fallbacks:
             _attach_user_greeting(fb)
 
-        @agent.tool(description=_load_tool_contract("search_web"))
         async def search_web(ctx: RunContext[SharedState], args: WebSearchArgs) -> str:
             """Search the web for real-time information. See tool contract for full spec."""
             query = args.query.strip()
@@ -1678,7 +1739,6 @@ class AgentManager:
             ctx.deps.search_cache[cache_key] = trimmed
             return trimmed
 
-        @agent.tool(description=_load_tool_contract("search_url"))
         async def search_url(ctx: RunContext[SharedState], args: UrlFetchArgs) -> str:
             """Fetch and extract content from a specific URL. See tool contract for full spec."""
             url = args.url.strip()
@@ -1699,7 +1759,6 @@ class AgentManager:
             ctx.deps.search_cache[cache_key] = trimmed
             return trimmed
 
-        @agent.tool(description=_load_tool_contract("send_email_assistant"))
         async def send_email_assistant(ctx: RunContext[SharedState], args: EmailArgs) -> str:
             """Send emails on behalf of the user. See tool contract for full spec."""
             query = args.query.strip()
@@ -1858,7 +1917,6 @@ class AgentManager:
             return clean_text_for_model(send_result)
 
 
-        @agent.tool(description=_load_tool_contract("history_tool"))
         async def history_tool(ctx: RunContext[SharedState], args: HistoryArgs) -> str:
             """Search conversation history for past discussions. See tool contract for full spec."""
             query = args.query.strip()
@@ -1880,7 +1938,6 @@ class AgentManager:
             except Exception as e:
                 return ToolResult.upstream_error(f"History lookup failed: {e}").to_agent_string()
 
-        @agent.tool(description=_load_tool_contract("recall"))
         async def recall(ctx: RunContext[SharedState], args: RecallArgs) -> str:
             """Recall personal, episodic, task, or working context. See tool contract for full spec."""
             query = args.query.strip()
@@ -1905,7 +1962,6 @@ class AgentManager:
                 return ToolResult.empty("No relevant information found.").to_agent_string()
             return ToolResult.ok(recall_text).to_agent_string()
 
-        @agent.tool(description=_load_tool_contract("calendar_create"))
         async def calendar_create(ctx: RunContext[SharedState], args: CalendarCreateArgs) -> str:
             """Create a Google Calendar event. See tool contract for full spec."""
             from tools.calendar_tool import create_calendar_event
@@ -1921,7 +1977,6 @@ class AgentManager:
             result = await create_calendar_event(inner)
             return result.to_agent_string()
 
-        @agent.tool(description=_load_tool_contract("calendar_list"))
         async def calendar_list(ctx: RunContext[SharedState], args: CalendarListArgs) -> str:
             """List upcoming Google Calendar events. See tool contract for full spec."""
             from tools.calendar_tool import list_upcoming_events
@@ -1932,6 +1987,23 @@ class AgentManager:
             )
             result = await list_upcoming_events(inner)
             return result.to_agent_string()
+
+        # Register the identical toolset on every rung of the cascade:
+        # run_agent_with_fallbacks swaps Agent objects on failure, and a rung
+        # without tools silently loses every capability while the shared
+        # system prompt still commands tool use.
+        _tool_registry = [
+            ("search_web", search_web),
+            ("search_url", search_url),
+            ("send_email_assistant", send_email_assistant),
+            ("history_tool", history_tool),
+            ("recall", recall),
+            ("calendar_create", calendar_create),
+            ("calendar_list", calendar_list),
+        ]
+        for _target_agent in [self.main_assistant, *self.main_assistant_fallbacks]:
+            for _contract_name, _tool_fn in _tool_registry:
+                _target_agent.tool(description=_load_tool_contract(_contract_name))(_tool_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -2413,6 +2485,11 @@ async def websocket_endpoint(ws: WebSocket):
                     await _run_dream_pass_if_needed(state, session_id=pending_sid)
                 except Exception as _e:
                     print(f"LOG: Dream pass error for pending session {pending_sid}: {_e}")
+        if state.sqlite_index is not None:
+            try:
+                state.sqlite_index.checkpoint()
+            except Exception:
+                pass
 
         await rag_system.start_session(session_id=restore_result.session_id)
         message_history: list[ModelMessage] | None = session_store.message_history or None
@@ -2538,6 +2615,11 @@ async def websocket_endpoint(ws: WebSocket):
                     await _run_dream_pass_if_needed(state, session_id=session_id)
                 except Exception as _e:
                     print(f"LOG: Dream pass error on session end for {session_id}: {_e}")
+            if state.sqlite_index is not None:
+                try:
+                    state.sqlite_index.checkpoint()
+                except Exception:
+                    pass
             print("LOG: Session archived and cleaned up")
             _unregister_shutdown_state(state)
 
@@ -2673,7 +2755,7 @@ async def _handle_text_message(
         await _ws_send_json(ws, {"type": "done", "content": final_output})
 
         # Update session
-        message_history = response.all_messages()
+        message_history = _persist_history(message_history, response)
         await state.session_store.replace_messages(message_history)
         state.rag_system.add_conversation(user_text, final_output)
         if state.memory_store is not None:
@@ -2824,7 +2906,7 @@ async def _handle_audio_message(
         await _ws_send_json(ws, {"type": "done", "content": final_output})
 
         # Update session
-        message_history = response.all_messages()
+        message_history = _persist_history(message_history, response)
         await state.session_store.replace_messages(message_history)
         state.rag_system.add_conversation(transcription, final_output)
         if state.memory_store is not None:
