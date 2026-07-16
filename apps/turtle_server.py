@@ -72,8 +72,11 @@ from core.llm_client import (
     run_agent_with_fallbacks,
 )
 from core.email_flow import (
+    build_compose_email_prompt,
     combine_extracted_email_details,
+    derive_fallback_subject,
     extract_deterministic_email_details,
+    format_email_draft,
     format_missing_email_prompt,
     merge_email_details,
     missing_email_fields,
@@ -198,6 +201,15 @@ config = _load_config()
 EMAIL_PROMPT = load_prompt("email_agent").replace("{bot_email}", settings.bot_email)
 _MAIN_ASSISTANT_PROMPT_TEMPLATE = load_prompt("main_assistant")
 
+# Identity handed to the email agent when it composes a body on the user's
+# behalf. Lets "tell about yourself" produce a self-description, and other
+# requests be written as the user's assistant.
+EMAIL_SENDER_IDENTITY = (
+    "You are Turtle, the user's personal AI assistant. Emails you send come "
+    f"from {settings.bot_email}. If the user asks you to write about yourself, "
+    "describe Turtle; otherwise write the message on the user's behalf."
+)
+
 
 def _build_main_assistant_prompt(
     *,
@@ -268,7 +280,12 @@ MAIN_ASSISTANT_PROMPT = _build_main_assistant_prompt()
 # a pure latency tax).  Kept at 2 for typed outputs (router/extractor/email).
 # See H3 in arch_improve.md.
 OUTPUT_RETRIES = 1
-SESSION_RESTORE_MODE = os.getenv("SESSION_RESTORE_MODE", "strict_new")
+# Env var wins (deployment override); otherwise honour turtle_config.json so the
+# committed default actually takes effect. "resume_if_active" lets a dropped or
+# refreshed WebSocket rejoin the live session instead of starting empty.
+SESSION_RESTORE_MODE = os.getenv("SESSION_RESTORE_MODE") or str(
+    config.get("SESSION_RESTORE_MODE", "resume_if_active")
+)
 ACTIVE_HISTORY_MAX_TURNS = int(config.get("TURTLE_HISTORY_MAX_TURNS", 12))
 ACTIVE_HISTORY_MAX_MESSAGES = int(config.get("ACTIVE_HISTORY_MAX_MESSAGES", 40))
 ACTIVE_HISTORY_MAX_TOKENS = int(config.get("TURTLE_HISTORY_MAX_TOKENS", 4000))
@@ -308,11 +325,16 @@ class SharedState:
     confirmation_gate: ConfirmationGate
     task_history_store: TaskHistoryStore
     rag_system: TurtleRAGSystem
+    sqlite_index: Any | None = None   # MemorySQLiteIndex; closed on shutdown
     retrieval_broker: Any | None = None   # D4: wired in setup_shared_state
     reflector: PeriodicReflector | None = None
     search_cache: dict[str, str] = field(default_factory=dict)
     turn_counter: int = 0
     user_id: str = ""
+    # 3b: the routed intent for the current turn. Read by _scope_tools_by_intent
+    # to expose only the tools relevant to this turn (a chitchat turn ships no
+    # tool contracts at all). Set per-turn by the handlers before graph.run.
+    intent: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +370,11 @@ async def _shutdown_state(state: "SharedState") -> None:
         state.journal_store.flush()
     except Exception as exc:
         print(f"LOG: Shutdown journal flush failed for {session_id}: {exc}")
+    if state.sqlite_index is not None:
+        try:
+            state.sqlite_index.close()
+        except Exception as exc:
+            print(f"LOG: Shutdown SQLite index close failed for {session_id}: {exc}")
 
 
 async def _shutdown_all_states() -> None:
@@ -1381,6 +1408,41 @@ def _runtime_agent_registry() -> list[dict[str, Any]]:
 # Helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 3b: intent-scoped tools
+# ---------------------------------------------------------------------------
+# The router classifies every turn; we expose only the tools that intent can
+# use, instead of shipping all 7 tool contracts (~3k tokens) on every request.
+# A "hey turtle" chitchat turn then carries ZERO tool contracts — which is what
+# pushed gpt-oss over Groq's 8k TPM cap (see problems/2026-05-30-*). An intent
+# absent from this map (incl. multi_step, where the planner may dispatch
+# anything, and any unknown/router-failure value) gets the full toolset.
+_TOOL_NAMES_BY_INTENT: dict[str, set[str]] = {
+    "chitchat": set(),
+    "web": {"search_web", "search_url"},
+    "url": {"search_url", "search_web"},
+    "email": {"send_email_assistant"},
+    "calendar": {"calendar_create", "calendar_list"},
+    "memory_recall": {"recall", "history_tool"},
+}
+
+
+async def _scope_tools_by_intent(ctx: RunContext[SharedState], tool_defs: list) -> list:
+    """pydantic-ai prepare_tools hook: filter the toolset to the routed intent.
+
+    Returns the unfiltered list for unknown/multi_step intents (safe default),
+    or only the intent's allowed tools (possibly empty, e.g. chitchat).
+    """
+    try:
+        intent = (ctx.deps.intent or "").strip() if ctx.deps is not None else ""
+    except Exception:
+        intent = ""
+    allowed = _TOOL_NAMES_BY_INTENT.get(intent)
+    if allowed is None:
+        return tool_defs
+    return [td for td in tool_defs if getattr(td, "name", None) in allowed]
+
+
 def _build_model_from_str(model_str: str, settings: Any) -> Any | None:
     """Parse 'provider:model_name' and return a pydantic-ai model object."""
     if not model_str:
@@ -1475,18 +1537,23 @@ class AgentManager:
                 and getattr(override, "model_name", None) == getattr(head, "model_name", None)
             )
 
-        # main_assistant: gpt-oss → Gemini direct → Gemini via OpenRouter.
-        # gpt-oss-120b on Groq handles the conversational + tool-call workload;
-        # if Groq 429s or harmony-errors, Gemini direct picks up cleanly, and
-        # OpenRouter is the last resort if Google quota is exhausted.
+        # main_assistant: Gemini direct → Gemini via OpenRouter → gpt-oss → Llama.
+        # a1: Gemini leads. It's a strong tool-caller, and on the free tier its
+        # token limits dwarf Groq's 8k TPM — which gpt-oss-120b blows on Turtle's
+        # tool surface (see problems/2026-05-30-groq-tpm-and-gemini-thinking.md).
+        # gpt-oss is demoted to a deep fallback: still there if Google is fully
+        # down, but no longer the rung that 413s on every turn. The override goes
+        # through get_google_models, so it inherits thinking-disabled settings;
+        # the _override_redundant guard collapses it onto gemini_models[0].
         main_override = _build_model_from_str(cfg.get("MAIN_AGENT_MODEL", ""), settings)
-        main_head: Any = main_override or gpt_oss
-        # Groq llama tacked on as final rescue: if Groq harmony-errors AND every
-        # Gemini variant 400s on function-call adjacency (Google strict, OR
-        # often proxies to the same backend), llama-3.3-70b on Groq is lenient
-        # about message order and gives us a non-zero chance of recovery.
+        if _override_redundant(main_override, gemini_models):
+            main_override = None
+        main_head: Any = main_override or (gemini_models[0] if gemini_models else gpt_oss)
+        # Groq llama is the final rescue: if every Gemini variant 400s on
+        # function-call adjacency (Google strict, OR often proxies to the same
+        # backend), llama-3.3-70b on Groq is lenient about message order.
         main_chain = build_chain(
-            main_head, gemini_models, openrouter_models, groq_llama, groq_llama_small,
+            main_head, gemini_models, openrouter_models, gpt_oss, groq_llama, groq_llama_small,
         )
 
         # email_agent: Gemini direct → Gemini via OpenRouter → Llama (Groq).
@@ -1507,7 +1574,9 @@ class AgentManager:
                 "Cannot build agent chain — no usable model for main/email agent."
             )
 
-        # Main assistant
+        # Main assistant. prepare_tools (3b) scopes the toolset to the routed
+        # intent per turn — applied to every rung so the cascade keeps the same
+        # tool-scoping behaviour on fallback.
         self.main_assistant = Agent(
             main_chain[0],
             deps_type=SharedState,
@@ -1515,11 +1584,13 @@ class AgentManager:
             output_retries=OUTPUT_RETRIES,
             instructions=MAIN_ASSISTANT_PROMPT,
             history_processors=[_trim_history_for_context, _sanitize_tool_pairs],
+            prepare_tools=_scope_tools_by_intent,
         )
         self.main_assistant_fallbacks = [
             Agent(m, deps_type=SharedState, output_type=str,
                   output_retries=OUTPUT_RETRIES, instructions=MAIN_ASSISTANT_PROMPT,
-                  history_processors=[_trim_history_for_context, _sanitize_tool_pairs])
+                  history_processors=[_trim_history_for_context, _sanitize_tool_pairs],
+                  prepare_tools=_scope_tools_by_intent)
             for m in main_chain[1:]
         ]
 
@@ -1684,6 +1755,40 @@ class AgentManager:
                     parts.append(f"bcc: {', '.join(invalid_bcc)}")
                 return clean_text_for_model(f"I found invalid email format: {'; '.join(parts)}. Please provide the address again.")
 
+            # Composition pass: when the user delegated authoring ("tell about
+            # yourself", "pick a subject"), the extractor leaves subject/content
+            # empty — historically that looped back asking the user to type
+            # them. Instead, let the agent AUTHOR the missing pieces. Subject is
+            # auto-derived and never blocks; we only fall back to asking when
+            # the request gave no basis to write a body.
+            profile = ctx.deps.personal_memory_store.load_profile_snapshot()
+            email_tone = (profile.get("preferences") or {}).get("email_tone") or ""
+            content_before_compose = merged["content"]
+
+            if missing_email_fields(merged):
+                compose_prompt = build_compose_email_prompt(
+                    user_request=query,
+                    merged=merged,
+                    email_tone=email_tone,
+                    sender_identity=EMAIL_SENDER_IDENTITY,
+                )
+                compose_result = await run_agent_with_fallbacks(
+                    agents_mgr.email_agent,
+                    agents_mgr.email_agent_fallbacks,
+                    compose_prompt,
+                    deps=ctx.deps,
+                    usage=ctx.usage,
+                )
+                composed = parse_email_extraction_response(compose_result.output).model_dump()
+                # Fill only the gaps — never overwrite anything the user dictated.
+                if not merged["content"] and composed.get("content"):
+                    merged["content"] = str(composed["content"]).strip()
+                if not merged["subject"] and composed.get("subject"):
+                    merged["subject"] = str(composed["subject"]).strip()
+                # Subject must never block a send once we have a body.
+                if not merged["subject"] and merged["content"]:
+                    merged["subject"] = derive_fallback_subject(merged["content"])
+
             missing = missing_email_fields(merged)
             if missing:
                 await ctx.deps.session_store.set_pending_email(
@@ -1691,6 +1796,25 @@ class AgentManager:
                     bcc_recipients=merged["bcc_recipients"], subject=merged["subject"], content=merged["content"],
                 )
                 return clean_text_for_model(format_missing_email_prompt(missing, merged))
+
+            # Draft-before-send: when the body was authored by Turtle this turn
+            # (not dictated by the user) and the user prefers drafts, show the
+            # draft and hold for a 'send' confirmation instead of sending now.
+            # On the follow-up turn the content is already pending, so this
+            # branch is skipped and the send proceeds. (Finally activates the
+            # previously-captured-but-unenforced prefers_draft_before_send.)
+            authored_this_turn = not content_before_compose and bool(merged["content"])
+            prefers_draft = bool((profile.get("workflow") or {}).get("prefers_draft_before_send"))
+            if authored_this_turn and prefers_draft:
+                await ctx.deps.session_store.set_pending_email(
+                    recipients=merged["recipients"], cc_recipients=merged["cc_recipients"],
+                    bcc_recipients=merged["bcc_recipients"], subject=merged["subject"], content=merged["content"],
+                )
+                return clean_text_for_model(
+                    "Here's the draft:\n\n"
+                    + format_email_draft(merged)
+                    + "\n\nReply \"send\" to send it, or tell me what to change."
+                )
 
             try:
                 validate_send_email_args(
@@ -1722,6 +1846,10 @@ class AgentManager:
 
             if send_result.startswith("Email sent successfully!"):
                 await ctx.deps.session_store.clear_pending_email()
+                # When Turtle authored the body, show it so the user sees what
+                # went out (send_email_now echoes only the headers).
+                if authored_this_turn:
+                    send_result = f"{send_result}\n\nBody:\n{merged['content']}"
             else:
                 await ctx.deps.session_store.set_pending_email(
                     recipients=merged["recipients"], cc_recipients=merged["cc_recipients"],
@@ -2211,7 +2339,14 @@ async def websocket_endpoint(ws: WebSocket):
         # personal memory now lives under personal_memory_dir(user_id).
         memory_store = None
         personal_memory_store = PersonalMemoryStore(user_id=user_id)
-        journal_store = JournalStore(user_id=user_id)
+        from core.memory_sqlite import MemorySQLiteIndex
+        sqlite_index = MemorySQLiteIndex(user_id=user_id)
+        journal_store = JournalStore(user_id=user_id, on_append=sqlite_index.index_event)
+        # Backfill the FTS5 index from the journal (idempotent; no-op on restart).
+        try:
+            sqlite_index.backfill_from_journal(journal_store)
+        except Exception as exc:
+            print(f"LOG: SQLite memory index backfill failed for {user_id}: {exc}")
         confirmation_gate = ConfirmationGate(
             journal=journal_store,
             store=personal_memory_store,
@@ -2235,9 +2370,11 @@ async def websocket_endpoint(ws: WebSocket):
             store=personal_memory_store,
             task_store=task_history_store,
             journal_store=journal_store,
+            sqlite_index=sqlite_index,
             session_store=session_store,
             rag_system=rag_system,
             vector_store=vector_store,
+            user_id=user_id,
         )
 
         state = SharedState(
@@ -2250,6 +2387,7 @@ async def websocket_endpoint(ws: WebSocket):
             confirmation_gate=confirmation_gate,
             task_history_store=task_history_store,
             rag_system=rag_system,
+            sqlite_index=sqlite_index,
             retrieval_broker=retrieval_broker,
             reflector=PeriodicReflector(),
             user_id=user_id,
@@ -2515,6 +2653,7 @@ async def _handle_text_message(
 
         # Consume RouterDecision intent — route into the appropriate graph
         graph = _select_graph(task_type)
+        state.intent = task_type  # 3b: scope tools to this turn's intent
 
         llm_start = time.time()
         response = await graph.run(
@@ -2667,6 +2806,7 @@ async def _handle_audio_message(
             timings["router_ms"] = -1
 
         graph = _select_graph(task_type)
+        state.intent = task_type  # 3b: scope tools to this turn's intent
 
         llm_start = time.time()
         response = await graph.run(

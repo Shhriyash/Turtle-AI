@@ -34,6 +34,46 @@ except Exception:
     _logfire = None  # type: ignore
 
 
+class _RepairedHistoryResult:
+    """Wraps a synthesis run result so its ``all_messages()`` extends the real
+    conversation instead of returning only the internal synthesis exchange.
+
+    The parallel-planner synthesis call runs without ``message_history`` (to
+    keep raw tool-call records away from fallback models). Callers persist
+    ``response.all_messages()`` as the canonical history, so without this
+    repair every parallel multi-step turn would discard the conversation and
+    store the synthesis prompt as the user's last message. We rebuild the
+    history as ``prior + [real user turn, synthesized reply turns]``.
+
+    Only ``.output`` and ``.all_messages()`` are consumed by callers; both are
+    proxied here.
+    """
+
+    def __init__(self, inner: Any, prior_history: list[Any], user_prompt: str) -> None:
+        from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart
+
+        self._inner = inner
+        inner_messages = list(inner.all_messages())
+        # Keep only the final assistant reply. Intermediate tool-call responses
+        # (and their request/return turns) from the synthesis run would orphan
+        # in the stored history; the conversation only needs the visible answer.
+        responses = [m for m in inner_messages if isinstance(m, ModelResponse)]
+        reply_messages = responses[-1:] if responses else []
+        real_user_turn = ModelRequest(parts=[UserPromptPart(content=user_prompt)])
+        self._messages = list(prior_history) + [real_user_turn] + reply_messages
+
+    @property
+    def output(self) -> Any:
+        return self._inner.output
+
+    def all_messages(self) -> list[Any]:
+        return self._messages
+
+    def __getattr__(self, name: str) -> Any:
+        # Proxy any other attribute access (e.g. usage) to the wrapped result.
+        return getattr(self._inner, name)
+
+
 # ---------------------------------------------------------------------------
 # Planner types (A4)
 # ---------------------------------------------------------------------------
@@ -563,12 +603,23 @@ class TurtleGraph:
         # a fallback model regurgitating "search_web(query=...)" as the reply.
         synthesis_prompt = _build_synthesis_prompt(prompt, step_results)
         synth_kwargs = {k: v for k, v in kwargs.items() if k != "message_history"}
-        return await run_agent_with_fallbacks(
+        synth_result = await run_agent_with_fallbacks(
             primary_agent,
             fallback_agents,
             synthesis_prompt,
             **synth_kwargs,
         )
+
+        # History repair: the synthesis call deliberately runs WITHOUT
+        # message_history (so a fallback model never sees raw tool-call
+        # records). But that means synth_result.all_messages() contains only
+        # the internal synthesis prompt + reply — not the conversation. If the
+        # caller stores that verbatim it WIPES the conversation and records the
+        # tool-result blob as the user's last turn. Reattach the real prior
+        # history and substitute the user's actual request for the synthesis
+        # prompt, so all_messages() extends the conversation correctly.
+        original_history = kwargs.get("message_history") or []
+        return _RepairedHistoryResult(synth_result, original_history, prompt)
 
     def __repr__(self) -> str:
         return f"TurtleGraph({self.graph_def.name!r}, intent={self.graph_def.intent!r})"

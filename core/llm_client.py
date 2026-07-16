@@ -11,7 +11,7 @@ from pydantic_ai.messages import (
     ToolCallPart,
     ToolReturnPart,
 )
-from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.models.groq import GroqModel
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.google import GoogleProvider
@@ -36,6 +36,24 @@ GEMINI_KEY_ENV_VARS = [
     "GEMINI_API_KEY",
     "GEMINI_API_KEY_2",
     "GEMINI_API_KEY_3",
+]
+
+# Substrings that identify a provider-level tool-render / template-compat
+# failure (chiefly Groq's Harmony path for gpt-oss models, but also Gemini's
+# strict function-call/response adjacency). Used both to decide a model swap
+# and to log the exact failure when it happens.
+_HARMONY_TOKENS = [
+    "tools should have a name",
+    "failed to template request",
+    "render tokens with harmony",
+    "harmonyerror",
+    "encodingerror",
+    # Gemini direct is strict about function-call / function-response
+    # adjacency in message_history. Groq/OpenRouter tolerate gaps; Google
+    # 400s. Treat as a provider-compat failure so the cascade can skip past
+    # Gemini-direct rungs to a more lenient backend (Groq llama).
+    "function response turn comes immediately after a function call",
+    "function call turn",
 ]
 
 
@@ -104,10 +122,21 @@ def get_google_models(
     callers can stack them as round-robin fallbacks.
     """
     model = model_name or os.getenv("GEMINI_MODEL", GEMINI_DEFAULT_MODEL)
+    # Gemini 2.5 models are *thinking* models: by default they spend part of the
+    # maxOutputTokens budget on internal reasoning. Turtle's agents are
+    # conversational + tool-routing, not deep-reasoning, so thinking just burns
+    # output budget — and with a small max_tokens it can consume the *entire*
+    # allowance, yielding empty/truncated responses (finish_reason length/error)
+    # that never reach a tool call. Disable it explicitly (thinking_budget=0,
+    # supported by gemini-2.5-flash) so the full token budget goes to the answer.
+    google_settings = GoogleModelSettings(
+        **(dict(settings) if settings else {}),
+        google_thinking_config={"thinking_budget": 0, "include_thoughts": False},
+    )
     models: list[GoogleModel] = []
     for api_key in get_gemini_keys():
         provider = GoogleProvider(api_key=api_key)
-        models.append(GoogleModel(model, provider=provider, settings=settings))
+        models.append(GoogleModel(model, provider=provider, settings=google_settings))
     return models
 
 
@@ -127,7 +156,10 @@ def get_groq_fallback_model(model_name: str | None = None, settings: ModelSettin
 
 
 def is_rate_limit_error(exc: Exception) -> bool:
-    if isinstance(exc, ModelHTTPError) and exc.status_code == 429:
+    # 413 = Groq "Request too large" for the per-minute token (TPM) budget —
+    # it carries code 'rate_limit_exceeded'. It's a capacity limit, not a bad
+    # request, so treat it like 429.
+    if isinstance(exc, ModelHTTPError) and exc.status_code in {413, 429}:
         return True
     if isinstance(exc, ModelAPIError):
         message = str(exc).lower()
@@ -137,21 +169,10 @@ def is_rate_limit_error(exc: Exception) -> bool:
 
 
 def is_key_failure_error(exc: Exception) -> bool:
-    harmony_tool_render_tokens = [
-        "tools should have a name",
-        "failed to template request",
-        "render tokens with harmony",
-        "harmonyerror",
-        "encodingerror",
-        # Gemini direct is strict about function-call / function-response
-        # adjacency in message_history. Groq/OpenRouter tolerate gaps; Google
-        # 400s. Treat as a provider-compat failure so the cascade can skip past
-        # Gemini-direct rungs to a more lenient backend (Groq llama).
-        "function response turn comes immediately after a function call",
-        "function call turn",
-    ]
     if isinstance(exc, ModelHTTPError):
-        if exc.status_code in {401, 403, 404, 429}:
+        # 413 = TPM "request too large" (rate_limit_exceeded) — capacity, not a
+        # client error. Fall over to a model on a different provider/limit.
+        if exc.status_code in {401, 403, 404, 413, 429}:
             return True
         if exc.status_code == 400:
             # Only treat 400 as fallback-eligible when it's a known provider-level
@@ -159,7 +180,7 @@ def is_key_failure_error(exc: Exception) -> bool:
             # errors (bad args, missing fields) must NOT trigger a model swap —
             # they should surface as semantic errors to the caller.
             message = str(exc).lower()
-            return any(token in message for token in harmony_tool_render_tokens)
+            return any(token in message for token in _HARMONY_TOKENS)
         return False
     if isinstance(exc, ModelAPIError):
         messages = _flatten_exception_messages(exc)
@@ -173,7 +194,7 @@ def is_key_failure_error(exc: Exception) -> bool:
                 "unauthorized",
                 "tool_choice",
                 "no endpoints found",
-                *harmony_tool_render_tokens,
+                *_HARMONY_TOKENS,
             ]
         )
     messages = _flatten_exception_messages(exc)
@@ -187,9 +208,41 @@ def is_key_failure_error(exc: Exception) -> bool:
             "unauthorized",
             "tool_choice",
             "no endpoints found",
-            *harmony_tool_render_tokens,
+            *_HARMONY_TOKENS,
         ]
     )
+
+
+def _is_harmony_error(exc: Exception) -> bool:
+    """True when the failure looks like a provider tool-render/template bug
+    (Groq Harmony for gpt-oss, or Gemini function-call adjacency)."""
+    return any(
+        token in message
+        for message in _flatten_exception_messages(exc)
+        for token in _HARMONY_TOKENS
+    )
+
+
+def _log_harmony_error(agent: Any, exc: Exception) -> None:
+    """Capture the *exact* harmony/tool-render error so we can finally see which
+    variant gpt-oss-120b is hitting. Cheap, fires only on a confirmed match."""
+    if not _is_harmony_error(exc):
+        return
+    model = getattr(agent, "model", None)
+    model_name = getattr(model, "model_name", None) or getattr(model, "name", None) or str(model)
+    status = getattr(exc, "status_code", None)
+    print(f"LOG: HARMONY tool-render failure on {model_name} (status={status}): {exc}")
+    if _logfire is not None:
+        try:
+            _logfire.error(
+                "harmony_tool_render_error",
+                model_name=str(model_name),
+                status_code=status,
+                error_class=exc.__class__.__name__,
+                error=str(exc)[:2000],
+            )
+        except Exception:
+            pass
 
 
 def _fallback_log(exc: Exception) -> None:
@@ -334,6 +387,7 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
             return result
         except Exception as exc:
             last_exc = exc
+            _log_harmony_error(agent, exc)
             health_tracker.mark_failure(agent, exc)
             should_fallback = (
                 is_key_failure_error(exc)
@@ -370,6 +424,7 @@ def run_agent_sync_with_fallbacks(primary_agent: Any, fallback_agents: list[Any]
             return result
         except Exception as exc:
             last_exc = exc
+            _log_harmony_error(agent, exc)
             health_tracker.mark_failure(agent, exc)
             should_fallback = (
                 is_key_failure_error(exc)

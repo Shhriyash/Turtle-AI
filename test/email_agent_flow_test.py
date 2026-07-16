@@ -7,9 +7,12 @@ from unittest.mock import patch
 from pydantic_ai.exceptions import ModelRetry
 
 from core.email_flow import (
+    build_compose_email_prompt,
     build_send_request,
     combine_extracted_email_details,
+    derive_fallback_subject,
     extract_deterministic_email_details,
+    format_email_draft,
     format_missing_email_prompt,
     merge_email_details,
     missing_email_fields,
@@ -156,6 +159,57 @@ class EmailFlowTests(unittest.TestCase):
         self.assertIn("To: user@example.com", prompt)
         self.assertIn("Subject: hello", prompt)
         self.assertIn("missing email body/message", prompt)
+
+    def test_compose_prompt_includes_request_identity_and_existing_fields(self) -> None:
+        prompt = build_compose_email_prompt(
+            user_request="tell about yourself and pick a subject",
+            merged={"subject": "", "content": "", "recipients": ["me@example.com"]},
+            email_tone="friendly",
+            sender_identity="You are Turtle.",
+        )
+        self.assertIn("Compose an email", prompt)
+        self.assertIn("You are Turtle.", prompt)
+        self.assertIn("friendly", prompt)
+        self.assertIn("tell about yourself and pick a subject", prompt)
+        # Must ask for JSON with subject + content (parseable by the extractor).
+        self.assertIn('"subject"', prompt)
+        self.assertIn('"content"', prompt)
+
+    def test_compose_prompt_preserves_dictated_fields(self) -> None:
+        prompt = build_compose_email_prompt(
+            user_request="finish this email",
+            merged={"subject": "Quarterly update", "content": "Numbers attached.", "recipients": []},
+        )
+        # Existing user-dictated values are shown so the model reuses them.
+        self.assertIn("Quarterly update", prompt)
+        self.assertIn("Numbers attached.", prompt)
+
+    def test_derive_fallback_subject(self) -> None:
+        self.assertEqual(
+            derive_fallback_subject("Hello there, this is Turtle. Extra."),
+            "Hello there, this is Turtle. Extra",  # trailing punctuation trimmed
+        )
+        self.assertEqual(derive_fallback_subject(""), "(no subject)")
+        self.assertEqual(derive_fallback_subject("   \n\n  Real body line here"), "Real body line here")
+        # Caps at 8 words.
+        self.assertEqual(
+            derive_fallback_subject("one two three four five six seven eight nine ten"),
+            "one two three four five six seven eight",
+        )
+
+    def test_format_email_draft_shows_headers_and_body_and_omits_empty(self) -> None:
+        draft = format_email_draft({
+            "recipients": ["me@example.com"],
+            "cc_recipients": [],
+            "bcc_recipients": [],
+            "subject": "About Turtle",
+            "content": "Hi.\nI'm your assistant.",
+        })
+        self.assertIn("To: me@example.com", draft)
+        self.assertIn("Subject: About Turtle", draft)
+        self.assertIn("I'm your assistant.", draft)
+        self.assertNotIn("Cc:", draft)
+        self.assertNotIn("Bcc:", draft)
 
     def test_recipient_validation_splits_valid_and_invalid(self) -> None:
         valid, invalid = validate_recipients(["good@example.com", "bad-email", "also@good.com"])

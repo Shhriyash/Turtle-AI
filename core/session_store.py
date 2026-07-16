@@ -74,31 +74,68 @@ class SessionStore:
         }
         await self.backend.put(Session(session_id=self.session_id, data=data))
 
-    async def start_or_restore(self, mode: str = "strict_new") -> SessionRestoreResult:
+    def _restore_from_session(self, session: Session) -> SessionRestoreResult:
+        self.session_id = session.session_id
+        self.current_status = "active"
+        self.pending_email = session.data.get("pending_email", self._default_pending_email())
+        summary = session.data.get("summary", [])
+        self.rolling_summary = summary if isinstance(summary, list) else []
+        raw_messages = session.data.get("messages", [])
+        try:
+            self.message_history = ModelMessagesTypeAdapter.validate_python(raw_messages)
+        except Exception:
+            self.message_history = []
+        return SessionRestoreResult(
+            session_id=self.session_id,
+            restored=True,
+            message_count=len(self.message_history),
+        )
+
+    @staticmethod
+    def _seconds_since(updated_at: str) -> float:
+        """Age in seconds of an ISO-8601 ``updated_at`` value; +inf if unparseable."""
+        if not updated_at:
+            return float("inf")
+        try:
+            ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except ValueError:
+            return float("inf")
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - ts).total_seconds()
+
+    async def start_or_restore(
+        self, mode: str = "strict_new", resume_window_seconds: int = 1800
+    ) -> SessionRestoreResult:
         await self.init_backend()
-        
+
         if mode == "resume_if_active":
             if hasattr(self.backend, "list_sessions"):
+                # 1) A still-active session (e.g. a second concurrent tab, or a
+                #    crash that skipped the disconnect finalizer).
                 active_sessions = await getattr(self.backend, "list_sessions")(status_filter="active")
                 if active_sessions:
                     active_sessions.sort(key=lambda s: s.data.get("updated_at", ""), reverse=True)
-                    latest = active_sessions[0]
-                    self.session_id = latest.session_id
-                    self.current_status = latest.data.get("status", "active")
-                    self.pending_email = latest.data.get("pending_email", self._default_pending_email())
-                    summary = latest.data.get("summary", [])
-                    self.rolling_summary = summary if isinstance(summary, list) else []
-                    raw_messages = latest.data.get("messages", [])
-                    try:
-                        self.message_history = ModelMessagesTypeAdapter.validate_python(raw_messages)
-                    except Exception:
-                        self.message_history = []
-                    
-                    return SessionRestoreResult(
-                        session_id=self.session_id,
-                        restored=True,
-                        message_count=len(self.message_history)
-                    )
+                    return self._restore_from_session(active_sessions[0])
+
+                # 2) A recently-disconnected session. The WS finalizer archives
+                #    every session as "pending_finalization" on disconnect, so a
+                #    reconnect (drop, refresh, watchdog) finds nothing "active".
+                #    Resume the most recent one within the window and flip it
+                #    back to active so the connect-time finalizer skips it.
+                pending = await getattr(self.backend, "list_sessions")(
+                    status_filter="pending_finalization"
+                )
+                if pending:
+                    pending.sort(key=lambda s: s.data.get("updated_at", ""), reverse=True)
+                    latest = pending[0]
+                    age = self._seconds_since(latest.data.get("updated_at", ""))
+                    if age <= resume_window_seconds:
+                        result = self._restore_from_session(latest)
+                        # Persist the active flip so the finalization loop and
+                        # any other connection no longer treat it as pending.
+                        await self._sync_to_backend()
+                        return result
 
         previous_session_id = None
         if hasattr(self.backend, "list_sessions"):

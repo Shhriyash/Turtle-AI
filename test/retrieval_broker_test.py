@@ -285,6 +285,85 @@ class RetrievalBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[Past Conversations]", result)
 
 
+class PersonalTierTests(unittest.IsolatedAsyncioTestCase):
+    """Hybrid personal recall: FTS5-first, vector fallback."""
+
+    def setUp(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from core.memory_journal import make_event
+        from core.memory_sqlite import MemorySQLiteIndex
+
+        self.base = Path("test") / "_tmp" / f"ptier_{uuid.uuid4().hex}"
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.store = _make_store(self.base)
+        self.task_store = TaskHistoryStore(self.base / "tasks" / "history.jsonl")
+        self.index = MemorySQLiteIndex(db_path=self.base / "memory.sqlite")
+        for ev in (
+            make_event(
+                kind="fact", topic="relations", key="relations.best_friend",
+                value={"best_friend": "Aarav"}, confidence=1.0,
+                source="explicit", extractor="deterministic", applied=True,
+                session_id="s1", turn_id="t1", observed_at="2026-05-01T10:00:00Z",
+            ),
+            make_event(
+                kind="preference", topic="preferences", key="preferences.tone",
+                value={"tone": "concise"}, confidence=1.0,
+                source="explicit", extractor="deterministic", applied=True,
+                session_id="s1", turn_id="t2", observed_at="2026-05-01T10:01:00Z",
+            ),
+        ):
+            self.index.index_event(ev)
+        self.vector_store = AsyncMock()
+        self.vector_store.search = AsyncMock(return_value=[])
+
+    def tearDown(self) -> None:
+        self.index.close()
+        shutil.rmtree(self.base, ignore_errors=True)
+
+    def _broker(self) -> RetrievalBroker:
+        return RetrievalBroker(
+            store=self.store,
+            task_store=self.task_store,
+            sqlite_index=self.index,
+            vector_store=self.vector_store,
+            user_id="usr_test",
+        )
+
+    async def test_strong_fts_skips_vector_call(self) -> None:
+        broker = self._broker()
+        result = await broker.recall(query="do you remember my best friend", scope="personal")
+        self.assertIn("Aarav", result)
+        self.vector_store.search.assert_not_awaited()
+
+    async def test_weak_fts_triggers_vector_fallback(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from core.storage import Hit
+
+        self.vector_store.search = AsyncMock(
+            return_value=[Hit(doc_id="d1", text="City: Mumbai", score=0.82, metadata={"topic": "identity"})]
+        )
+        broker = self._broker()
+        result = await broker.recall(query="where do I stay", scope="personal")
+        self.vector_store.search.assert_awaited_once()
+        self.assertIn("Mumbai", result)
+
+    async def test_empty_fts_and_empty_vector_returns_empty(self) -> None:
+        broker = self._broker()
+        result = await broker.recall(query="quantum chromodynamics", scope="personal")
+        self.assertEqual(result, "")
+        self.vector_store.search.assert_awaited_once()
+
+    async def test_token_overlap_math(self) -> None:
+        from core.retrieval_broker import _token_overlap
+
+        self.assertEqual(_token_overlap("best friend", "Best Friend Aarav"), 1.0)
+        self.assertEqual(_token_overlap("best friend", "no match here"), 0.0)
+        self.assertEqual(_token_overlap("", "anything"), 0.0)
+        self.assertAlmostEqual(_token_overlap("best friend pal", "best buddy"), 1 / 3)
+
+
 class RetrievalBudgetTests(unittest.TestCase):
     def test_default_budget_values(self) -> None:
         b = DEFAULT_BUDGET

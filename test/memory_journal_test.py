@@ -55,6 +55,50 @@ class MemoryJournalTests(unittest.TestCase):
         self.assertEqual(loaded[0].event_id, event.event_id)
         self.assertEqual(loaded[0].value["name"], "Shriyash")
 
+    def test_on_append_fires_once_per_event(self) -> None:
+        seen: list[str] = []
+        journal = JournalStore(
+            journal_dir=self.base / "journal_cb",
+            on_append=lambda ev: seen.append(ev.event_id),
+        )
+        event = make_event(
+            kind="fact",
+            topic="identity",
+            key="identity.name",
+            value={"name": "Cb"},
+            confidence=1.0,
+            source="explicit",
+            extractor="deterministic",
+            applied=True,
+            session_id="s1",
+            turn_id="t1",
+            observed_at="2026-04-13T10:00:00Z",
+        )
+        journal.append(event)
+        journal.append(event)  # idempotent — must NOT fire again
+        self.assertEqual(seen, [event.event_id])
+
+    def test_on_append_exception_does_not_block_write(self) -> None:
+        def _boom(_ev) -> None:
+            raise RuntimeError("index down")
+
+        journal = JournalStore(journal_dir=self.base / "journal_boom", on_append=_boom)
+        event = make_event(
+            kind="fact",
+            topic="identity",
+            key="identity.name",
+            value={"name": "Safe"},
+            confidence=1.0,
+            source="explicit",
+            extractor="deterministic",
+            applied=True,
+            session_id="s1",
+            turn_id="t1",
+            observed_at="2026-04-13T10:00:00Z",
+        )
+        journal.append(event)  # must not raise
+        self.assertEqual(len(journal.load_all()), 1)
+
     def test_append_is_idempotent_by_event_id(self) -> None:
         event = make_event(
             kind="fact",

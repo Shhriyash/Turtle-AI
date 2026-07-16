@@ -75,7 +75,6 @@ Recall tool rubric:
 - Call it to check whether a task was already attempted with scope tasks.
 - Call it when the user references something earlier in this conversation that is no longer visible, using scope working.
 - Do not call recall for general knowledge, for facts already in the injected identity or index block, or for the current turn's content.
-- Query phrasing: pass the bare noun phrase you are looking for, written the way it is most likely stored. Do NOT prefix the query with "user's", "my", or "your" — those tokens never appear in stored memory and will cause a miss. Examples: "best friend", "job or occupation", "morning routine", "preferred email tone". Not: "user's best friend", "my job", "your morning routine".
 - Using injected memory: if the runtime_context, identity block, or memory index already contains a fact the user is asking about (their name, email, timezone, language, occupation, listed relations, listed routines), answer directly from that block. Do NOT ask the user for a fact that is already shown to you, and do NOT say "I don't have a record" for something present in the injected block.
 </citation_rules>
 

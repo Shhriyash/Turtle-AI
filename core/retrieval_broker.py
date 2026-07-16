@@ -8,15 +8,23 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
+from core.config import settings
+from core.memory_sqlite import MemoryEventRow, MemorySQLiteIndex
 from core.personal_memory_prompt import PersonalMemoryPromptBuilder
 from core.personal_memory_store import PersonalMemoryStore
 from core.task_history import TaskHistoryStore
 from core.memory_journal import JournalStore
 from core.session_store import SessionStore
+
+try:
+    import logfire as _logfire  # type: ignore
+except Exception:  # pragma: no cover - logfire optional
+    _logfire = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -109,23 +117,12 @@ _RECALL_QUERY_FILLER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Possessives the model adds because the system prompt taught it to phrase
-# queries from the assistant's perspective ("user's <noun>", "my <noun>",
-# "your <noun>"). Stored memory lines never contain these tokens.
-_RECALL_QUERY_POSSESSIVE_RE = re.compile(
-    r"\b(?:the\s+user'?s?|user'?s?|my|your|their|his|her)\s+",
-    re.IGNORECASE,
-)
-
-
 def _normalize_recall_query(query: str) -> str:
-    """Lowercase + strip natural-language filler + strip possessives.
+    """Lowercase + collapse whitespace + strip leading filler.
 
-    The personal-memory lexical search compares the query as a substring of
-    each topic line. If the model emits "user's best friend" but the line is
-    "- Best Friend: Aarav", the substring fails. Normalization brings the
-    query into the same shape the store uses ("best friend") so the match has
-    a chance of hitting.
+    FTS5 tokenization (porter stemmer, unicode61) handles inflection,
+    possessives, and word order, so we only strip the leading conversational
+    filler ("do you remember", "what is") to keep the MATCH expression tight.
     """
     text = " ".join(str(query or "").split()).strip().lower()
     if not text:
@@ -136,52 +133,59 @@ def _normalize_recall_query(query: str) -> str:
         if replaced == text:
             break
         text = replaced
-    text = _RECALL_QUERY_POSSESSIVE_RE.sub("", text)
     text = " ".join(text.split())
     text = text.rstrip("?.!,; ")
     return text
 
 
-# Maps query keywords → topic file(s) we should dump in full when lexical
-# search misses. Order within each tuple is preserved so the highest-signal
-# keywords match first.
-_TOPIC_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("relations", (
-        "best friend", "boyfriend", "girlfriend",
-        "wife", "husband", "spouse", "partner",
-        "brother", "sister", "sibling", "cousin",
-        "mom", "mother", "dad", "father", "parent",
-        "family", "relative", "friend",
-    )),
-    ("identity", (
-        "name", "email", "timezone", "time zone",
-        "language", "city", "country",
-        "occupation", "job", "role", "profession",
-        "company", "employer", "work",
-    )),
-    ("workflow", (
-        "morning routine", "daily briefing",
-        "routine", "schedule", "habit",
-        "every morning", "every day", "every week",
-        "daily", "weekly", "briefing",
-    )),
-    ("contacts", ("recipient", "mail to", "send to", "contact")),
-    ("projects", ("project", "repo", "repository", "codebase", "working on")),
-    ("preferences", ("prefer", "tone", "style", "humor", "concise", "detailed")),
-)
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
-def _topics_for_keywords(query: str) -> list[str]:
-    """Return candidate topic names whose keyword family appears in *query*."""
-    if not query:
-        return []
-    topics: list[str] = []
-    for topic_name, keywords in _TOPIC_KEYWORDS:
-        if topic_name in topics:
+def _tokenize(text: str) -> set[str]:
+    return set(_TOKEN_RE.findall(str(text or "").lower()))
+
+
+def _token_overlap(query: str, line: str) -> float:
+    """Fraction of query tokens that also appear in *line*.
+
+    Corpus-independent and interpretable — the primary "is lexical strong
+    enough?" signal. Returns 0.0 when the query has no tokens.
+    """
+    q_tokens = _tokenize(query)
+    if not q_tokens:
+        return 0.0
+    line_tokens = _tokenize(line)
+    return len(q_tokens & line_tokens) / len(q_tokens)
+
+
+def _row_searchable_text(row: MemoryEventRow) -> str:
+    """The text FTS5 actually matched on — topic, key, value, evidence.
+
+    Used for token-overlap scoring so a query like "best friend" (stored in the
+    *key* ``relations.best_friend`` with value "Aarav") counts as a strong hit.
+    """
+    return " ".join(
+        part for part in (row.topic, row.key, row.value_text, row.evidence_text) if part
+    )
+
+
+def _format_personal_hits(hits: list[MemoryEventRow]) -> str:
+    """Render BM25-ranked FTS rows as a compact prompt block."""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for row in hits:
+        text = (row.value_text or "").strip()
+        if not text:
             continue
-        if any(kw in query for kw in keywords):
-            topics.append(topic_name)
-    return topics
+        dedupe_key = f"{row.topic}:{text.lower()}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        label = row.key or row.topic
+        lines.append(f"- {label}: {text}")
+    if not lines:
+        return ""
+    return "[Personal Memory]\n" + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -202,17 +206,21 @@ class RetrievalBroker:
         store: PersonalMemoryStore,
         task_store: TaskHistoryStore,
         journal_store: JournalStore | None = None,
+        sqlite_index: MemorySQLiteIndex | None = None,
         session_store: SessionStore | None = None,
         rag_system: Any | None = None,
         vector_store: Any | None = None,
+        user_id: str = "",
         budget: RetrievalBudget = DEFAULT_BUDGET,
     ) -> None:
         self.store = store
         self.task_store = task_store
         self.journal_store = journal_store
+        self.sqlite_index = sqlite_index
         self.session_store = session_store
         self.rag_system = rag_system
         self.vector_store = vector_store
+        self.user_id = user_id
         self.budget = budget
         # Reuse existing topic-selection logic from PersonalMemoryPromptBuilder.
         self._prompt_builder = PersonalMemoryPromptBuilder(store)
@@ -319,87 +327,168 @@ class RetrievalBroker:
         return "\n".join(lines).strip()
 
     async def _build_personal_tier(self, query: str) -> str:
-        """Search personal memory topics + journal for relevant matches.
+        """Hybrid personal recall: FTS5-first, vector fallback.
 
-        The model frequently phrases queries as "user's X" or "my X" — neither
-        token appears in stored memory. We normalize the query first so the
-        substring match has a chance of hitting. If lexical match still finds
-        nothing, we fall back to dumping the full body of any topic file the
-        query keyword-routes to, letting the model do the matching itself.
+        FTS5 handles the common case (exact / inflected / possessive / word
+        order) at sub-millisecond cost. When lexical retrieval is weak or empty
+        we pay for a query-embedding round-trip and consult the vector store,
+        which closes the synonym/semantic gap ("closest pal" → "Best Friend").
         """
-        if not str(query or "").strip():
+        started = time.perf_counter()
+        if not str(query or "").strip() or self.sqlite_index is None:
             return ""
-        lowered = _normalize_recall_query(query)
-        if not lowered:
+        normalized = _normalize_recall_query(query)
+        if not normalized:
             return ""
 
-        sections: list[str] = []
-        topic_hits: list[str] = []
-        for topic_name in sorted(self.store.topic_paths.keys()):
+        try:
+            fts_hits = self.sqlite_index.search(normalized, limit=8)
+        except Exception as exc:
+            print(f"LOG: RetrievalBroker FTS5 search failed: {exc}")
+            fts_hits = []
+
+        top_overlap = (
+            _token_overlap(normalized, _row_searchable_text(fts_hits[0])) if fts_hits else 0.0
+        )
+        top_rank = fts_hits[0].rank if fts_hits else None
+
+        # Common case: strong lexical match — done, no network call.
+        if self._fts_is_strong(fts_hits, normalized):
+            result = _format_personal_hits(fts_hits)
+            self._log_recall(
+                query=query, normalized=normalized, fts_hits=fts_hits,
+                top_overlap=top_overlap, top_rank=top_rank, path="fts",
+                vector_triggered=False, vec_hits=[], chosen_source="fts",
+                started=started,
+            )
+            return result
+
+        # Weak or empty lexical result → pay for semantic.
+        vec_hits: list[Any] = []
+        if self.vector_store is not None and self.user_id:
             try:
-                doc = self.store.load_topic(topic_name)
-            except Exception:
+                vec_hits = await self.vector_store.search(self.user_id, query, 5)
+            except Exception as exc:
+                print(f"LOG: RetrievalBroker vector search failed: {exc}")
+                vec_hits = []
+
+        if not vec_hits and not fts_hits:
+            self._log_recall(
+                query=query, normalized=normalized, fts_hits=fts_hits,
+                top_overlap=top_overlap, top_rank=top_rank, path="miss",
+                vector_triggered=True, vec_hits=vec_hits, chosen_source="none",
+                started=started,
+            )
+            return ""
+
+        merged = self._combine(fts_hits, vec_hits)
+        chosen = "both" if (fts_hits and vec_hits) else ("fts" if fts_hits else "vector")
+        self._log_recall(
+            query=query, normalized=normalized, fts_hits=fts_hits,
+            top_overlap=top_overlap, top_rank=top_rank, path="vector_fallback",
+            vector_triggered=True, vec_hits=vec_hits, chosen_source=chosen,
+            started=started,
+        )
+        return merged
+
+    def _fts_is_strong(self, hits: list[MemoryEventRow], query: str) -> bool:
+        """Whether FTS5 was strong enough to skip the vector fallback.
+
+        Token overlap is the primary signal (interpretable, corpus-independent);
+        BM25 rank is secondary (corpus-dependent, kept loose).
+        """
+        if not hits:
+            return False
+        top = hits[0]
+        overlap = _token_overlap(query, _row_searchable_text(top))
+        if overlap < settings.personal_recall_overlap_threshold:
+            return False
+        # BM25 rank: more-negative = better. A rank above the ceiling is weak.
+        if top.rank > settings.personal_recall_bm25_ceiling:
+            return False
+        return True
+
+    def _combine(self, fts_hits: list[MemoryEventRow], vec_hits: list[Any]) -> str:
+        """Simple union: FTS hits first (precise), then novel vector hits.
+
+        No normalized score merge — BM25 and cosine are opposite-direction,
+        different-scale distributions. Dedupe by topic+text. Capped at 8 lines.
+        """
+        lines: list[str] = []
+        seen: set[str] = set()
+
+        for row in fts_hits:
+            text = (row.value_text or "").strip()
+            if not text:
                 continue
-            matches = []
-            for line in doc.lines or []:
-                line_text = str(line).strip()
-                if not line_text:
-                    continue
-                if lowered in line_text.lower():
-                    matches.append(line_text)
-                if len(matches) >= 4:
-                    break
-            if matches:
-                title = doc.metadata.get("title") or topic_name.replace("_", " ").title()
-                topic_hits.append("\n".join([f"[{title}]", *matches]))
-            if len(topic_hits) >= 3:
+            dedupe_key = f"{row.topic}:{text.lower()}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            label = row.key or row.topic
+            lines.append(f"- {label}: {text}")
+            if len(lines) >= 8:
                 break
 
-        if topic_hits:
-            sections.append("\n\n".join(topic_hits))
-        else:
-            # Lexical miss — dump full topic bodies the query keyword-routes to.
-            fallback_topics = _topics_for_keywords(lowered)
-            fallback_hits: list[str] = []
-            for topic_name in fallback_topics:
-                try:
-                    doc = self.store.load_topic(topic_name)
-                except Exception:
-                    continue
-                body_lines = [
-                    str(line).strip()
-                    for line in (doc.lines or [])
-                    if str(line).strip()
-                ]
-                if not body_lines:
-                    continue
-                title = doc.metadata.get("title") or topic_name.replace("_", " ").title()
-                fallback_hits.append("\n".join([f"[{title}]", *body_lines]))
-                if len(fallback_hits) >= 2:
-                    break
-            if fallback_hits:
-                sections.append("\n\n".join(fallback_hits))
+        for hit in vec_hits:
+            if len(lines) >= 8:
+                break
+            text = str(getattr(hit, "text", "") or "").strip()
+            if not text:
+                continue
+            topic = ""
+            meta = getattr(hit, "metadata", None)
+            if isinstance(meta, dict):
+                topic = str(meta.get("topic", "") or "")
+            dedupe_key = f"{topic}:{text.lower()}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            lines.append(f"- {text}")
 
-        if self.journal_store is not None:
-            journal_hits: list[str] = []
+        if not lines:
+            return ""
+        return "[Personal Memory]\n" + "\n".join(lines)
+
+    def _log_recall(
+        self,
+        *,
+        query: str,
+        normalized: str,
+        fts_hits: list[MemoryEventRow],
+        top_overlap: float,
+        top_rank: float | None,
+        path: str,
+        vector_triggered: bool,
+        vec_hits: list[Any],
+        chosen_source: str,
+        started: float,
+    ) -> None:
+        """One structured log/span per recall — the data behind §12.3 tuning."""
+        vec_top_cosine = None
+        if vec_hits:
             try:
-                events = self.journal_store.load_all()
+                vec_top_cosine = float(getattr(vec_hits[0], "score", None))
             except Exception:
-                events = []
-            for event in reversed(events[-200:]):
-                text = json.dumps(event.to_payload(), ensure_ascii=False).lower()
-                if lowered not in text:
-                    continue
-                value_text = json.dumps(event.value, ensure_ascii=False)
-                journal_hits.append(
-                    f"- {event.topic} {event.key}: {value_text}"
-                )
-                if len(journal_hits) >= 5:
-                    break
-            if journal_hits:
-                sections.append("[Journal]\n" + "\n".join(journal_hits))
-
-        return "\n\n".join(sections).strip()
+                vec_top_cosine = None
+        attrs = {
+            "normalized_query": normalized,
+            "fts_hit_count": len(fts_hits),
+            "fts_top_rank": top_rank,
+            "fts_top_overlap": round(top_overlap, 3),
+            "path": path,
+            "vector_triggered": vector_triggered,
+            "vector_hit_count": len(vec_hits),
+            "vector_top_cosine": vec_top_cosine,
+            "chosen_source": chosen_source,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+        print(f"LOG: RetrievalBroker personal recall {attrs}")
+        if _logfire is not None:
+            try:
+                _logfire.info("turtle.personal_recall", **attrs)
+            except Exception:
+                pass
 
     async def _build_episodic_tier(self, query: str) -> str:
         """Tier 3: top-k episodic RAG hits formatted for prompt injection."""

@@ -50,7 +50,14 @@ class PersonalMemoryMergeTests(unittest.TestCase):
         finally:
             shutil.rmtree(base, ignore_errors=True)
 
-    def test_merge_accepts_im_name_pattern(self) -> None:
+    def test_bare_copula_name_is_deferred_to_llm(self) -> None:
+        # "Im shriyash" is a bare copula: semantically it could be a name,
+        # occupation, location, or mood. The deterministic path must NOT
+        # confidently label it a name (that false-positive is what shadowed the
+        # LLM and wrote "an AI engineer" into identity.name). It produces no
+        # strong candidate here and the async path defers to the LLM extractor,
+        # which classifies the role correctly. Explicit performatives
+        # ("my name is X") are covered by the test above.
         base = Path("test") / "_tmp" / f"personal_memory_merge_{uuid.uuid4().hex}"
         base.mkdir(parents=True, exist_ok=True)
         try:
@@ -63,11 +70,13 @@ class PersonalMemoryMergeTests(unittest.TestCase):
                 session_id="session-im",
                 profile=None,
             )
+            # No deterministic identity.name candidate from a bare copula.
+            self.assertEqual(
+                [c for c in candidates if c.key == "name" and c.topic == "identity"],
+                [],
+            )
             result = merge_personal_memory_candidates(store=store, candidates=candidates)
-
-            self.assertIn("identity", result.written_topics)
-            identity_text = (base / "identity.md").read_text(encoding="utf-8")
-            self.assertIn("Name: shriyash", identity_text)
+            self.assertNotIn("identity", result.written_topics)
         finally:
             shutil.rmtree(base, ignore_errors=True)
 

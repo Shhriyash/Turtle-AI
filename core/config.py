@@ -152,6 +152,34 @@ class TurtleSettings(BaseSettings):
         default=15, alias="TURTLE_PERSONAL_MEMORY_MAX_TOPIC_FILES"
     )
 
+    # Hybrid personal recall (FTS5-first, vector fallback). Tuned from logged
+    # retrieval stats (§13), not gotten right up front.
+    # Token-overlap fraction of the top FTS hit below which we treat lexical
+    # retrieval as weak and fall back to the vector store.
+    personal_recall_overlap_threshold: float = Field(
+        default=0.5, alias="TURTLE_PERSONAL_RECALL_OVERLAP_THRESHOLD"
+    )
+    # FTS5 BM25 rank ceiling (more-negative = better). A top hit with rank
+    # above this is barely-matched → treat as weak. Default 0.0 effectively
+    # disables the BM25 veto (real ranks on a small per-user corpus are tiny
+    # negatives), so token overlap is the deciding signal until tuned from
+    # logged stats (§13). Set to e.g. -0.5 to make BM25 vote.
+    personal_recall_bm25_ceiling: float = Field(
+        default=0.0, alias="TURTLE_PERSONAL_RECALL_BM25_CEILING"
+    )
+    # Off by default: ship the simple FTS-first/vector-fallback union. Only
+    # enable a normalized BM25+cosine merge once logs justify it (§12.3).
+    personal_recall_merge_enabled: bool = Field(
+        default=False, alias="TURTLE_PERSONAL_RECALL_MERGE_ENABLED"
+    )
+    # (W_LEX, W_SEM) weights for the optional normalized merge.
+    personal_recall_merge_lex_weight: float = Field(
+        default=0.6, alias="TURTLE_PERSONAL_RECALL_MERGE_LEX_WEIGHT"
+    )
+    personal_recall_merge_sem_weight: float = Field(
+        default=0.4, alias="TURTLE_PERSONAL_RECALL_MERGE_SEM_WEIGHT"
+    )
+
     # Periodic reflector (Phase 2): runs Stage B + dream pass mid-session.
     reflect_enabled: bool = Field(default=True, alias="TURTLE_REFLECT_ENABLED")
     reflect_every_turns: int = Field(default=15, alias="TURTLE_REFLECT_EVERY_TURNS")

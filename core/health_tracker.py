@@ -80,7 +80,9 @@ def _cooldown_seconds(exc: Exception) -> float:
 
     if ModelHTTPError is not None and isinstance(exc, ModelHTTPError):
         status = getattr(exc, "status_code", None)
-        if status in (429, 402) or (isinstance(status, int) and status >= 500):
+        # 413 = Groq TPM "request too large" (per-minute budget). Back off
+        # briefly so the cascade prefers a higher-limit provider for ~1 min.
+        if status in (413, 429, 402) or (isinstance(status, int) and status >= 500):
             return _COOLDOWN_TRANSIENT_S
         if status == 400:
             message = str(exc).lower()

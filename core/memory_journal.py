@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from core.guardrails import enforce_storage_cap
 from core.paths import personal_journal_dir, personal_memory_dir
@@ -104,10 +104,20 @@ def validate_event(event: MemoryEvent) -> None:
 class JournalStore:
     """Append-only JSONL journal, sharded by month, idempotent by event_id."""
 
-    def __init__(self, user_id: str = "default", journal_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        user_id: str = "default",
+        journal_dir: Path | None = None,
+        *,
+        on_append: Callable[[MemoryEvent], None] | None = None,
+    ) -> None:
         self.user_id = user_id
         self.journal_dir = journal_dir or personal_journal_dir(user_id)
         self.journal_dir.mkdir(parents=True, exist_ok=True)
+        # Optional write-through hook (e.g. SQLite FTS5 index). Wrapped in
+        # try/except at the call site so a failing index never blocks the
+        # journal write — the journal is the source of truth.
+        self.on_append = on_append
 
     def _shard_path_for(self, observed_at: str) -> Path:
         try:
@@ -138,6 +148,11 @@ class JournalStore:
                 os.fsync(file.fileno())
             except Exception:
                 pass
+        if self.on_append is not None:
+            try:
+                self.on_append(event)
+            except Exception as exc:
+                print(f"LOG: JournalStore on_append hook failed for {event.event_id}: {exc}")
         return event
 
     def append_many(self, events: Iterable[MemoryEvent]) -> list[MemoryEvent]:
