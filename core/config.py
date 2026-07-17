@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,7 +31,25 @@ class TurtleSettings(BaseSettings):
     # Deployment & Infrastructure
     # -----------------------------------------------------------------------
     deploy_mode: str = Field(default="local", alias="TURTLE_DEPLOY")
-    data_dir: Path = Field(default=Path("data"), alias="TURTLE_DATA_DIR")
+    # Anchor the data dir to the repo root, NOT the CWD. A bare Path("data") is
+    # CWD-relative, so launching the server from another directory silently
+    # created a fresh empty data/users.sqlite next to that CWD — and the next
+    # onboarding minted brand-new user_ids while the real memory sat orphaned
+    # under <repo>/data (hazard H2 in the W2 identity audit). _PROJECT_ROOT/"data"
+    # matches core.paths.DATA_DIR so identity and memory always agree on location.
+    # The TURTLE_DATA_DIR env alias still overrides this for real relocations.
+    data_dir: Path = Field(default=_PROJECT_ROOT / "data", alias="TURTLE_DATA_DIR")
+
+    @field_validator("data_dir")
+    @classmethod
+    def _anchor_data_dir(cls, value: Path) -> Path:
+        # A RELATIVE env override (TURTLE_DATA_DIR=data) would reintroduce the
+        # exact CWD hazard the absolute default fixes, so anchor it to the repo
+        # root too. Absolute overrides pass through untouched.
+        if not value.is_absolute():
+            return _PROJECT_ROOT / value
+        return value
+
     port: int = Field(default=8765, alias="TURTLE_PORT")
     host: str = Field(default="127.0.0.1", alias="TURTLE_HOST")
     server_reload: bool = Field(default=False, alias="TURTLE_SERVER_RELOAD")
@@ -104,8 +122,11 @@ class TurtleSettings(BaseSettings):
 
     # Phase 6: production guardrails
     # Hard cap on bytes stored under personal_memory_dir(user_id). Writes that
-    # would push the directory past this cap raise StorageCapExceededError so
-    # the UI can prompt the user to trim. 0 disables the cap.
+    # would push the directory past this cap raise StorageCapExceededError; the
+    # write is blocked (non-destructive — nothing already stored is touched) and
+    # the user is notified via a WebSocket "notice" frame (code "storage_cap")
+    # that the browser renders as a toast, so failed memory writes are visible
+    # instead of silent. 0 disables the cap.
     user_storage_cap_mb: int = Field(
         default=50, alias="TURTLE_USER_STORAGE_CAP_MB"
     )

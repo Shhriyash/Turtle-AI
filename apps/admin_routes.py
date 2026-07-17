@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, EmailStr
 
 from core.config import settings
-from core.identity import identity_manager
+from core.identity import identity_manager, normalize_email
 from core.paths import PERSONAL_MEMORY_DIR, RAG_DATA_DIR
 from core.telemetry import emit as emit_event
 
@@ -184,7 +184,9 @@ def _forget_email_html(link: str, ttl_minutes: int) -> str:
 @router.post("/forget-me")
 async def forget_me_start(req: Request, body: ForgetMeRequest) -> JSONResponse:
     """Send a confirmation link to the user's primary email."""
-    email = body.email.strip().lower()
+    # Normalize through the shared helper so the lookup matches the exact key
+    # resolve_user() stored in channel_mappings (same casing/whitespace policy).
+    email = normalize_email(body.email)
     await identity_manager.init_db()
 
     # Resolve without creating — only act when the user exists.
@@ -244,6 +246,11 @@ async def _purge_user(user_id: str) -> dict[str, Any]:
 
     memory_dir = PERSONAL_MEMORY_DIR / user_id
     if memory_dir.exists():
+        # This rmtree also removes account.json (it lives inside memory_dir).
+        # That is REQUIRED, not incidental: the marker is the durable email->id
+        # binding resolve_user() rebinds from, so it MUST die with the dir or a
+        # purged user could be silently resurrected on the next onboarding.
+        # Nothing else to delete for the marker — it has no separate location.
         shutil.rmtree(memory_dir, ignore_errors=True)
         removed["memory"] = not memory_dir.exists()
 

@@ -25,7 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, EmailStr, Field
 
 from core.config import settings
-from core.identity import identity_manager
+from core.identity import identity_manager, normalize_email, write_account_marker
 from core.personal_memory_store import PersonalMemoryStore
 from core.telemetry import emit as emit_event
 
@@ -166,7 +166,7 @@ async def onboarding_start(req: Request, body: OnboardingStartRequest) -> JSONRe
     client_ip = req.client.host if req.client else ""
     _check_rate_limit(client_ip)
 
-    email = body.email.strip().lower()
+    email = normalize_email(body.email)
     name = body.name.strip()
     timezone = (body.timezone or "UTC").strip() or "UTC"
 
@@ -295,6 +295,16 @@ async def onboarding_start(req: Request, body: OnboardingStartRequest) -> JSONRe
             secure=False,
             path="/",
         )
+        # Drop an (unverified) account marker so this identity survives a
+        # users.sqlite reset even in dev, where we never require the /claim
+        # round-trip. email_verified=False; cloud rebind still demands a
+        # verified marker, so this dev residue can't rebind a stranger there.
+        try:
+            write_account_marker(user_id, email, verified=False)
+        except Exception:
+            logger.exception(
+                "onboarding/start: account marker write failed for user_id=%s", user_id
+            )
         logger.info(
             "onboarding/start: dev-mode session cookie issued for user_id=%s "
             "(skipping magic-link click)", user_id
@@ -331,7 +341,7 @@ async def onboarding_claim(token: str) -> Any:
         raise HTTPException(status_code=410, detail="Link already used.")
 
     name = (payload.get("name") or "").strip()
-    email = (payload.get("email") or "").strip()
+    email = normalize_email(payload.get("email") or "")
     tz = (payload.get("tz") or "UTC").strip() or "UTC"
 
     # Seed identity.md directly (source=explicit, bypass confirmation gate).
@@ -352,6 +362,17 @@ async def onboarding_claim(token: str) -> Any:
             # Don't block the redirect if seeding fails — identity can still be
             # filled in by the regular extraction pipeline on the first turn.
             logger.exception("onboarding: identity seed write failed for user_id=%s", user_id)
+
+    # Clicking the magic link proves email ownership, so persist a VERIFIED
+    # account marker. This is the durable email->user_id binding that lets a
+    # future users.sqlite reset rebind this email to the same id instead of
+    # minting a fresh one and orphaning the memory dir. Best-effort: a marker
+    # failure must not block sign-in.
+    if email:
+        try:
+            write_account_marker(user_id, email, verified=True)
+        except Exception:
+            logger.exception("onboarding: account marker write failed for user_id=%s", user_id)
 
     emit_event("onboarding_complete", user_id=user_id, channel="web_email")
     cookie_value = issue_session_cookie_value(user_id)

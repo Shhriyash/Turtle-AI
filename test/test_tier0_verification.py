@@ -199,55 +199,58 @@ class TestLLMClientFallbackFix:
 # Check 3: D3 — confirmation injection strings are gone from server source
 # ---------------------------------------------------------------------------
 
+def _async_func_source(name: str) -> str:
+    """Return the source slice of a top-level async function in turtle_server.py.
+
+    Phase 3 W3 unified every entrypoint behind one pipeline (_execute_turn), so
+    the structural checks that used to target the two handlers now target the
+    canonical pipeline function (and separately assert the handlers delegate to
+    it). This helper keeps those AST/grep checks honest against the real body.
+    """
+    import ast
+
+    server_path = ROOT / "apps" / "turtle_server.py"
+    source = server_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    lines = source.splitlines()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == name:
+            return "\n".join(lines[node.lineno - 1 : node.end_lineno])
+    raise AssertionError(f"{name} not found in server source")
+
+
 class TestConfirmationInjectionRemoved:
-    """D3 verification: 'Quick check:' injection must not appear in server code paths."""
+    """D3 verification: 'Quick check:' injection must not appear in the turn pipeline.
 
-    def test_quick_check_not_in_handle_text_message(self):
-        """The _handle_text_message function must not contain the 'Quick check' WS send."""
-        import ast
-        import inspect
+    Phase 3 W3: the canonical turn body lives in _execute_turn; the handlers are
+    thin wrappers. The D3 guarantee is meaningful on _execute_turn.
+    """
 
-        server_path = ROOT / "apps" / "turtle_server.py"
-        source = server_path.read_text(encoding="utf-8")
+    def test_quick_check_not_in_execute_turn(self):
+        """The canonical pipeline (_execute_turn) must not contain the 'Quick check' WS send."""
+        func_source = _async_func_source("_execute_turn")
+        assert "Quick check:" not in func_source, (
+            "_execute_turn still contains 'Quick check:' injection — D3 fix not applied!"
+        )
+        print("[PASS] _execute_turn: no 'Quick check' injection found")
 
-        # Parse and extract the function body as source slice
-        tree = ast.parse(source)
-        lines = source.splitlines()
+    def test_text_handler_delegates_to_pipeline(self):
+        """_handle_text_message must delegate to _execute_turn and carry no injection."""
+        func_source = _async_func_source("_handle_text_message")
+        assert "_execute_turn" in func_source, (
+            "_handle_text_message no longer delegates to the canonical _execute_turn pipeline"
+        )
+        assert "Quick check:" not in func_source
+        print("[PASS] _handle_text_message delegates to _execute_turn, no injection")
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_text_message":
-                start = node.lineno - 1
-                end = node.end_lineno
-                func_source = "\n".join(lines[start:end])
-                assert "Quick check:" not in func_source, (
-                    "_handle_text_message still contains 'Quick check:' injection — D3 fix not applied!"
-                )
-                print("[PASS] _handle_text_message: no 'Quick check' injection found")
-                return
-
-        raise AssertionError("_handle_text_message not found in server source")
-
-    def test_quick_check_not_in_handle_audio_message(self):
-        """The _handle_audio_message function must not contain the 'Quick check' WS send."""
-        import ast
-
-        server_path = ROOT / "apps" / "turtle_server.py"
-        source = server_path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        lines = source.splitlines()
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_audio_message":
-                start = node.lineno - 1
-                end = node.end_lineno
-                func_source = "\n".join(lines[start:end])
-                assert "Quick check:" not in func_source, (
-                    "_handle_audio_message still contains 'Quick check:' injection — D3 fix not applied!"
-                )
-                print("[PASS] _handle_audio_message: no 'Quick check' injection found")
-                return
-
-        raise AssertionError("_handle_audio_message not found in server source")
+    def test_audio_handler_delegates_to_pipeline(self):
+        """_handle_audio_message must delegate to _execute_turn and carry no injection."""
+        func_source = _async_func_source("_handle_audio_message")
+        assert "_execute_turn" in func_source, (
+            "_handle_audio_message no longer delegates to the canonical _execute_turn pipeline"
+        )
+        assert "Quick check:" not in func_source
+        print("[PASS] _handle_audio_message delegates to _execute_turn, no injection")
 
     def test_queue_confirmation_still_present(self):
         """Silent queuing (_queue_confirmation_candidates_from_turn) must still exist."""
@@ -264,51 +267,34 @@ class TestConfirmationInjectionRemoved:
 # ---------------------------------------------------------------------------
 
 class TestRouterStageWired:
-    """A1 verification: router is imported and called in both handlers."""
+    """A1 verification: router is imported and called in the canonical pipeline.
 
-    def test_router_import_in_text_handler(self):
-        """_handle_text_message must reference route_turn."""
-        import ast
+    Phase 3 W3: routing lives in _execute_turn (shared by every entrypoint), so
+    the A1 assertions target it. The handlers must funnel through it.
+    """
 
-        server_path = ROOT / "apps" / "turtle_server.py"
-        source = server_path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        lines = source.splitlines()
+    def test_router_wired_in_pipeline(self):
+        """_execute_turn must reference route_turn and the router_ms timing."""
+        func_source = _async_func_source("_execute_turn")
+        assert "route_turn" in func_source, \
+            "_execute_turn missing route_turn call — A1 not wired"
+        assert "router_ms" in func_source, \
+            "_execute_turn missing router_ms timing — A1 not wired"
+        print("[PASS] route_turn wired into _execute_turn")
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_text_message":
-                start = node.lineno - 1
-                end = node.end_lineno
-                func_source = "\n".join(lines[start:end])
-                assert "route_turn" in func_source, \
-                    "_handle_text_message missing route_turn call — A1 not wired"
-                assert "router_ms" in func_source, \
-                    "_handle_text_message missing router_ms timing — A1 not wired"
-                print("[PASS] route_turn wired into _handle_text_message")
-                return
+    def test_text_handler_funnels_through_pipeline(self):
+        """_handle_text_message must route through _execute_turn (A1 by delegation)."""
+        func_source = _async_func_source("_handle_text_message")
+        assert "_execute_turn" in func_source, \
+            "_handle_text_message does not funnel through _execute_turn — A1 not wired"
+        print("[PASS] _handle_text_message funnels through _execute_turn")
 
-        raise AssertionError("_handle_text_message not found")
-
-    def test_router_import_in_audio_handler(self):
-        """_handle_audio_message must reference route_turn."""
-        import ast
-
-        server_path = ROOT / "apps" / "turtle_server.py"
-        source = server_path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        lines = source.splitlines()
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_audio_message":
-                start = node.lineno - 1
-                end = node.end_lineno
-                func_source = "\n".join(lines[start:end])
-                assert "route_turn" in func_source, \
-                    "_handle_audio_message missing route_turn call — A1 not wired"
-                print("[PASS] route_turn wired into _handle_audio_message")
-                return
-
-        raise AssertionError("_handle_audio_message not found")
+    def test_audio_handler_funnels_through_pipeline(self):
+        """_handle_audio_message must route through _execute_turn (A1 by delegation)."""
+        func_source = _async_func_source("_handle_audio_message")
+        assert "_execute_turn" in func_source, \
+            "_handle_audio_message does not funnel through _execute_turn — A1 not wired"
+        print("[PASS] _handle_audio_message funnels through _execute_turn")
 
     def test_router_heuristic_fallback_works(self):
         """RouterDecision heuristic fallback must not raise for any common input."""

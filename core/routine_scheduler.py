@@ -33,6 +33,11 @@ _log = logging.getLogger(__name__)
 
 _SCHEDULER_DB_PATH = DATA_DIR / "scheduler.sqlite"
 
+# Single registry of cadences the scheduler knows how to translate into a cron
+# trigger. A cadence absent from this map is *unschedulable* — the trigger
+# builder returns None rather than silently firing it every day (see
+# _routine_to_cron_trigger). hourly/monthly carry distinctive base fields that
+# the builder augments with the routine's clock time / day-of-month.
 _CADENCE_TO_CRON: dict[str, dict[str, str]] = {
     "daily":    {"day_of_week": "*"},
     "weekday":  {"day_of_week": "mon-fri"},
@@ -40,8 +45,8 @@ _CADENCE_TO_CRON: dict[str, dict[str, str]] = {
     "weekend":  {"day_of_week": "sat,sun"},
     "weekends": {"day_of_week": "sat,sun"},
     "weekly":   {"day_of_week": "mon"},
-    # Hourly + monthly are accepted by the schema but require additional
-    # fields; left out until we have a real user case.
+    "hourly":   {"hour": "*"},   # every hour; minute filled from the clock time (else :00)
+    "monthly":  {"day": "1"},    # 1st of month by default; overridable via value["day"]
 }
 
 
@@ -185,22 +190,57 @@ def _job_id_for(user_id: str, key: str) -> str:
 
 
 def _routine_to_cron_trigger(value: dict[str, Any]) -> CronTrigger | None:
-    cadence = str(value.get("cadence") or "daily").strip().lower()
+    cadence_raw = value.get("cadence")
     time_str = value.get("time")
     tz = value.get("timezone") or None
 
-    cron_kwargs = dict(_CADENCE_TO_CRON.get(cadence, _CADENCE_TO_CRON["daily"]))
+    # Missing cadence entirely keeps the schema renderer's documented default
+    # (daily). A *present but unknown* cadence is a different case, handled below.
+    if cadence_raw is None or (isinstance(cadence_raw, str) and not cadence_raw.strip()):
+        cadence = "daily"
+    else:
+        cadence = str(cadence_raw).strip().lower()
 
+    mapping = _CADENCE_TO_CRON.get(cadence)
+    if mapping is None:
+        # Unknown cadence: do NOT silently fall back to daily. A routine the user
+        # asked for "every quarter" firing every morning is worse than not firing
+        # — skip it loudly so the misconfiguration is visible in the logs.
+        print(f"LOG: routine has unschedulable cadence {cadence!r}; skipping")
+        return None
+    cron_kwargs = dict(mapping)
+
+    # Parse the clock time once (HH:MM). A malformed value is a refuse, not a
+    # guess — better no fire than a fire at the wrong time.
+    hh: int | None = None
+    mm: int | None = None
     if isinstance(time_str, str) and ":" in time_str:
         try:
-            hh, mm = time_str.split(":", 1)
-            cron_kwargs["hour"] = str(int(hh))
-            cron_kwargs["minute"] = str(int(mm))
+            hh_s, mm_s = time_str.split(":", 1)
+            hh, mm = int(hh_s), int(mm_s)
         except Exception:
             return None
+
+    if cadence == "hourly":
+        # Fires every hour at a fixed minute; the clock *hour* is irrelevant, so
+        # a routine with no time is still schedulable (defaults to :00).
+        cron_kwargs["minute"] = str(mm if mm is not None else 0)
     else:
-        # No clock time — can't schedule a cron without one.
-        return None
+        # Every other cadence pins to a wall-clock time; without one we cannot
+        # build a cron trigger at all.
+        if hh is None or mm is None:
+            return None
+        cron_kwargs["hour"] = str(hh)
+        cron_kwargs["minute"] = str(mm)
+        if cadence == "monthly":
+            # Honor an explicit day-of-month when the value carries one; the
+            # mapping already defaults to the 1st.
+            day = value.get("day") or value.get("day_of_month")
+            if day is not None:
+                try:
+                    cron_kwargs["day"] = str(int(day))
+                except Exception:
+                    pass  # unparseable day → keep the default 1st-of-month
 
     if tz:
         cron_kwargs["timezone"] = tz
@@ -240,7 +280,7 @@ def _fire_routine(user_id: str, routine_key: str, value: dict[str, Any]) -> None
             value=fire_value,
             confidence=1.0,
             source="synthesized",
-            extractor="dream_pass",  # closest valid extractor label
+            extractor="scheduler",  # honest provenance (was mislabeled "dream_pass")
             session_id=f"scheduler_{fired_at[:10]}",
             turn_id=f"scheduler_{fired_at}",
             applied=False,

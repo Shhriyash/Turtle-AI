@@ -206,7 +206,12 @@ class TestD1LLMExtractor:
 # ---------------------------------------------------------------------------
 
 class TestD2BackgroundDreamPass:
-    """D2: Dream pass must use asyncio.create_task, never await directly in handlers."""
+    """D2: Dream pass must never be awaited directly in the turn pipeline.
+
+    Phase 3 W3: the reflector/dream-pass wiring lives in the canonical
+    _execute_turn pipeline (shared by every entrypoint), so the D2 guarantee is
+    pinned there; the handlers funnel through it.
+    """
 
     def _get_handler_source(self, name: str) -> str:
         import ast
@@ -218,22 +223,30 @@ class TestD2BackgroundDreamPass:
                 return "\n".join(lines[node.lineno - 1 : node.end_lineno])
         raise AssertionError(f"{name} not found in server source")
 
-    def test_text_handler_uses_create_task_for_dream_pass(self):
-        src = self._get_handler_source("_handle_text_message")
+    def test_pipeline_uses_create_task_for_dream_pass(self):
+        src = self._get_handler_source("_execute_turn")
         assert "create_task" in src and "_run_dream_pass_if_needed" in src, \
-            "_handle_text_message: dream pass not converted to create_task"
+            "_execute_turn: dream pass not converted to create_task"
         # Must NOT have a direct await of dream pass (outside create_task)
         assert "await _run_dream_pass_if_needed" not in src, \
-            "Dream pass still awaited directly in text handler"
-        print("[PASS] Text handler: dream pass uses asyncio.create_task")
+            "Dream pass still awaited directly in the turn pipeline"
+        print("[PASS] _execute_turn: dream pass never awaited directly")
 
-    def test_audio_handler_uses_create_task_for_dream_pass(self):
+    def test_text_handler_funnels_through_pipeline(self):
+        src = self._get_handler_source("_handle_text_message")
+        assert "_execute_turn" in src, \
+            "_handle_text_message no longer funnels through _execute_turn"
+        assert "await _run_dream_pass_if_needed" not in src, \
+            "Dream pass still awaited directly in text handler"
+        print("[PASS] Text handler: funnels through _execute_turn")
+
+    def test_audio_handler_funnels_through_pipeline(self):
         src = self._get_handler_source("_handle_audio_message")
-        assert "create_task" in src and "_run_dream_pass_if_needed" in src, \
-            "_handle_audio_message: dream pass not converted to create_task"
+        assert "_execute_turn" in src, \
+            "_handle_audio_message no longer funnels through _execute_turn"
         assert "await _run_dream_pass_if_needed" not in src, \
             "Dream pass still awaited directly in audio handler"
-        print("[PASS] Audio handler: dream pass uses asyncio.create_task")
+        print("[PASS] Audio handler: funnels through _execute_turn")
 
 
 # ---------------------------------------------------------------------------

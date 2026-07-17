@@ -18,7 +18,7 @@ ALLOWED_KINDS = frozenset({"fact", "preference", "behavior", "correction", "cont
 # The 11-topic vocabulary now has a single home in core.memory_schema; re-exported
 # here so existing `from core.memory_journal import ALLOWED_TOPICS` importers work.
 ALLOWED_SOURCES = frozenset({"explicit", "inferred", "synthesized", "migration"})
-ALLOWED_EXTRACTORS = frozenset({"deterministic", "llm_turn", "dream_pass", "migration"})
+ALLOWED_EXTRACTORS = frozenset({"deterministic", "llm_turn", "dream_pass", "migration", "scheduler"})
 
 
 def _utc_now() -> str:

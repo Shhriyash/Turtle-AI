@@ -218,7 +218,12 @@ async def voice_stream(ws: WebSocket):
 
         print(f"[TwilioVoice] STT: {text!r}")
 
-        uid = user_id or "anon"
+        # A caller whose number Twilio didn't share must NOT collapse onto a
+        # shared "anon" identity — the dispatch pipeline now builds a full
+        # memory-bearing state per user_id, so a shared id would pool every
+        # anonymous caller's session history and memory into one account.
+        # Scope the fallback to this call instead.
+        uid = user_id or f"anon_{call_sid or 'unknown'}"
         event = TurtleEvent(
             user_id=uid,
             channel="twilio_voice",

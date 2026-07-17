@@ -25,7 +25,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 # ---------------------------------------------------------------------------
 # Path bootstrap (same as turtle_voice.py)
@@ -942,13 +942,27 @@ def _journal_and_queue_candidates(
     if not events:
         return 0
 
-    state.journal_store.append_many(events)
-    if applied_events:
-        result = replay(state.journal_store.load_all(), store=state.personal_memory_store)
-        if result.written_topics:
-            print(f"LOG: Per-turn memory applied for {session_id}: {result.written_topics}")
-            if "workflow" in result.written_topics:
-                _register_user_routines_safe(state)
+    try:
+        state.journal_store.append_many(events)
+    except StorageCapExceededError:
+        # Cap hit on the journal append: nothing persisted. Notify the user and
+        # bail — queuing pending candidates behind a gate we couldn't journal
+        # would be dishonest bookkeeping.
+        _notify_storage_cap(state)
+        return 0
+    try:
+        if applied_events:
+            result = replay(state.journal_store.load_all(), store=state.personal_memory_store)
+            if result.written_topics:
+                print(f"LOG: Per-turn memory applied for {session_id}: {result.written_topics}")
+                if "workflow" in result.written_topics:
+                    _register_user_routines_safe(state)
+    except StorageCapExceededError:
+        # Distinct boundary from the append (Codex R1#2): the journal HAS the
+        # events; only the rendered projection hit the cap. Notify but keep
+        # going — the pending candidates below were journaled and belong in the
+        # gate, and the projection regenerates on the next successful replay.
+        _notify_storage_cap(state)
 
     queued = 0
     for event in pending_events:
@@ -1390,6 +1404,163 @@ def _register_user_routines_safe(state: "SharedState") -> None:
         print(f"LOG: routine registration failed for {state.user_id}: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Storage-cap user notification (W4 / Phase 3)
+#
+# core.guardrails.enforce_storage_cap raises StorageCapExceededError when a
+# user's memory dir is at its cap (settings.user_storage_cap_mb). Before this,
+# breaches vanished into broad `except Exception` logs and the user's memory
+# writes failed silently. These helpers surface the breach:
+#   * always a LOG line (server-side, works today);
+#   * a WS "notice" frame when a websocket is reachable (see delivery note).
+#
+# Delivery mechanism (documented for the integrator finishing the concurrent
+# handler refactor): the per-turn write funnels this fires from
+# (_apply_explicit_facts_from_turn, _journal_and_queue_candidates) are sync,
+# take no `ws`, and their call sites live in the handler region another agent
+# owns — and SharedState can't be extended here. So today the frame is stashed
+# in a per-session pending registry and always logged; the remember tool
+# (which returns a string the model relays) delivers a user-visible message
+# directly. When the refactor lands, the handler should drain the pending
+# notice next to its other _ws_send_json calls, e.g.:
+#     notice = pop_pending_storage_cap_notice(state.session_store.session_id or state.user_id)
+#     if notice: await _ws_send_json(ws, notice)
+# Passing a live `ws` into _notify_storage_cap also sends immediately (dormant
+# today because no caller has one to pass).
+_STORAGE_CAP_NOTICE_CODE = "storage_cap"
+_STORAGE_CAP_NOTICE_MESSAGE = (
+    "Memory storage is full — new facts can't be saved. "
+    "Ask me to forget things, or contact the admin to raise the cap."
+)
+# Bounded to keep these from growing without limit on a long-lived process.
+_STORAGE_CAP_REGISTRY_CAP = 512
+# Once-per-session guard so a user isn't spammed every failing write this turn.
+_STORAGE_CAP_NOTIFIED: dict[str, float] = {}
+# Frames awaiting a websocket to carry them (drained by the handler; see note).
+_PENDING_STORAGE_CAP_NOTICES: dict[str, dict[str, Any]] = {}
+
+
+def build_storage_cap_notice() -> dict[str, Any]:
+    """The WS frame the browser renders as a toast (see websocket.js 'notice')."""
+    return {
+        "type": "notice",
+        "code": _STORAGE_CAP_NOTICE_CODE,
+        "message": _STORAGE_CAP_NOTICE_MESSAGE,
+    }
+
+
+def _storage_cap_key(state: "SharedState") -> str:
+    """Stable per-session identity, defensive about partial test doubles."""
+    session_store = getattr(state, "session_store", None)
+    session_id = getattr(session_store, "session_id", None) if session_store else None
+    return str(session_id or getattr(state, "user_id", "") or f"state_{id(state)}")
+
+
+def _bounded_put(registry: dict[str, Any], key: str, value: Any) -> None:
+    """Insert into a dict with a hard size cap (clears wholesale when full)."""
+    if key not in registry and len(registry) >= _STORAGE_CAP_REGISTRY_CAP:
+        registry.clear()
+    registry[key] = value
+
+
+def pop_pending_storage_cap_notice(key: str) -> dict[str, Any] | None:
+    """Handler-facing: fetch and clear a session's pending storage-cap notice."""
+    return _PENDING_STORAGE_CAP_NOTICES.pop(key, None)
+
+
+def _notify_storage_cap(state: "SharedState", ws: Any | None = None) -> bool:
+    """Surface a storage-cap breach to the user, at most once per session.
+
+    Always prints a LOG line. Stashes a WS notice frame for the handler to
+    deliver, and—if a live ws is supplied—schedules an immediate send.
+    Returns True on the first call for a session, False on subsequent ones.
+    """
+    key = _storage_cap_key(state)
+    if key in _STORAGE_CAP_NOTIFIED:
+        return False
+    _bounded_put(_STORAGE_CAP_NOTIFIED, key, time.time())
+
+    print(f"LOG: storage cap reached — memory write blocked for session {key}")
+    frame = build_storage_cap_notice()
+
+    if ws is not None:
+        # Immediate delivery when a caller has a websocket in hand. Send OR
+        # queue, never both — queueing too would double-toast the user when
+        # the turn-end drain fires (Codex R1#6).
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(_ws_send_json(ws, frame))
+            # Swallow send failures; an unobserved task exception would log noisily.
+            task.add_done_callback(lambda t: t.exception())
+            return True
+        except RuntimeError:
+            pass  # no running loop — fall through to the pending registry
+    _bounded_put(_PENDING_STORAGE_CAP_NOTICES, key, frame)
+    return True
+
+
+def _store_remembered_fact(
+    state: "SharedState",
+    *,
+    topic: str,
+    key_slug: str,
+    value_text: str,
+) -> str:
+    """Persist an explicit user-stated fact; return the agent-facing result string.
+
+    Extracted from the `remember` tool (a closure, so otherwise untestable) so
+    the storage-cap failure path can be unit tested. On a cap breach the fact is
+    NOT saved: the user is notified and an honest failure string is returned
+    instead of a fabricated "Stored".
+    """
+    from core.memory_journal import generate_event_id
+
+    try:
+        event = make_event(
+            event_id=generate_event_id(),
+            kind="fact",
+            topic=topic,
+            key=f"{topic}.{key_slug}",
+            value={"value": value_text},
+            confidence=1.0,
+            source="explicit",
+            extractor="deterministic",
+            session_id=state.session_store.session_id or "unknown_session",
+            turn_id=f"remember_{generate_event_id()[:8]}",
+            evidence={"note": "user asked Turtle to remember this"},
+            applied=True,
+        )
+        state.journal_store.append_many([event])
+    except StorageCapExceededError:
+        # Cap hit on the journal append — the fact truly was NOT saved. Honest
+        # failure the model relays to the user instead of a fake "Stored".
+        _notify_storage_cap(state)
+        return (
+            "I couldn't save that — memory storage is at its cap. "
+            "Ask me to forget something to free up space."
+        )
+    except Exception as e:
+        return ToolResult.upstream_error(f"Could not store the memory: {e}").to_agent_string()
+
+    try:
+        replay(state.journal_store.load_all(), store=state.personal_memory_store)
+    except StorageCapExceededError:
+        # Distinct boundary from the append (Codex R1#2): the journal — the
+        # source of truth — HAS the fact; only the rendered projection failed.
+        # Claiming "couldn't save" here would be false, and the projection
+        # regenerates on the next successful replay.
+        _notify_storage_cap(state)
+        return (
+            f"Noted: {topic}.{key_slug} = {value_text}. But memory storage is at "
+            "its cap, so my memory files couldn't refresh — ask me to forget "
+            "things to free up space."
+        )
+    except Exception as e:
+        print(f"LOG: remember-tool replay failed after journal append: {e}")
+
+    return ToolResult.ok(f"Stored: {topic}.{key_slug} = {value_text}").to_agent_string()
+
+
 def _apply_explicit_facts_from_turn(
     state: "SharedState",
     *,
@@ -1461,6 +1632,10 @@ def _apply_explicit_facts_from_turn(
             print(f"LOG: Per-turn memory applied for {session_id}: {result.written_topics}")
             if "workflow" in result.written_topics:
                 _register_user_routines_safe(state)
+    except StorageCapExceededError:
+        # The write funnel hit the per-user storage cap. Tell the user their
+        # memory is full instead of swallowing it as a generic failure below.
+        _notify_storage_cap(state)
     except Exception as e:
         print(f"LOG: Per-turn fact extraction failed for {session_id}: {e}")
 
@@ -2116,8 +2291,7 @@ class AgentManager:
 
         async def remember(ctx: RunContext[SharedState], args: RememberArgs) -> str:
             """Explicitly store a user-stated fact in personal memory. See tool contract."""
-            from core.memory_journal import ALLOWED_TOPICS, generate_event_id, make_event
-            from core.memory_replayer import replay as _replay
+            from core.memory_journal import ALLOWED_TOPICS
 
             topic = args.topic.strip().lower()
             key_slug = args.key.strip().lower()
@@ -2133,27 +2307,11 @@ class AgentManager:
             import re as _re
             key_slug = _re.sub(r"[^a-z0-9]+", "_", key_slug).strip("_") or "note"
 
-            try:
-                event = make_event(
-                    event_id=generate_event_id(),
-                    kind="fact",
-                    topic=topic,
-                    key=f"{topic}.{key_slug}",
-                    value={"value": value_text},
-                    confidence=1.0,
-                    source="explicit",
-                    extractor="deterministic",
-                    session_id=ctx.deps.session_store.session_id or "unknown_session",
-                    turn_id=f"remember_{generate_event_id()[:8]}",
-                    evidence={"note": "user asked Turtle to remember this"},
-                    applied=True,
-                )
-                ctx.deps.journal_store.append_many([event])
-                _replay(ctx.deps.journal_store.load_all(), store=ctx.deps.personal_memory_store)
-            except Exception as e:
-                return ToolResult.upstream_error(f"Could not store the memory: {e}").to_agent_string()
-
-            return ToolResult.ok(f"Stored: {topic}.{key_slug} = {value_text}").to_agent_string()
+            # Store + storage-cap handling lives in a module-level helper so the
+            # cap-failure path is unit testable (this tool is a closure).
+            return _store_remembered_fact(
+                ctx.deps, topic=topic, key_slug=key_slug, value_text=value_text
+            )
 
         # Register the identical toolset on every rung of the cascade:
         # run_agent_with_fallbacks swaps Agent objects on failure, and a rung
@@ -2211,6 +2369,17 @@ async def _stop_routine_scheduler() -> None:
     _routine_scheduler = None
 
 
+@app.on_event("shutdown")
+async def _flush_trace_spans() -> None:
+    # Drain the BatchSpanProcessor's in-memory buffer; without this, spans from
+    # the final minutes before shutdown never reach data/traces/traces.jsonl.
+    try:
+        from core.observability import flush_traces
+        flush_traces()
+    except Exception as e:
+        print(f"LOG: trace flush on shutdown failed: {e}")
+
+
 def get_routine_scheduler():
     return _routine_scheduler
 
@@ -2258,43 +2427,196 @@ from apps.admin_routes import router as _admin_router
 app.include_router(_admin_router)
 
 
-# Per-(user_id, channel) message history — keyed by (user_id, channel).
-# Capped at 40 messages (same window as the WebSocket path).
-_channel_histories: dict[tuple[str, str], list] = {}
-_CHANNEL_HISTORY_LIMIT = 40
+# Per-(user_id, channel) SharedState cache. Channels now run through the SAME
+# turn pipeline as the WebSocket path, so their conversation of record lives in
+# the session store (like web), not a bare capped list. The cache preserves
+# session continuity across webhook turns; a per-key lock serialises turns for
+# the same (user, channel) so the shared, lazily-assigned http_client and the
+# session-store writes never race.
+#
+# Bounded + idle-TTL'd (Codex review R2#8/#9): a public webhook can mint
+# unbounded unique sender ids, and a cached state pins its SessionStore's
+# resumed session forever — evicting after idle both bounds memory and forces
+# start_or_restore (with its session age cap) to re-run for returning users.
+# Entries store (state, last_used_monotonic).
+_CHANNEL_STATES: dict[tuple[str, str], tuple[SharedState, float]] = {}
+_CHANNEL_STATE_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+_CHANNEL_STATE_CAP = 64
+_CHANNEL_STATE_IDLE_TTL_S = 30 * 60
+
+
+def _channel_state_lock(key: tuple[str, str]) -> asyncio.Lock:
+    lock = _CHANNEL_STATE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CHANNEL_STATE_LOCKS[key] = lock
+    return lock
+
+
+def _evict_stale_channel_states(now: float) -> None:
+    """Drop idle/over-cap cached channel states.
+
+    Never evicts an entry whose lock is currently held: popping a held lock
+    would let the next same-key event mint a fresh lock and run concurrently
+    with the holder. Durability does not depend on the cache — every turn
+    journals and persists through its stores before returning, so an evicted
+    state is simply rebuilt (with a fresh age-capped start_or_restore) on the
+    user's next event."""
+    def _evict(key: tuple[str, str]) -> None:
+        lock = _CHANNEL_STATE_LOCKS.get(key)
+        if lock is not None and lock.locked():
+            return  # a turn is running for this key — skip this round
+        _CHANNEL_STATES.pop(key, None)
+        _CHANNEL_STATE_LOCKS.pop(key, None)
+
+    for key in [
+        key for key, (_, last_used) in _CHANNEL_STATES.items()
+        if now - last_used > _CHANNEL_STATE_IDLE_TTL_S
+    ]:
+        _evict(key)
+    if len(_CHANNEL_STATES) > _CHANNEL_STATE_CAP:
+        # Still over cap after TTL: drop the least-recently-used entries.
+        by_age = sorted(_CHANNEL_STATES.items(), key=lambda kv: kv[1][1])
+        for key, _ in by_age[: len(_CHANNEL_STATES) - _CHANNEL_STATE_CAP]:
+            _evict(key)
+
+
+async def _build_channel_state(user_id: str, channel: str) -> SharedState:
+    """Construct a full SharedState for a channel turn.
+
+    This mirrors the WebSocket connection setup (SessionStore + PersonalMemory
+    + sqlite index with None-degrade + JournalStore write-through +
+    ConfirmationGate + RetrievalBroker + reflector) so channel turns get memory
+    context, journaling, the gate, extraction, and session continuity — parity
+    with web. It does NOT run the WS path's pending-finalization sweep; that is
+    a connection-lifecycle concern and unnecessary for stateless webhooks.
+
+    ``http_client`` is left ``None``; the dispatcher assigns a live client for
+    the duration of each turn (search/url tools need one) and clears it after.
+    """
+    session_store = SessionStore(user_id=user_id)
+    restore_result = await session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
+    # Legacy single-tenant MemoryStore intentionally not constructed (as WS).
+    memory_store = None
+    personal_memory_store = PersonalMemoryStore(user_id=user_id)
+    from core.memory_sqlite import MemorySQLiteIndex
+    # Same derived-read-model None-degrade as the WS path.
+    try:
+        sqlite_index = MemorySQLiteIndex(user_id=user_id)
+    except Exception as exc:
+        print(f"LOG: SQLite memory index unavailable for {user_id}: {exc}; falling back to journal scans")
+        sqlite_index = None
+    journal_store = JournalStore(
+        user_id=user_id,
+        on_append=sqlite_index.index_event if sqlite_index is not None else None,
+    )
+    if sqlite_index is not None:
+        try:
+            sqlite_index.backfill_from_journal(journal_store)
+        except Exception as exc:
+            print(f"LOG: SQLite memory index backfill failed for {user_id}: {exc}")
+    confirmation_gate = ConfirmationGate(
+        journal=journal_store,
+        store=personal_memory_store,
+        state_path=personal_memory_dir(user_id) / "confirmation_state.json",
+        sqlite_index=sqlite_index,
+    )
+    personal_memory_prompt = PersonalMemoryPromptBuilder(
+        personal_memory_store,
+        config=PersonalMemoryPromptConfig(
+            max_bytes=PERSONAL_MEMORY_MAX_BYTES,
+            max_topic_files=PERSONAL_MEMORY_MAX_TOPIC_FILES,
+        ),
+    )
+    task_history_store = TaskHistoryStore(TASK_HISTORY_FILE)
+    rag_system = TurtleRAGSystem(user_id=user_id)
+
+    from core.storage.local.faiss_store import FAISSVectorStore
+    from core.retrieval_broker import RetrievalBroker
+    vector_store = FAISSVectorStore()
+    retrieval_broker = RetrievalBroker(
+        store=personal_memory_store,
+        task_store=task_history_store,
+        journal_store=journal_store,
+        sqlite_index=sqlite_index,
+        session_store=session_store,
+        rag_system=rag_system,
+        vector_store=vector_store,
+        user_id=user_id,
+    )
+
+    state = SharedState(
+        http_client=None,
+        session_store=session_store,
+        memory_store=memory_store,
+        personal_memory_store=personal_memory_store,
+        personal_memory_prompt=personal_memory_prompt,
+        journal_store=journal_store,
+        confirmation_gate=confirmation_gate,
+        task_history_store=task_history_store,
+        rag_system=rag_system,
+        sqlite_index=sqlite_index,
+        retrieval_broker=retrieval_broker,
+        reflector=PeriodicReflector(),
+        user_id=user_id,
+    )
+    try:
+        await rag_system.start_session(session_id=restore_result.session_id)
+    except Exception as exc:
+        print(f"LOG: Channel rag start_session failed for {user_id}: {exc}")
+    # Register for graceful-shutdown journal flush / index checkpoint.
+    _register_shutdown_state(state)
+    return state
 
 
 async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
+    """Channel-agnostic dispatch — every adapter funnels through the ONE
+    canonical turn pipeline (_execute_turn) with a full per-(user, channel)
+    SharedState.
+
+    Channels therefore get exactly what web gets: router-driven graph selection,
+    memory context, the trace span, journaling, the confirmation gate, explicit
+    facts, silent candidate queuing, and cross-turn continuity via the session
+    store. No websocket exists here, so ``_execute_turn`` runs with ``ws=None``
+    and every frame no-ops; the terminal user-facing text comes back on
+    ``reply_text``.
+
+    Known limitation: sessions are tenant-scoped, not channel-scoped, so a user
+    active on web and a channel at the same moment can resume the same session
+    and interleave histories — identical to two simultaneous web tabs today.
+    Channel-scoped session streams are future work, deliberately not bolted on
+    here (a pseudo-tenant per channel would orphan its sessions from the
+    web-connect finalization sweep).
     """
-    Channel-agnostic dispatch: router → graph → main LLM → response text.
+    now = time.monotonic()
+    _evict_stale_channel_states(now)
+    key = (event.user_id, event.channel)
+    async with _channel_state_lock(key):
+        cached = _CHANNEL_STATES.get(key)
+        state = cached[0] if cached is not None else None
+        if state is None:
+            state = await _build_channel_state(event.user_id, event.channel)
+        _CHANNEL_STATES[key] = (state, now)
 
-    Uses the global agents_mgr (same models as the WS handler).
-    Conversation history is maintained per (user_id, channel) in
-    _channel_histories so each user retains context across turns.
-    """
-    from core.output_clean import clean_text_for_model
-    from pydantic_ai.usage import RunUsage
+        message_history = state.session_store.message_history or None
 
-    history_key = (event.user_id, event.channel)
-    message_history = _channel_histories.get(history_key) or None
+        # Tools need a live http client; lend the cached state one for this
+        # turn only (async with so it's always closed).
+        async with httpx.AsyncClient() as client:
+            state.http_client = client
+            try:
+                outcome = await _execute_turn(
+                    None,
+                    state,
+                    event.content,
+                    message_history,
+                    channel=event.channel,
+                    send_status=False,
+                )
+            finally:
+                state.http_client = None
 
-    graph = _select_graph("chitchat")  # router not wired for channels yet; default graph
-    prompt = event.content
-    response = await graph.run(
-        agents_mgr.main_assistant,
-        prompt,
-        fallback_agents=agents_mgr.main_assistant_fallbacks,
-        deps=None,
-        message_history=message_history,
-        usage=RunUsage(),
-        usage_limits=agents_mgr.usage_limits,
-    )
-
-    # Persist history, capped to the last N messages
-    updated = response.all_messages()
-    _channel_histories[history_key] = updated[-_CHANNEL_HISTORY_LIMIT:]
-
-    text = clean_text_for_model(response.output)
+    text = outcome.reply_text or outcome.output_text or ""
     return TurtleResponse(
         content=text,
         channel=event.channel,
@@ -2875,42 +3197,101 @@ def _classify_handler_error(exc: Exception) -> tuple[str, str]:
     return "internal_error", "Something went wrong. The error has been logged."
 
 
-async def _handle_text_message(
-    ws: WebSocket,
+class TurnOutcome(NamedTuple):
+    """Return value of the canonical turn pipeline.
+
+    ``new_history`` is the conversation of record to carry into the next turn.
+
+    ``output_text`` is the cleaned *model* reply — what the voice path speaks.
+    It is ``None`` when the turn produced no model reply: a confirmation
+    intercept (which already sent its own ``done`` frame) or a pipeline error
+    (which already sent an ``error`` frame). Voice skips TTS when it is ``None``.
+
+    ``reply_text`` is the terminal user-facing text for this turn regardless of
+    how it terminated — the model reply, the confirmation acknowledgement, or the
+    friendly error string. WebSocket callers already received it as a frame, but
+    a channel caller (``ws=None``) relays this to the adapter, so it never gets
+    a silent empty reply.
+    """
+    new_history: list[ModelMessage] | None
+    output_text: str | None
+    reply_text: str = ""
+
+
+async def _emit(ws: WebSocket | None, data: dict[str, Any]) -> None:
+    """Send a WS frame, no-op when there is no websocket (channel callers).
+
+    Every user-facing frame in the pipeline goes through here so a channel
+    adapter can drive the exact same turn with ``ws=None``.
+    """
+    if ws is None:
+        return
+    await _ws_send_json(ws, data)
+
+
+async def _execute_turn(
+    ws: WebSocket | None,
     state: SharedState,
     user_text: str,
     message_history: list[ModelMessage] | None,
-) -> list[ModelMessage] | None:
-    """Process a text chat message and stream the response."""
+    *,
+    channel: str,
+    send_status: bool = True,
+) -> TurnOutcome:
+    """The one canonical turn pipeline shared by every entrypoint.
+
+    web (text), web_voice (audio), and every channel adapter (WhatsApp, iMessage,
+    Slack, Twilio Voice) all funnel through here so a single code path owns
+    analytics, the confirmation intercept + sidecar, routing, memory context,
+    the per-turn trace span, graph execution + fallbacks, output cleaning,
+    persistence, explicit-fact application, silent candidate queuing, the
+    reflector/dream pass, timing, and classified error handling.
+
+    All websocket sends go through ``_emit`` so a channel caller may pass
+    ``ws=None``; ``send_status`` suppresses the "thinking" status frame for
+    callers that manage their own status lifecycle (or have no UI to update).
+    """
     timings: dict[str, float] = {}
     overall_start = time.time()
 
     if state.user_id:
-        emit_event_once(state.user_id, "first_message_sent", channel="web")
+        emit_event_once(state.user_id, "first_message_sent", channel=channel)
 
-    await _ws_send_json(ws, {"type": "status", "status": "thinking"})
+    if send_status:
+        await _emit(ws, {"type": "status", "status": "thinking"})
 
+    # final_output tracks whether the model already answered; the except block
+    # uses it to keep a computed answer alive when only post-processing failed.
+    final_output: str | None = None
     try:
-        confirmation_reply = _maybe_handle_confirmation_turn(state, user_text)
-        if confirmation_reply is not None:
-            await _ws_send_json(ws, {"type": "done", "content": confirmation_reply})
-            timings["total_ms"] = round((time.time() - overall_start) * 1000)
-            await _ws_send_json(ws, {"type": "timing", **timings})
-            return message_history
+        # Confirmation intercept + sidecar are websocket-only: a channel caller
+        # (ws=None) has no way to render the prompt, so its users have never
+        # seen a question — intercepting their bare "yes" would consume an
+        # answer to something they were never asked (Codex review R2#4).
+        # Channel users review pending memories in the web UI instead.
+        if ws is not None:
+            confirmation_reply = _maybe_handle_confirmation_turn(state, user_text)
+            if confirmation_reply is not None:
+                await _emit(ws, {"type": "done", "content": confirmation_reply})
+                timings["total_ms"] = round((time.time() - overall_start) * 1000)
+                await _emit(ws, {"type": "timing", **timings})
+                # No model reply to speak, but the confirmation acknowledgement is
+                # the turn's user-facing text — callers relay it via reply_text.
+                return TurnOutcome(message_history, None, confirmation_reply)
 
-        # C2+C3: if a memory-confirmation prompt is pending and the user is
-        # not answering it right now, surface the question as a sidecar
-        # message before the agent reply. Their next yes/no will be picked
-        # up by _maybe_handle_confirmation_turn on the following turn.
-        pending_prompt = state.confirmation_gate.next_prompt()
-        if pending_prompt is not None:
-            await _ws_send_json(ws, {
-                "type": "confirmation_prompt",
-                "event_ids": list(pending_prompt.all_event_ids),
-                "topic": pending_prompt.topic,
-                "key": pending_prompt.key,
-                "message": pending_prompt.question,
-            })
+            # C2+C3: if a memory-confirmation prompt is pending and the user is
+            # not answering it right now, surface the question as a sidecar
+            # message before the agent reply. Their next yes/no will be picked
+            # up by _maybe_handle_confirmation_turn on the following turn.
+            pending_prompt = state.confirmation_gate.next_prompt()
+            if pending_prompt is not None:
+                await _emit(ws, {
+                    "type": "confirmation_prompt",
+                    "event_ids": list(pending_prompt.all_event_ids),
+                    "topic": pending_prompt.topic,
+                    "key": pending_prompt.key,
+                    "message": pending_prompt.question,
+                })
 
         task_type = _detect_task_type(user_text)
 
@@ -2951,6 +3332,7 @@ async def _handle_text_message(
             intent=task_type,
             memory_context_chars=len(state.memory_context or ""),
             tools_scoped=",".join(sorted(_TOOL_NAMES_BY_INTENT.get(task_type, {"unscoped"}))),
+            channel=channel,
         ):
             response = await graph.run(
                 agents_mgr.main_assistant,
@@ -2966,20 +3348,17 @@ async def _handle_text_message(
         final_output = clean_text_for_model(response.output)
 
         # Send complete response
-        await _ws_send_json(ws, {"type": "done", "content": final_output})
+        await _emit(ws, {"type": "done", "content": final_output})
 
         # Update session
         message_history = _persist_history(message_history, response)
         await state.session_store.replace_messages(message_history)
         state.rag_system.add_conversation(user_text, final_output)
-        if state.memory_store is not None:
-            state.memory_store.record_turn(
-                session_id=state.session_store.session_id or "unknown_session",
-                turn_id=turn_id,
-                user_text=user_text,
-                assistant_text=final_output,
-                task_type=task_type,
-            )
+        # NOTE: the legacy memory_store.record_turn block was dropped here.
+        # state.memory_store is None on every live entrypoint (the WS/channel
+        # setup never constructs the single-tenant MemoryStore — personal
+        # memory lives under personal_memory_dir(user_id) instead), so the
+        # block was dead on all paths.
         # Immediately apply explicit facts (email, name) so next turn sees them
         _apply_explicit_facts_from_turn(
             state,
@@ -2995,6 +3374,18 @@ async def _handle_text_message(
             session_id=state.session_store.session_id or "unknown_session",
             user_text=user_text,
         )
+        # Storage-cap breaches inside the sync extraction funnels can't reach
+        # the websocket themselves — they stash a pending notice frame. Deliver
+        # it now so the user learns their memory writes are failing. Only pop
+        # when a websocket exists to carry it: popping with ws=None would
+        # discard the notice unseen (Codex review R2#7); a channel user's
+        # pending notice survives until their next web session drains it.
+        if ws is not None:
+            # Same key derivation as _notify_storage_cap — a hand-rolled key
+            # here could diverge and strand the pending frame (Codex R1#3).
+            cap_notice = pop_pending_storage_cap_notice(_storage_cap_key(state))
+            if cap_notice:
+                await _emit(ws, cap_notice)
         if state.reflector is not None:
             await state.reflector.on_turn(
                 state,
@@ -3004,13 +3395,20 @@ async def _handle_text_message(
             )
 
         timings["total_ms"] = round((time.time() - overall_start) * 1000)
-        await _ws_send_json(ws, {"type": "timing", **timings})
+        await _emit(ws, {"type": "timing", **timings})
 
-        return message_history
+        return TurnOutcome(message_history, final_output, final_output)
 
     except Exception as e:
-        print(f"LOG: Text handler error: {e}")
+        print(f"LOG: Turn pipeline error ({channel}): {e}")
         traceback.print_exc()
+        # The model already answered and the failure happened in post-turn
+        # bookkeeping (persistence, RAG, extraction, reflector). The websocket
+        # user already has their done frame; a channel caller only ever sees
+        # reply_text — so return the real answer, not an error that would
+        # replace it (Codex review R2#6). The failure itself is logged above.
+        if final_output is not None:
+            return TurnOutcome(message_history, final_output, final_output)
         code, friendly = _classify_handler_error(e)
         if _logfire_loaded:
             try:
@@ -3020,11 +3418,25 @@ async def _handle_text_message(
                     error_class=e.__class__.__name__,
                     error_code=code,
                     error_message=str(e),
+                    channel=channel,
                 )
             except Exception:
                 pass
-        await _ws_send_json(ws, {"type": "error", "code": code, "message": friendly})
-        return message_history
+        await _emit(ws, {"type": "error", "code": code, "message": friendly})
+        # No model reply, but a channel caller still needs the friendly message
+        # relayed rather than a silent empty string.
+        return TurnOutcome(message_history, None, friendly)
+
+
+async def _handle_text_message(
+    ws: WebSocket,
+    state: SharedState,
+    user_text: str,
+    message_history: list[ModelMessage] | None,
+) -> list[ModelMessage] | None:
+    """Web text entrypoint — a thin wrapper over the canonical turn pipeline."""
+    outcome = await _execute_turn(ws, state, user_text, message_history, channel="web")
+    return outcome.new_history
 
 
 async def _handle_audio_message(
@@ -3035,7 +3447,12 @@ async def _handle_audio_message(
     *,
     sample_rate: int = 16000,
 ) -> list[ModelMessage] | None:
-    """Process voice input: STT → LLM → TTS."""
+    """Voice entrypoint: STT + transcription echo → canonical turn pipeline
+    (channel="web_voice") → streaming TTS of the returned reply.
+
+    The turn itself is delegated to _execute_turn; this handler owns only the
+    audio-specific bookends (speech in, speech out) and their timings.
+    """
     timings: dict[str, float] = {}
     overall_start = time.time()
 
@@ -3072,87 +3489,20 @@ async def _handle_audio_message(
         # Send transcription to client
         await _ws_send_json(ws, {"type": "transcription", "text": transcription})
 
-        confirmation_reply = _maybe_handle_confirmation_turn(state, transcription)
-        if confirmation_reply is not None:
-            await _ws_send_json(ws, {"type": "done", "content": confirmation_reply})
-            timings["total_ms"] = round((time.time() - overall_start) * 1000)
-            await _ws_send_json(ws, {"type": "timing", **timings})
+        # The full turn — routing, memory, graph, persistence, extraction,
+        # trace span, confirmation sidecar, classified errors — is owned by the
+        # one canonical pipeline. Voice thereby gains everything the text path
+        # had that this handler used to omit.
+        outcome = await _execute_turn(
+            ws, state, transcription, message_history, channel="web_voice",
+        )
+        message_history = outcome.new_history
+        final_output = outcome.output_text
+
+        # A confirmation intercept or a pipeline error returns no speakable
+        # text (and has already emitted its own done/error frame): stop here.
+        if not final_output:
             return message_history
-
-        # Process as text
-        await _ws_send_json(ws, {"type": "status", "status": "thinking"})
-
-        task_type = _detect_task_type(transcription)
-
-        # A1: Router stage — same as text path, concurrent with memory resolution.
-        from core.router import route_turn as _route_turn
-        router_start = time.time()
-        router_task = asyncio.create_task(_route_turn(transcription, model_name=str(config.get("ROUTER_AGENT_MODEL") or "")))
-
-        state.memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=transcription)
-        prompt_input = transcription
-        turn_id = _new_turn_id(state)
-
-        try:
-            router_decision = await router_task
-            timings["router_ms"] = round((time.time() - router_start) * 1000)
-            task_type = router_decision.intent if router_decision.intent != "clarify" else task_type
-        except Exception as _re:
-            print(f"LOG: Router await failed: {_re}")
-            timings["router_ms"] = -1
-
-        graph = _select_graph(task_type)
-        state.intent = task_type  # 3b: scope tools to this turn's intent
-
-        llm_start = time.time()
-        response = await graph.run(
-            agents_mgr.main_assistant,
-            prompt_input,
-            fallback_agents=agents_mgr.main_assistant_fallbacks,
-            deps=state,
-            message_history=message_history,
-            usage=RunUsage(),
-            usage_limits=agents_mgr.usage_limits,
-        )
-        timings["llm_ms"] = round((time.time() - llm_start) * 1000)
-
-        final_output = clean_text_for_model(response.output)
-        await _ws_send_json(ws, {"type": "done", "content": final_output})
-
-        # Update session
-        message_history = _persist_history(message_history, response)
-        await state.session_store.replace_messages(message_history)
-        state.rag_system.add_conversation(transcription, final_output)
-        if state.memory_store is not None:
-            state.memory_store.record_turn(
-                session_id=state.session_store.session_id or "unknown_session",
-                turn_id=turn_id,
-                user_text=transcription,
-                assistant_text=final_output,
-                task_type=task_type,
-            )
-        # Immediately apply explicit facts (email, name) so next turn sees them
-        _apply_explicit_facts_from_turn(
-            state,
-            session_id=state.session_store.session_id or "unknown_session",
-            turn_id=turn_id,
-            user_text=transcription,
-            task_type=task_type,
-        )
-        # D3: candidates queued silently — no in-turn confirmation interrupt.
-        # The web UI /api/memory/pending endpoint will expose them for batch review.
-        _queue_confirmation_candidates_from_turn(
-            state,
-            session_id=state.session_store.session_id or "unknown_session",
-            user_text=transcription,
-        )
-        if state.reflector is not None:
-            await state.reflector.on_turn(
-                state,
-                session_id=state.session_store.session_id or "",
-                message_history=message_history or [],
-                dream_pass_runner=_run_dream_pass_if_needed,
-            )
 
         # E3: Streaming TTS with sentence-boundary chunking.
         # Each sentence is synthesised as soon as its boundary is detected and

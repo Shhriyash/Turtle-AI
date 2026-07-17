@@ -5,6 +5,7 @@ G2: High-level SessionStore wrapper around the new storage abstraction.
 """
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -134,8 +135,22 @@ class SessionStore:
         return (datetime.now(UTC) - ts).total_seconds()
 
     async def _list_sessions_for_user(self, status_filter: str) -> list[Session]:
-        sessions = await getattr(self.backend, "list_sessions")(status_filter=status_filter)
-        # Custom backends may not accept user_id, so enforce tenant filtering here.
+        list_sessions = getattr(self.backend, "list_sessions")
+        kwargs: dict[str, Any] = {"status_filter": status_filter}
+        # Push the tenant filter into the backend (indexed WHERE user_id=?) when
+        # its signature accepts it; custom backends (e.g. test fakes) that don't
+        # take user_id fall back to an unscoped list.
+        try:
+            params = inspect.signature(list_sessions).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "user_id" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            kwargs["user_id"] = self.user_id
+        sessions = await list_sessions(**kwargs)
+        # Defense-in-depth: keep the Python-side filter so backends that ignore
+        # (or don't support) the user_id kwarg still get correct tenancy.
         return [s for s in sessions if s.data.get("user_id", "") == self.user_id]
 
     async def start_or_restore(
@@ -253,6 +268,16 @@ class SessionStore:
             return
         session = await self.backend.get(session_id)
         if session is None:
+            return
+        # Never finalize another tenant's session — that would flip a stranger's
+        # transcript to completed from this connection. Legacy unowned rows
+        # (no user_id) stay finalizable by anyone, matching the sweep's semantics.
+        owner = session.data.get("user_id", "")
+        if owner and owner != self.user_id:
+            print(
+                f"LOG: SessionStore.mark_finalized refused cross-tenant session "
+                f"{session_id} (owner={owner!r}, caller={self.user_id!r})"
+            )
             return
         session.data["status"] = "completed"
         session.data["updated_at"] = _utc_now()

@@ -35,6 +35,17 @@ class VectorStore(Protocol):
     async def search(self, user_id: str, query: str, k: int) -> list[Hit]: ...
 
 class SessionStoreProtocol(Protocol):
+    """Minimal session persistence surface: only ``get``/``put`` are required so
+    lightweight/custom backends stay trivial to implement.
+
+    The SessionStore wrapper additionally *duck-types* an optional extended
+    surface — ``init_db()``, ``list_sessions(status_filter, user_id)`` and
+    ``delete(session_id)`` — via ``hasattr``/``inspect`` and degrades gracefully
+    when a backend omits it (e.g. it passes ``user_id`` only when the signature
+    accepts it, and re-filters tenancy in Python regardless). The bundled
+    ``SQLiteSessionStore`` implements the full surface with a real, indexed
+    ``user_id`` column.
+    """
     async def get(self, session_id: str) -> Optional[Session]: ...
     async def put(self, session: Session) -> None: ...
 

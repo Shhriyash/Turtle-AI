@@ -82,6 +82,11 @@ function handleServerMessage(msg) {
             setBubbleState('idle');
             showToast(msg.message, true);
             break;
+        case 'notice':
+            // Non-fatal server notice (e.g. storage_cap: memory writes are
+            // failing). Surface as an error-styled toast so the user knows.
+            showToast(msg.message, true);
+            break;
         case 'pong':
             break;
         default:
