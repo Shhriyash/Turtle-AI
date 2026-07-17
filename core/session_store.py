@@ -286,6 +286,41 @@ class SessionStore:
             return []
         return list(self.rolling_summary[-max_entries:])
 
+    async def get_summary_tail_with_carryover(self, max_entries: int = 6) -> list[dict[str, Any]]:
+        """Summary tail with cross-session continuity seeding.
+
+        The current session's own rolling summary always wins when present. But
+        a freshly started session has an empty summary, so the [Recent Summary]
+        tier never fired for a new conversation. When empty (and the backend
+        supports list_sessions), fall back to the most recent COMPLETED session
+        owned by the same user and return ITS tail — this is what gives a
+        brand-new session continuity with the previous one.
+        """
+        if max_entries <= 0:
+            return []
+        own = self.get_summary_tail(max_entries=max_entries)
+        if own:
+            return own
+        if not hasattr(self.backend, "list_sessions"):
+            return []
+        try:
+            completed = await self._list_sessions_for_user("completed")
+        except Exception as exc:
+            print(f"LOG: SessionStore carryover list_sessions failed: {exc}")
+            return []
+        if not completed:
+            return []
+        # Newest completed session first; the current session is never among
+        # the completed set, but guard against it anyway.
+        completed.sort(key=lambda s: s.data.get("updated_at", ""), reverse=True)
+        for session in completed:
+            if self.session_id and session.session_id == self.session_id:
+                continue
+            summary = session.data.get("summary", [])
+            if isinstance(summary, list) and summary:
+                return list(summary[-max_entries:])
+        return []
+
     async def append_summary(
         self,
         *,

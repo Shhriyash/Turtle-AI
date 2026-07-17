@@ -380,13 +380,14 @@ class PersonalTierTests(unittest.IsolatedAsyncioTestCase):
 
 class RetrievalBudgetTests(unittest.TestCase):
     def test_default_budget_values(self) -> None:
-        # Current API: prompt-time injection is index + rolling-summary only;
-        # episodic/task tiers moved behind the recall tool.
+        # Phase 2 W2: prompt-time injection is index + query-aware [Relevant
+        # Memory] + rolling-summary; total raised to 600 with headroom.
         b = DEFAULT_BUDGET
         self.assertEqual(b.index_tokens, 240)
+        self.assertEqual(b.relevant_tokens, 160)
         self.assertEqual(b.summary_tokens, 150)
-        self.assertEqual(b.total_tokens, 390)
-        self.assertEqual(b.index_tokens + b.summary_tokens, b.total_tokens)
+        self.assertEqual(b.total_tokens, 600)
+        self.assertLessEqual(b.index_tokens + b.relevant_tokens + b.summary_tokens, b.total_tokens)
 
     def test_custom_budget(self) -> None:
         b = RetrievalBudget(index_tokens=30, summary_tokens=20, total_tokens=50)

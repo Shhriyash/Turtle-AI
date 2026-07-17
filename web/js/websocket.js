@@ -7,6 +7,7 @@ import { setStatus, showBanner, hideBanner, showToast } from './utils.js';
 import { addMessage, showThinking, hideThinking, setBubbleState } from './chat.js';
 import { playAudioBlob } from './voice.js';
 import { updateTimings } from './devmode.js';
+import { renderConfirmationPrompt } from './memory.js';
 
 /** Connect (or reconnect) to the WebSocket server */
 export function connectWebSocket() {
@@ -69,6 +70,11 @@ function handleServerMessage(msg) {
             break;
         case 'timing':
             updateTimings(msg);
+            break;
+        case 'confirmation_prompt':
+            // Server queued an uncertain memory fact behind the gate.
+            // Surface it as an inline card the user can confirm/dismiss.
+            renderConfirmationPrompt(msg);
             break;
         case 'error':
             hideThinking();

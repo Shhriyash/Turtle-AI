@@ -10,27 +10,13 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from core.guardrails import enforce_storage_cap
+from core.memory_schema import ALLOWED_TOPICS
 from core.paths import personal_journal_dir, personal_memory_dir
 
 
 ALLOWED_KINDS = frozenset({"fact", "preference", "behavior", "correction", "contradiction"})
-ALLOWED_TOPICS = frozenset(
-    {
-        "identity",
-        "preferences",
-        "workflow",
-        "contacts",
-        "projects",
-        "corrections",
-        "relations",
-        # The LLM extractor prompt requests these four; rejecting them used to
-        # raise mid-batch and void every sibling candidate in the same turn.
-        "working_style",
-        "communication_style",
-        "tool_preferences",
-        "decision_style",
-    }
-)
+# The 11-topic vocabulary now has a single home in core.memory_schema; re-exported
+# here so existing `from core.memory_journal import ALLOWED_TOPICS` importers work.
 ALLOWED_SOURCES = frozenset({"explicit", "inferred", "synthesized", "migration"})
 ALLOWED_EXTRACTORS = frozenset({"deterministic", "llm_turn", "dream_pass", "migration"})
 
@@ -71,6 +57,11 @@ class MemoryEvent:
     supersedes: str | None = None
     applied: bool = False
     rejected: bool = False
+    # Pre-rendered one-line projection, snapshotted at extraction time so the
+    # replayer can render verbatim (statement-based rendering). Empty on old
+    # events and on events built without one; the replayer falls back to the
+    # key templates in core.memory_schema in that case.
+    statement: str = ""
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -93,6 +84,7 @@ class MemoryEvent:
             supersedes=payload.get("supersedes"),
             applied=bool(payload.get("applied", False)),
             rejected=bool(payload.get("rejected", False)),
+            statement=str(payload.get("statement", "")),
         )
 
 
@@ -299,6 +291,7 @@ def make_event(
     supersedes: str | None = None,
     applied: bool = False,
     event_id: str | None = None,
+    statement: str = "",
 ) -> MemoryEvent:
     event = MemoryEvent(
         event_id=event_id or generate_event_id(),
@@ -315,6 +308,7 @@ def make_event(
         evidence=dict(evidence or {}),
         supersedes=supersedes,
         applied=applied,
+        statement=statement,
     )
     validate_event(event)
     return event

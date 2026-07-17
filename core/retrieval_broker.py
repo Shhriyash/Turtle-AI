@@ -34,8 +34,12 @@ except Exception:  # pragma: no cover - logfire optional
 @dataclass(frozen=True)
 class RetrievalBudget:
     index_tokens: int = 240
+    # Phase 2 W2: query-aware [Relevant Memory] tier — the always-on injection
+    # that surfaces stored facts outside identity/preferences without a
+    # separate recall-tool call.
+    relevant_tokens: int = 160
     summary_tokens: int = 150
-    total_tokens: int = 390
+    total_tokens: int = 600
 
 
 DEFAULT_BUDGET = RetrievalBudget()
@@ -241,18 +245,36 @@ class RetrievalBroker:
             trimmed = _trim_to_tokens(index_text, budget_1)
             if trimmed:
                 sections.append(trimmed)
-                tokens_used += _estimate_tokens(trimmed)
+                # Clamp to the tier budget: _trim_to_tokens appends "..." on cut,
+                # so re-estimating can exceed the budget and overdraw the total.
+                tokens_used += min(_estimate_tokens(trimmed), budget_1)
+
+        # --- Tier 1.5: query-aware relevant memory (always-on) ----------
+        # The autopsy's single most damaging read-path finding: build_context
+        # ignored *query* and injected only the static identity/preferences
+        # card, so any stored fact outside those two topics was invisible unless
+        # the model separately called the recall tool. This tier fixes that by
+        # running the Phase 1 search layer against the actual query.
+        remaining = self.budget.total_tokens - tokens_used
+        budget_r = min(self.budget.relevant_tokens, remaining)
+        if budget_r > 0:
+            relevant_text = self._build_relevant_tier(query, exclude_text=index_text)
+            if relevant_text:
+                trimmed = _trim_to_tokens(relevant_text, budget_r)
+                if trimmed:
+                    sections.append(trimmed)
+                    tokens_used += min(_estimate_tokens(trimmed), budget_r)
 
         # --- Tier 2: rolling summary tail -------------------------------
         remaining = self.budget.total_tokens - tokens_used
         budget_2 = min(self.budget.summary_tokens, remaining)
         if budget_2 > 0:
-            summary_text = self._build_summary_tier()
+            summary_text = await self._build_summary_tier()
             if summary_text:
                 trimmed = _trim_to_tokens(summary_text, budget_2)
                 if trimmed:
                     sections.append(trimmed)
-                    tokens_used += _estimate_tokens(trimmed)
+                    tokens_used += min(_estimate_tokens(trimmed), budget_2)
 
         return "\n\n".join(sections).strip()
 
@@ -304,10 +326,82 @@ class RetrievalBroker:
 
         return "\n\n".join(sections).strip()
 
-    def _build_summary_tier(self) -> str:
+    def _build_relevant_tier(self, query: str, *, exclude_text: str = "") -> str:
+        """Tier 1.5: query-aware always-on injection of relevant stored facts.
+
+        Runs the Phase 1 search layer (stopword AND-first/OR-fallback,
+        latest-per-key, superseded exclusion) then applies an injection-grade
+        relevance floor: only rows whose token overlap with the normalized
+        query clears 0.3 survive. An always-on tier must prefer empty over
+        wrong — the autopsy's "what editor do I use → taekwondo" failure — so
+        weak hits are dropped rather than injected. Hits whose value already
+        appears in the Tier-1 identity/preferences body are deduped away.
+        """
+        if not str(query or "").strip() or self.sqlite_index is None:
+            return ""
+        normalized = _normalize_recall_query(query)
+        if not normalized:
+            return ""
+        try:
+            hits = self.sqlite_index.search(normalized, limit=5)
+            # Values already served by a Tier-1 line ("- Name: Shriyash" →
+            # "shriyash"). Exact match on the parsed line value, NOT substring
+            # containment over the whole block: substring matching suppressed
+            # distinct short facts ("Python", "yes") whenever the same word
+            # happened to appear inside an unrelated Tier-1 sentence.
+            exclude_values = {
+                line.split(":", 1)[1].strip().lower()
+                for line in str(exclude_text or "").splitlines()
+                if ":" in line
+            }
+            exclude_values.discard("")
+            lines: list[str] = []
+            seen: set[str] = set()
+            for row in hits:
+                # Injection-grade floor — confidently-wrong beats honestly-empty.
+                # Scored against what actually gets injected (topic/key label +
+                # value), NOT the full searchable text: evidence_text is never
+                # shown, so a row whose only query overlap lives in hidden
+                # evidence must not clear the floor on its strength.
+                injectable = " ".join(
+                    part for part in (row.topic, row.key, row.value_text) if part
+                )
+                if _token_overlap(normalized, injectable) < 0.3:
+                    continue
+                text = (row.value_text or "").strip()
+                if not text:
+                    continue
+                # Dedupe against the Tier-1 identity/preferences body already present.
+                if text.lower() in exclude_values:
+                    continue
+                dedupe_key = f"{row.topic}:{text.lower()}"
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                label = row.key or row.topic
+                lines.append(f"- {label}: {text}")
+            if not lines:
+                return ""
+            return "[Relevant Memory]\n" + "\n".join(lines)
+        except Exception as exc:
+            print(f"LOG: RetrievalBroker relevant tier failed: {exc}")
+            return ""
+
+    async def _build_summary_tier(self) -> str:
         if self.session_store is None:
             return ""
-        entries = self.session_store.get_summary_tail(max_entries=6)
+        try:
+            # Prefer cross-session carryover when the store exposes it: a fresh
+            # session's own rolling_summary is empty, so this is what seeds a
+            # brand-new session with the previous session's [Recent Summary] —
+            # the continuity the tier had never actually provided in production.
+            if hasattr(self.session_store, "get_summary_tail_with_carryover"):
+                entries = await self.session_store.get_summary_tail_with_carryover(max_entries=6)
+            else:
+                entries = self.session_store.get_summary_tail(max_entries=6)
+        except Exception as exc:
+            print(f"LOG: RetrievalBroker summary tier failed: {exc}")
+            return ""
         if not entries:
             return ""
         lines = ["[Recent Summary]"]

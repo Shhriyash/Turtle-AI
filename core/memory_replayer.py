@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Iterable
 
 from core.memory_journal import MemoryEvent
+from core.memory_schema import TOPICS, render_statement
 from core.personal_memory_store import PersonalMemoryStore
 
 
@@ -15,33 +16,10 @@ _DECAY_EXEMPT_TOPICS = frozenset({"identity"})
 _DECAY_EXEMPT_SOURCE = "migration"
 
 
-TOPIC_TITLES = {
-    "identity": "Identity",
-    "preferences": "Preferences",
-    "workflow": "Workflow",
-    "contacts": "Contacts",
-    "projects": "Projects",
-    "corrections": "Corrections",
-    "relations": "Relations",
-    "working_style": "Working Style",
-    "communication_style": "Communication Style",
-    "tool_preferences": "Tool Preferences",
-    "decision_style": "Decision Style",
-}
-
-TOPIC_SUMMARIES = {
-    "identity": "Name, email, location, timezone, language, and role",
-    "preferences": "Tone, response style, and delivery defaults",
-    "workflow": "Recurring habits and operational defaults",
-    "contacts": "Frequent recipients and confirmed aliases",
-    "projects": "Project context and recurring work references",
-    "corrections": "User corrections and how to apply them",
-    "relations": "People in the user's life and their roles",
-    "working_style": "How the user approaches tasks",
-    "communication_style": "How the user likes to receive information",
-    "tool_preferences": "Tools, languages, and environments the user favours",
-    "decision_style": "How the user makes decisions",
-}
+# Topic titles/summaries and the topic tuple all derive from the single registry
+# in core.memory_schema so the vocabularies can never drift apart again.
+TOPIC_TITLES = {name: spec.title for name, spec in TOPICS.items()}
+TOPIC_SUMMARIES = {name: spec.summary for name, spec in TOPICS.items()}
 
 LINE_SORT_ORDER = [
     "Name",
@@ -65,19 +43,7 @@ LINE_SORT_ORDER = [
     "Correction",
 ]
 
-ALL_TOPICS = (
-    "identity",
-    "preferences",
-    "workflow",
-    "contacts",
-    "projects",
-    "corrections",
-    "relations",
-    "working_style",
-    "communication_style",
-    "tool_preferences",
-    "decision_style",
-)
+ALL_TOPICS = tuple(TOPICS)
 
 
 @dataclass(frozen=True)
@@ -187,173 +153,11 @@ def _event_sort_key(event: MemoryEvent) -> tuple[str, str]:
 
 
 def _render_event_lines(event: MemoryEvent) -> list[str]:
-    value = event.value or {}
-    key = event.key
-
-    if key == "identity.name":
-        name = _clean_text(value.get("name"))
-        return [f"- Name: {name}"] if name else []
-
-    if key == "identity.home_city":
-        home_city = _clean_text(value.get("home_city"))
-        return [f"- Home city: {home_city}"] if home_city else []
-
-    if key == "identity.current_city":
-        current_city = _clean_text(value.get("current_city"))
-        return [f"- Current city: {current_city}"] if current_city else []
-
-    if key == "identity.country":
-        country = _clean_text(value.get("country"))
-        return [f"- Country: {country}"] if country else []
-
-    if key == "identity.primary_email":
-        email = _clean_text(value.get("primary_email") or value.get("email"))
-        return [f"- Primary email: {email.lower()}"] if email else []
-
-    if key.startswith("identity.known_email."):
-        email = _clean_text(value.get("email"))
-        return [f"- Known email: {email.lower()}"] if email else []
-
-    if key == "identity.timezone":
-        tz = _clean_text(value.get("timezone"))
-        return [f"- Timezone: {tz}"] if tz else []
-
-    if key == "identity.preferred_language":
-        language = _clean_text(value.get("preferred_language"))
-        return [f"- Preferred language: {language}"] if language else []
-
-    if key == "identity.occupation":
-        occupation = _clean_text(value.get("occupation"))
-        return [f"- Occupation: {occupation}"] if occupation else []
-
-    if key == "identity.company":
-        company = _clean_text(value.get("company"))
-        return [f"- Company: {company}"] if company else []
-
-    if key == "preferences.response_style":
-        style = _clean_text(value.get("response_style"))
-        return [f"- Response style: {style}"] if style else []
-
-    if key == "preferences.humor_level":
-        humor = _clean_text(value.get("humor_level"))
-        return [f"- Humor level: {humor}"] if humor else []
-
-    if key == "preferences.email_tone":
-        tone = _clean_text(value.get("email_tone"))
-        return [f"- Email tone: {tone}"] if tone else []
-
-    if key == "workflow.prefers_draft_before_send":
-        flag = value.get("prefers_draft_before_send")
-        if flag is None:
-            return []
-        return [f"- Prefers draft before send: {'true' if bool(flag) else 'false'}"]
-
-    if key == "workflow.primary_llm":
-        model = _clean_text(value.get("primary_llm"))
-        return [f"- Preferred primary model: {model}"] if model else []
-
-    if key == "workflow.email_interactions_recorded":
-        count = value.get("count")
-        if count is None:
-            return []
-        try:
-            return [f"- Email interactions recorded: {int(count)}"]
-        except Exception:
-            return []
-
-    # D4: routines — emit a parseable single-line summary so the profile
-    # snapshot can read them back without re-touching the journal.
-    if key in {"workflow.morning_routine", "workflow.daily_briefing"} or key.startswith("workflow.recurring_request"):
-        routine = _clean_text(value.get("routine") or value.get("name"))
-        if not routine:
-            return []
-        cadence = _clean_text(value.get("cadence") or value.get("frequency") or "daily")
-        clock = _clean_text(value.get("time"))
-        tz = _clean_text(value.get("timezone"))
-        items_field = value.get("items") or value.get("steps") or []
-        if isinstance(items_field, str):
-            items_field = [items_field]
-        items = [_clean_text(i) for i in items_field if _clean_text(i)] if isinstance(items_field, list) else []
-
-        schedule_parts = [cadence] if cadence else []
-        if clock:
-            schedule_parts.append(clock)
-        if tz:
-            schedule_parts.append(tz)
-        schedule = " ".join(schedule_parts) or "daily"
-
-        line = f"- Routine: {routine} | {schedule}"
-        if items:
-            line += f" | items: {', '.join(items)}"
-        return [line]
-
-    if key.startswith("contacts.frequent_recipient."):
-        email = _clean_text(value.get("email"))
-        if not email:
-            return []
-        count = value.get("count")
-        if count is None:
-            return [f"- Frequent recipient: {email.lower()}"]
-        try:
-            return [f"- Frequent recipient: {email.lower()} (count: {int(count)})"]
-        except Exception:
-            return [f"- Frequent recipient: {email.lower()}"]
-
-    if key.startswith("projects.project."):
-        name = _clean_text(value.get("name"))
-        summary = _clean_text(value.get("summary"))
-        if not name:
-            return []
-        if summary:
-            return [f"- Project: {name} — {summary}"]
-        return [f"- Project: {name}"]
-
-    if event.topic == "relations" and key.startswith("relations."):
-        role = _clean_text(value.get("role") or key.split(".", 1)[-1])
-        name = _clean_text(value.get("name"))
-        if not name:
-            return []
-        label = role.replace("_", " ").title() if role else "Person"
-        return [f"- {label}: {name}"]
-
-    if event.topic == "corrections":
-        summary = _clean_text(value.get("summary") or value.get("text"))
-        if summary:
-            return [f"- Correction: {summary}"]
-        # fall through to the generic renderer for corrections whose value
-        # carries structured fields instead of a summary/text string
-
-    # Generic fallback: an applied event must never be invisible just because
-    # its key is missing from the whitelist above (that is how the confirmed
-    # corrections.name_role and preferences.sport facts vanished).
-    label_source = key.rsplit(".", 1)[-1] if "." in key else (key or event.topic)
-    label = _clean_text(label_source.replace("_", " ")).title() or event.topic.title()
-
-    parts: list[str] = []
-
-    def _collect(node: object) -> None:
-        if isinstance(node, dict):
-            for item in node.values():
-                _collect(item)
-        elif isinstance(node, (list, tuple)):
-            for item in node:
-                _collect(item)
-        elif isinstance(node, bool):
-            parts.append("true" if node else "false")
-        elif isinstance(node, (str, int, float)):
-            text = _clean_text(node)
-            if text:
-                parts.append(text)
-
-    _collect(value)
-    flattened = ", ".join(parts)
-    return [f"- {label}: {flattened}"] if flattened else []
-
-
-def _clean_text(value: object) -> str:
-    if value is None:
-        return ""
-    return " ".join(str(value).split()).strip()
+    # The per-key templates and generic fallback now live in the single registry
+    # (core.memory_schema.render_statement); the replayer only owns the "- "
+    # bullet wrapping and the empty-line filter.
+    statement = render_statement(event)
+    return [f"- {statement}"] if statement else []
 
 
 def _sort_lines(lines: list[str]) -> list[str]:

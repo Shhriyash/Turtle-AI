@@ -97,6 +97,7 @@ from core.guardrails import (
 from core.telemetry import emit as emit_event, emit_once as emit_event_once
 from core.dream_pass import DreamPass
 from core.memory_journal import JournalStore, make_event
+from core.memory_schema import decide_write_policy, statement_for
 from core.memory_extractor import extract_memory_event_specs
 from core.memory_replayer import replay
 from core.observability import trace_sink
@@ -915,10 +916,21 @@ def _journal_and_queue_candidates(
         if event is None:
             continue
 
+        # llm_turn values are not guaranteed to be substrings of the user text
+        # the way regex values are, so recompute evidence support and let the
+        # single write-policy make the applied call (an explicit fact whose value
+        # is absent from its evidence downgrades to pending).
         if candidate.extraction_source == "llm_turn" and event.applied:
             value_text = str(candidate.value).strip().lower()
             evidence_text = str(candidate.evidence or "").lower()
-            if value_text not in evidence_text:
+            evidence_supported = bool(value_text) and value_text in evidence_text
+            policy = decide_write_policy(
+                source=event.source,
+                topic=event.topic,
+                confidence=event.confidence,
+                evidence_supported=evidence_supported,
+            )
+            if policy != "applied":
                 event = _dc_replace(event, applied=False)
 
         if event.applied:
@@ -1028,25 +1040,45 @@ def _confidence_for_candidate(candidate: PersonalMemoryCandidate) -> float:
     return 0.5
 
 
+def _deterministic_evidence_supported(candidate: PersonalMemoryCandidate) -> bool:
+    """Evidence check for the deterministic sync path.
+
+    Regex candidates are extracted from literal user text, but nothing at apply
+    time enforced that (Codex review A#2). For the quote-shaped topics —
+    identity and contacts, where a mis-parsed value auto-applied at high
+    confidence does real damage — require the value to literally appear in the
+    captured evidence. Derived values elsewhere (booleans, routine descriptors,
+    counts) are not quotes of the user text; for those, non-empty evidence is
+    the requirement, since the regex match window *is* the evidence.
+    """
+    evidence = str(candidate.evidence or "").strip().lower()
+    if not evidence:
+        return False
+    if candidate.topic not in {"identity", "contacts"}:
+        return True
+    value = str(candidate.value or "").strip().lower()
+    return bool(value) and value in evidence
+
+
 def _should_auto_apply_event(
     *,
     kind: str,
     source: str,
     confidence: float,
     topic: str = "",
+    evidence_supported: bool = True,
 ) -> bool:
-    # Explicit, high-confidence facts/preferences always auto-apply.
-    if source == "explicit" and confidence >= 0.9 and kind in {"fact", "preference"}:
-        return True
-    # Phase 1: confidence-tiered auto-apply for non-identity topics.
-    # Inferred preferences/workflow/projects with conf>=0.85 bypass the gate.
-    if (
-        topic in {"preferences", "workflow", "projects"}
-        and confidence >= 0.85
-        and kind in {"fact", "preference", "behavior"}
-    ):
-        return True
-    return False
+    # Thin adapter over the single write-policy registry for the deterministic
+    # sync path. Callers with a candidate in hand pass the computed
+    # ``_deterministic_evidence_supported`` verdict; the default True is only
+    # for legacy call shapes without one. (``kind`` is retained for signature
+    # stability; the policy keys off source/topic/confidence/evidence.)
+    return decide_write_policy(
+        source=source,
+        topic=topic,
+        confidence=confidence,
+        evidence_supported=evidence_supported,
+    ) == "applied"
 
 
 def _candidate_to_journal_event(
@@ -1205,7 +1237,16 @@ def _candidate_to_journal_event(
             "user_text": candidate.evidence,
             "observation_count": 1,
         },
-        applied=_should_auto_apply_event(kind=kind, source=source, confidence=confidence, topic=topic),
+        applied=_should_auto_apply_event(
+            kind=kind,
+            source=source,
+            confidence=confidence,
+            topic=topic,
+            evidence_supported=_deterministic_evidence_supported(candidate),
+        ),
+        # Snapshot the projection on the assembled event so the replayer renders
+        # it verbatim (statement-based rendering).
+        statement=statement_for(topic, event_key, event_value),
     )
 
 
@@ -1408,6 +1449,7 @@ def _apply_explicit_facts_from_turn(
                 source=_source_for_candidate(candidate),
                 confidence=_confidence_for_candidate(candidate),
                 topic=candidate.topic,
+                evidence_supported=_deterministic_evidence_supported(candidate),
             )
         ]
         if not events:
@@ -2539,17 +2581,30 @@ async def websocket_endpoint(ws: WebSocket):
         memory_store = None
         personal_memory_store = PersonalMemoryStore(user_id=user_id)
         from core.memory_sqlite import MemorySQLiteIndex
-        sqlite_index = MemorySQLiteIndex(user_id=user_id)
-        journal_store = JournalStore(user_id=user_id, on_append=sqlite_index.index_event)
-        # Backfill the FTS5 index from the journal (idempotent; no-op on restart).
+        # The index is a derived read model — if it can't open (locked file,
+        # failed column migration), degrade to journal scans rather than kill
+        # the session. Every consumer below accepts sqlite_index=None.
         try:
-            sqlite_index.backfill_from_journal(journal_store)
+            sqlite_index = MemorySQLiteIndex(user_id=user_id)
         except Exception as exc:
-            print(f"LOG: SQLite memory index backfill failed for {user_id}: {exc}")
+            print(f"LOG: SQLite memory index unavailable for {user_id}: {exc}; falling back to journal scans")
+            sqlite_index = None
+        journal_store = JournalStore(
+            user_id=user_id,
+            on_append=sqlite_index.index_event if sqlite_index is not None else None,
+        )
+        # Backfill the FTS5 index from the journal (idempotent; no-op on restart).
+        if sqlite_index is not None:
+            try:
+                sqlite_index.backfill_from_journal(journal_store)
+            except Exception as exc:
+                print(f"LOG: SQLite memory index backfill failed for {user_id}: {exc}")
         confirmation_gate = ConfirmationGate(
             journal=journal_store,
             store=personal_memory_store,
             state_path=personal_memory_dir(user_id) / "confirmation_state.json",
+            # Phase 2 W3: indexed hot-path lookups instead of O(n) journal scans.
+            sqlite_index=sqlite_index,
         )
         personal_memory_prompt = PersonalMemoryPromptBuilder(
             personal_memory_store,

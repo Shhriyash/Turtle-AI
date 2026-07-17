@@ -721,6 +721,7 @@ async def run_stage_b_session_extractor(
     from core.config import settings as _settings
     from core.llm_client import get_google_models, get_groq_model, get_openrouter_models
     from core.memory_journal import ALLOWED_TOPICS, make_event
+    from core.memory_schema import decide_write_policy, statement_for
 
     if not _settings.personal_memory_enabled or not _settings.personal_memory_stage_b_enabled:
         return 0
@@ -841,14 +842,17 @@ async def run_stage_b_session_extractor(
             json.dumps(payload_for_id, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
 
-        # Phase 1: confidence-tiered auto-apply. Identity auto-applies only for
-        # evidence-grounded explicit statements at very high confidence — in
-        # production the correct stage-B name fix sat gated while regex garbage
-        # auto-applied; this closes that inversion without opening it to guesses.
-        auto_apply_topics = {"preferences", "workflow", "projects"}
-        applied = topic in auto_apply_topics and confidence >= 0.85
-        if topic == "identity" and source == "explicit" and confidence >= 0.95:
-            applied = True
+        # Auto-apply is now the single registry decision (core.memory_schema).
+        # The former stage-B special case auto-applied explicit identity at
+        # confidence >= 0.95; decide_write_policy uses >= 0.9 for evidence-
+        # supported explicit facts of any topic — an intended widening (the
+        # phase1 0.99 case still applies).
+        applied = decide_write_policy(
+            source=source,
+            topic=topic,
+            confidence=confidence,
+            evidence_supported=_evidence_supports_value(value, evidence),
+        ) == "applied"
 
         events.append(
             make_event(
@@ -864,6 +868,8 @@ async def run_stage_b_session_extractor(
                 turn_id=f"{session_id}_stageb_{index}",
                 evidence=evidence,
                 applied=applied,
+                # Snapshot the projection now so the replayer renders verbatim.
+                statement=statement_for(topic, key, value),
             )
         )
 

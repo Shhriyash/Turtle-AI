@@ -10,6 +10,7 @@ import { connectWebSocket, startConnectionWatchdog } from './websocket.js';
 import { sendMessage, handleInputKey, setupInputAutosize, closeResponsePanel } from './chat.js';
 import { startRecording, stopRecording, refreshVoiceButtonUi } from './voice.js';
 import { toggleDevPanel, applyDevConfig, resetDevDefaults } from './devmode.js';
+import { initMemoryUI } from './memory.js';
 
 function isTypingTarget(target) {
     const el = target;
@@ -197,6 +198,7 @@ function initEvents() {
 function init() {
     initDOM();
     initEvents();
+    initMemoryUI();
     updateVoiceModeUi();
     connectWebSocket();
     startConnectionWatchdog();

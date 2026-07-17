@@ -27,4 +27,5 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run test suite
-        run: python -m pytest test --ignore=test/evals -q
+        # Phase 2 W5 made test/evals genuinely offline — no ignore needed.
+        run: python -m pytest test -q

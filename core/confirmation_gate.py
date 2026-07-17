@@ -4,12 +4,15 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.io_atomic import atomic_write_json
 from core.memory_journal import JournalStore, MemoryEvent, make_event
 from core.memory_replayer import replay
 from core.personal_memory_store import PersonalMemoryStore
+
+if TYPE_CHECKING:
+    from core.memory_sqlite import MemoryEventRow, MemorySQLiteIndex
 
 
 DEFAULT_SILENCE_DAYS = 14
@@ -76,10 +79,18 @@ class ConfirmationGate:
         first_session_window_minutes: int = DEFAULT_FIRST_SESSION_WINDOW_MINUTES,
         first_session_event_threshold: int = DEFAULT_FIRST_SESSION_EVENT_THRESHOLD,
         first_session_account_age_hours: int = DEFAULT_FIRST_SESSION_ACCOUNT_AGE_HOURS,
+        sqlite_index: "MemorySQLiteIndex | None" = None,
     ) -> None:
         self.journal = journal
         self.store = store
         self.state_path = state_path
+        # Optional read model (Phase 2 W3). When wired — it must be the same
+        # index the journal write-throughs to via on_append — the hot-path
+        # existence / silence / latest-by-key lookups route through indexed
+        # queries instead of O(n) journal scans. Default None preserves the
+        # exact journal-scan behavior, so callers that don't pass it are
+        # unchanged. apps/turtle_server.py wires it in a one-line follow-up.
+        self.sqlite_index = sqlite_index
         self.silence_days = int(silence_days)
         self.first_session_window_minutes = int(first_session_window_minutes)
         self.first_session_event_threshold = int(first_session_event_threshold)
@@ -279,22 +290,31 @@ class ConfirmationGate:
         return self._is_silenced(topic, key)
 
     def _silence_cutoff(self, events: list[MemoryEvent]) -> datetime | None:
+        return self._silence_cutoff_from_count(len(events))
+
+    def _silence_cutoff_from_count(self, event_count: int) -> datetime | None:
         """Return the timestamp before which a rejection no longer silences.
 
         Returns None when silencing is disabled (silence_days <= 0). For
         first-session users (sparse journal or fresh account) the window
         collapses to ``first_session_window_minutes`` so onboarding feels
-        responsive instead of muted for two weeks.
+        responsive instead of muted for two weeks. Takes the event *count*
+        rather than the list because that is all the first-session verdict
+        needs — so the indexed path can pass ``sqlite_index.count()`` without
+        materializing every event.
         """
         if self.silence_days <= 0:
             return None
         now = datetime.now(UTC)
-        if self._is_first_session(events):
+        if self._is_first_session_from_count(event_count):
             return now - timedelta(minutes=max(0, self.first_session_window_minutes))
         return now - timedelta(days=self.silence_days)
 
     def _is_first_session(self, events: list[MemoryEvent]) -> bool:
-        if len(events) < self.first_session_event_threshold:
+        return self._is_first_session_from_count(len(events))
+
+    def _is_first_session_from_count(self, event_count: int) -> bool:
+        if event_count < self.first_session_event_threshold:
             return True
         try:
             ctime = self.journal.journal_dir.stat().st_ctime
@@ -305,9 +325,44 @@ class ConfirmationGate:
             pass
         return False
 
+    def _usable_index(self):
+        """The sqlite index, or None when absent OR stale.
+
+        A write-through failure after a successful journal append leaves the
+        read model missing events; trusting it then would change gate decisions
+        (missed contradiction tombstones stop silencing, real journal events
+        look nonexistent). Stale means: fall back to the journal scan until a
+        successful full backfill clears the flag.
+        """
+        index = self.sqlite_index
+        if index is not None and not getattr(index, "is_stale", False):
+            return index
+        return None
+
     def _is_silenced(self, topic: str, key: str) -> bool:
+        # Indexed path: reproduce the journal scan below exactly over the read
+        # model. The first-session verdict only needs the total event count, and
+        # the silence check itself only needs the (topic, key) contradictions —
+        # both are indexed lookups, so the whole journal never has to be walked.
+        index = self._usable_index()
+        if index is not None:
+            cutoff = self._silence_cutoff_from_count(index.count())
+            if cutoff is None:
+                return False
+            for row in index.events_for_key(topic, key):
+                if row.kind != "contradiction":
+                    continue
+                if not row.value.get("rejected"):
+                    continue
+                observed = _parse_iso(row.observed_at)
+                if observed is None:
+                    continue
+                if observed >= cutoff:
+                    return True
+            return False
+
         events = list(self.journal.iter_events())
-        cutoff = self._silence_cutoff(events)
+        cutoff = self._silence_cutoff_from_count(len(events))
         if cutoff is None:
             return False
         for event in events:
@@ -325,13 +380,45 @@ class ConfirmationGate:
         return False
 
     def _load_event(self, event_id: str) -> MemoryEvent | None:
+        # Indexed path: primary-key lookup + reconstruct the event, instead of a
+        # linear journal scan. The reconstruction is faithful for every field the
+        # gate reads downstream (kind/topic/key/value/session_id/turn_id); fields
+        # the gate never touches fall back to journal defaults.
+        index = self._usable_index()
+        if index is not None:
+            row = index.get_event(event_id)
+            if row is None:
+                return None
+            return self._row_to_event(row)
         for event in self.journal.iter_events():
             if event.event_id == event_id:
                 return event
         return None
 
     def _event_exists_in_journal(self, event_id: str) -> bool:
+        index = self._usable_index()
+        if index is not None:
+            return index.event_exists(event_id)
         return self._load_event(event_id) is not None
+
+    @staticmethod
+    def _row_to_event(row: "MemoryEventRow") -> MemoryEvent:
+        """Reconstruct a MemoryEvent from an indexed read-model row."""
+        return MemoryEvent(
+            event_id=row.event_id,
+            session_id=row.session_id,
+            turn_id=row.turn_id,
+            observed_at=row.observed_at,
+            kind=row.kind,
+            topic=row.topic,
+            key=row.key,
+            value=dict(row.value),
+            confidence=float(row.confidence),
+            source=row.source,
+            extractor=row.extractor or "deterministic",
+            applied=bool(row.applied),
+            statement=row.statement,
+        )
 
     def _remove_from_pending(self, event_id: str) -> None:
         pending = self._state["pending"]
