@@ -11,10 +11,10 @@ EXPECTED = {
     "search_web",
     "search_url",
     "send_email_assistant",
-    "history_tool",
     "recall",
     "calendar_create",
     "calendar_list",
+    "remember",
 }
 
 

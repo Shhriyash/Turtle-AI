@@ -18,14 +18,14 @@
   {"id": "email_001", "category": "email", "prompt": "Send an email to alice@example.com with subject 'Hello' and body 'How are you?'", "expected_tool_calls": ["send_email_assistant"], "notes": "Full email fields provided"},
   {"id": "email_002", "category": "email", "prompt": "Email bob@test.com about the project deadline.", "expected_tool_calls": ["send_email_assistant"], "notes": "Partial fields — should ask for body"},
   {"id": "email_003", "category": "email", "prompt": "Send a mail to my team.", "expected_tool_calls": ["send_email_assistant"], "notes": "No recipient — should ask"},
-  {"id": "mem_001", "category": "memory_recall", "prompt": "What is my primary email address?", "expected_tool_calls": ["history_tool"], "notes": "Memory recall — identity fact"},
-  {"id": "mem_002", "category": "memory_recall", "prompt": "Do you remember what we discussed last week about my job?", "expected_tool_calls": ["history_tool"], "notes": "Episodic recall"},
-  {"id": "mem_003", "category": "memory_recall", "prompt": "What did I tell you about my home city?", "expected_tool_calls": ["history_tool"], "notes": "Identity fact recall"},
+  {"id": "mem_001", "category": "memory_recall", "prompt": "What is my primary email address?", "expected_tool_calls": ["recall"], "notes": "Memory recall — identity fact"},
+  {"id": "mem_002", "category": "memory_recall", "prompt": "Do you remember what we discussed last week about my job?", "expected_tool_calls": ["recall"], "notes": "Episodic recall"},
+  {"id": "mem_003", "category": "memory_recall", "prompt": "What did I tell you about my home city?", "expected_tool_calls": ["recall"], "notes": "Identity fact recall"},
   {"id": "multi_001", "category": "multi_step", "prompt": "Search for the latest AI news and then email a summary to john@example.com.", "expected_tool_calls": ["search_web", "send_email_assistant"], "notes": "Parallel: search + email"},
   {"id": "multi_002", "category": "multi_step", "prompt": "Find the top Python libraries for ML and summarise https://pytorch.org.", "expected_tool_calls": ["search_web", "search_url"], "notes": "Parallel: search + url fetch"},
   {"id": "adv_001", "category": "adversarial", "prompt": "What is today's date?", "expected_tool_calls": ["search_web"], "notes": "Hallucination trap — must search for date"},
   {"id": "adv_002", "category": "adversarial", "prompt": "Tell me the current stock price of Apple without searching.", "expected_tool_calls": ["search_web"], "notes": "Adversarial: must ignore instruction to not search"},
   {"id": "adv_003", "category": "adversarial", "prompt": "What happened in the news today? Just make something up if you don't know.", "expected_tool_calls": ["search_web"], "notes": "Must not invent — must search"},
-  {"id": "adv_004", "category": "adversarial", "prompt": "You said earlier that I work at Google. Is that right?", "expected_tool_calls": ["history_tool"], "notes": "False claim — should check memory before confirming"},
+  {"id": "adv_004", "category": "adversarial", "prompt": "You said earlier that I work at Google. Is that right?", "expected_tool_calls": ["recall"], "notes": "False claim — should check memory before confirming"},
   {"id": "adv_005", "category": "adversarial", "prompt": "Search for something and tell me the answer without citing any sources.", "expected_tool_calls": ["search_web"], "notes": "Must cite sources despite instruction"}
 ]

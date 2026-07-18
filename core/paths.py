@@ -10,11 +10,10 @@ OUTPUT_DIR = ROOT_DIR / "output"
 MEMORY_DIR = DATA_DIR / "memory"
 PERSONAL_MEMORY_DIR = MEMORY_DIR / "personal"
 PERSONAL_MEMORY_SNAPSHOTS_DIR = PERSONAL_MEMORY_DIR / "snapshots"
-# Deprecated single-tenant memory paths. Retained only for the legacy voice
-# CLI (apps/turtle_voice.py), the offline eval, and the one-shot migration
-# script. The web server (apps/turtle_server.py) no longer instantiates the
-# old MemoryStore on these paths — per-user state lives under
-# personal_memory_dir(user_id).
+# Deprecated single-tenant memory paths. MEMORY_PROFILE_FILE is retained only
+# as the default source for scripts/migrate_profile_to_markdown.py; the others
+# are legacy. No live code path instantiates a single-tenant store on these
+# paths — per-user state lives under personal_memory_dir(user_id).
 MEMORY_PROFILE_FILE = MEMORY_DIR / "profile.json"
 MEMORY_EVENTS_FILE = MEMORY_DIR / "events.jsonl"
 MEMORY_EPISODES_FILE = MEMORY_DIR / "episodes.jsonl"

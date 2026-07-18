@@ -81,8 +81,8 @@ async def run_single_prompt(
                         tool_calls_observed.append("search_url")
                     elif "email" in status.lower():
                         tool_calls_observed.append("send_email_assistant")
-                    elif "history" in status.lower():
-                        tool_calls_observed.append("history_tool")
+                    elif "history" in status.lower() or "recall" in status.lower():
+                        tool_calls_observed.append("recall")
                 elif msg_type == "error":
                     error = msg.get("message", "unknown error")
                     break

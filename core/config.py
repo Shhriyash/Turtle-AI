@@ -146,11 +146,6 @@ class TurtleSettings(BaseSettings):
     personal_memory_enabled: bool = Field(
         default=True, alias="TURTLE_PERSONAL_MEMORY_ENABLED"
     )
-    # Phase 6: dream pass disabled by default in prod until observed on
-    # 2-3 real users' journals. Re-enable explicitly via env when ready.
-    personal_memory_dream_pass_enabled: bool = Field(
-        default=False, alias="TURTLE_PERSONAL_MEMORY_DREAM_PASS_ENABLED"
-    )
     personal_memory_stage_b_enabled: bool = Field(
         default=True, alias="TURTLE_PERSONAL_MEMORY_STAGE_B_ENABLED"
     )

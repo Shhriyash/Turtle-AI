@@ -1,97 +1,18 @@
 """
 test/session_memory_continuity_test.py
 --------------------------------------
-Covers two in-session-memory fixes:
+Covers the in-session-memory continuity fix:
 
-1. Parallel multi_step synthesis previously dropped message_history and the
-   caller stored the synthesis-only result as the canonical conversation,
-   wiping prior turns. _RepairedHistoryResult must re-extend the conversation.
-
-2. resume_if_active must rejoin a recently-disconnected (pending_finalization)
-   session so a dropped/refreshed WebSocket keeps its history, while leaving
-   stale sessions to be finalized normally.
+resume_if_active must rejoin a recently-disconnected (pending_finalization)
+session so a dropped/refreshed WebSocket keeps its history, while leaving
+stale sessions to be finalized normally.
 """
 import asyncio
 import unittest
 from datetime import UTC, datetime, timedelta
 
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
-
-from core.graph import _RepairedHistoryResult
 from core.session_store import SessionStore
 from core.storage import Session
-
-
-class _FakeSynthResult:
-    """Minimal stand-in for a pydantic-ai run result (synthesis call)."""
-
-    def __init__(self, output: str, messages: list) -> None:
-        self.output = output
-        self._messages = messages
-        self.usage = "sentinel-usage"
-
-    def all_messages(self) -> list:
-        return self._messages
-
-
-class RepairedHistoryResultTests(unittest.TestCase):
-    def _prior(self) -> list:
-        return [
-            ModelRequest(parts=[UserPromptPart(content="my name is Shriyash")]),
-            ModelResponse(parts=[TextPart(content="Nice to meet you, Shriyash.")]),
-        ]
-
-    def test_all_messages_extends_conversation(self) -> None:
-        prior = self._prior()
-        # The synthesis run's own history: an internal synthesis prompt + reply.
-        synth_messages = [
-            ModelRequest(parts=[UserPromptPart(content="SYNTHESIS PROMPT with tool blobs")]),
-            ModelResponse(parts=[TextPart(content="Here is your answer.")]),
-        ]
-        inner = _FakeSynthResult("Here is your answer.", synth_messages)
-
-        wrapped = _RepairedHistoryResult(inner, prior, user_prompt="what's the weather and news?")
-        out = wrapped.all_messages()
-
-        # Prior conversation is preserved.
-        self.assertEqual(out[0], prior[0])
-        self.assertEqual(out[1], prior[1])
-        # The real user request is recorded — NOT the internal synthesis prompt.
-        user_turn = out[2]
-        self.assertIsInstance(user_turn, ModelRequest)
-        self.assertEqual(user_turn.parts[0].content, "what's the weather and news?")
-        self.assertNotIn(
-            "SYNTHESIS PROMPT",
-            " ".join(str(p) for m in out for p in m.parts),
-        )
-        # Final assistant reply is present and last.
-        self.assertIsInstance(out[-1], ModelResponse)
-        self.assertEqual(out[-1].parts[0].content, "Here is your answer.")
-        self.assertEqual(len(out), 4)
-
-    def test_keeps_only_final_response_drops_tool_turns(self) -> None:
-        # Synthesis that called a tool: response(tool call) -> request(return) -> response(text)
-        synth_messages = [
-            ModelRequest(parts=[UserPromptPart(content="SYNTH PROMPT")]),
-            ModelResponse(parts=[TextPart(content="(intermediate tool-call turn)")]),
-            ModelRequest(parts=[UserPromptPart(content="(tool return)")]),
-            ModelResponse(parts=[TextPart(content="final answer")]),
-        ]
-        inner = _FakeSynthResult("final answer", synth_messages)
-        wrapped = _RepairedHistoryResult(inner, [], user_prompt="do the thing")
-        out = wrapped.all_messages()
-
-        # Only [real user turn, final response] — no orphaned tool turns.
-        self.assertEqual(len(out), 2)
-        self.assertEqual(out[0].parts[0].content, "do the thing")
-        self.assertEqual(out[1].parts[0].content, "final answer")
-
-    def test_output_and_attr_proxy(self) -> None:
-        inner = _FakeSynthResult("answer", [ModelResponse(parts=[TextPart(content="answer")])])
-        wrapped = _RepairedHistoryResult(inner, [], user_prompt="q")
-        self.assertEqual(wrapped.output, "answer")
-        # Unknown attributes proxy to the wrapped result (e.g. usage).
-        self.assertEqual(wrapped.usage, "sentinel-usage")
 
 
 class _FakeBackend:

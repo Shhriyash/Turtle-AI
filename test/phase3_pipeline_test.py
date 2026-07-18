@@ -3,10 +3,10 @@
 Every entrypoint (web text, web voice, and every channel adapter) now funnels
 through ONE canonical turn pipeline, ``apps.turtle_server._execute_turn``. This
 module drives that pipeline directly, fully offline (no LLM, no network, no live
-keys), with a fake websocket that records frames, a stubbed graph, a stubbed
-router, and a minimal ``SharedState`` built from fakes.
+keys), with a fake websocket that records frames, a stubbed model call
+(``run_agent_with_fallbacks``), and a minimal ``SharedState`` built from fakes.
 
-It pins the five properties the unification has to preserve/grant:
+It pins the properties the unification has to preserve/grant:
   (a) the per-turn trace span "turtle.turn" is emitted for web, web_voice AND a
       channel dispatch (each carrying its ``channel`` attribute);
   (b) the ``ws=None`` path (how a channel adapter drives the pipeline) completes
@@ -14,8 +14,12 @@ It pins the five properties the unification has to preserve/grant:
   (c) the confirmation sidecar frame is emitted when the gate has a pending
       prompt (voice thereby gains the sidecar the old audio handler lacked);
   (d) the turn's history is persisted through the session store;
-  (e) a graph failure is reported through ``_classify_handler_error`` — a
+  (e) a model-call failure is reported through ``_classify_handler_error`` — a
       structured error frame with a code, never the raw exception string.
+
+The turn pipeline is now a single ``run_agent_with_fallbacks`` call — no router,
+no graph layer, no chat-intercept of a bare "yes" (a confirming turn reaches the
+model like any other and is auto-promoted in the memory funnel instead).
 
 The side-effect funnels (``_apply_explicit_facts_from_turn`` /
 ``_queue_confirmation_candidates_from_turn``) are owned by a concurrent
@@ -61,12 +65,20 @@ class FakeWS:
 
 
 class FakeSessionStore:
-    """Just the surface _execute_turn touches: session_id + history + replace."""
+    """Just the surface _execute_turn touches: session_id + history + replace +
+    the pending-email peek (used by the pending-email task_type bypass)."""
 
-    def __init__(self, session_id: str = "s_test") -> None:
+    def __init__(self, session_id: str = "s_test", pending_email: dict | None = None) -> None:
         self.session_id = session_id
         self.message_history: list = []
         self.replace_calls: list[list] = []
+        self._pending_email = pending_email or {
+            "recipients": [], "cc_recipients": [], "bcc_recipients": [],
+            "subject": "", "content": "",
+        }
+
+    def get_pending_email(self) -> dict:
+        return self._pending_email
 
     async def replace_messages(self, messages: list) -> None:
         self.message_history = list(messages)
@@ -90,9 +102,6 @@ class StubGate:
     def next_prompt(self):
         return self._prompt
 
-    def preview_pending(self, ids):  # pragma: no cover - not exercised
-        return None
-
     def record_response(self, event_id, accepted):  # pragma: no cover
         return True
 
@@ -109,23 +118,6 @@ class FakeResponse:
         return self._msgs
 
 
-class FakeGraph:
-    """Stubbed TurtleGraph: returns a canned result, or raises."""
-
-    def __init__(self, output: str = "stub reply", raises: Exception | None = None) -> None:
-        self.output = output
-        self.raises = raises
-
-    async def run(self, primary_agent, prompt, **kwargs):
-        if self.raises is not None:
-            raise self.raises
-        msgs = [
-            ModelRequest(parts=[UserPromptPart(content=prompt)]),
-            ModelResponse(parts=[TextPart(content=self.output)]),
-        ]
-        return FakeResponse(self.output, msgs)
-
-
 class SpanRecorder:
     """Stand-in for trace_sink — records every span name + attributes."""
 
@@ -140,6 +132,9 @@ class SpanRecorder:
     def channels_for(self, name: str) -> list[str]:
         return [kw.get("channel") for n, kw in self.spans if n == name]
 
+    def intents_for(self, name: str) -> list[str]:
+        return [kw.get("intent") for n, kw in self.spans if n == name]
+
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -150,7 +145,7 @@ def env(monkeypatch):
     """Neutralise every offline-hostile side effect and record the span sink."""
     recorder = SpanRecorder()
     monkeypatch.setattr(ts, "trace_sink", recorder)
-    # Never touch Logfire in the error path.
+    # Never touch Logfire in the model or error path.
     monkeypatch.setattr(ts, "_logfire_loaded", False)
     # Owned by a concurrent workstream / can spawn bg tasks — no-op here.
     monkeypatch.setattr(ts, "_apply_explicit_facts_from_turn", lambda *a, **k: None)
@@ -162,18 +157,13 @@ def env(monkeypatch):
         return True
     monkeypatch.setattr(ts, "emit_event_once", _emit_once)
 
-    async def _fake_route_turn(text, model_name: str = ""):
-        return SimpleNamespace(intent="general")
-    monkeypatch.setattr("core.router.route_turn", _fake_route_turn)
-
     return SimpleNamespace(recorder=recorder, emits=emits)
 
 
-def _make_state(gate=None) -> ts.SharedState:
+def _make_state(gate=None, session_store=None) -> ts.SharedState:
     return ts.SharedState(
         http_client=None,
-        session_store=FakeSessionStore(),
-        memory_store=None,
+        session_store=session_store or FakeSessionStore(),
         personal_memory_store=None,
         personal_memory_prompt=None,
         journal_store=None,
@@ -186,8 +176,17 @@ def _make_state(gate=None) -> ts.SharedState:
     )
 
 
-def _use_graph(monkeypatch, graph: FakeGraph) -> None:
-    monkeypatch.setattr(ts, "_select_graph", lambda intent: graph)
+def _use_model(monkeypatch, output: str = "stub reply", raises: Exception | None = None) -> None:
+    """Stub the ONE model call the pipeline now makes: run_agent_with_fallbacks."""
+    async def _fake_run(primary_agent, fallback_agents, prompt, **kwargs):
+        if raises is not None:
+            raise raises
+        msgs = [
+            ModelRequest(parts=[UserPromptPart(content=prompt)]),
+            ModelResponse(parts=[TextPart(content=output)]),
+        ]
+        return FakeResponse(output, msgs)
+    monkeypatch.setattr(ts, "run_agent_with_fallbacks", _fake_run)
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +194,7 @@ def _use_graph(monkeypatch, graph: FakeGraph) -> None:
 # ---------------------------------------------------------------------------
 
 def test_web_turn_emits_span_and_persists(env, monkeypatch):
-    _use_graph(monkeypatch, FakeGraph(output="hi there"))
+    _use_model(monkeypatch, output="hi there")
     state = _make_state()
     ws = FakeWS()
 
@@ -216,7 +215,7 @@ def test_web_turn_emits_span_and_persists(env, monkeypatch):
 
 
 def test_voice_turn_emits_span(env, monkeypatch):
-    _use_graph(monkeypatch, FakeGraph(output="spoken reply"))
+    _use_model(monkeypatch, output="spoken reply")
     state = _make_state()
     ws = FakeWS()
 
@@ -229,7 +228,7 @@ def test_voice_turn_emits_span(env, monkeypatch):
 
 def test_channel_dispatch_span_and_ws_none(env, monkeypatch):
     """(a) channel span + (b) ws=None path completes and still returns a reply."""
-    _use_graph(monkeypatch, FakeGraph(output="channel reply"))
+    _use_model(monkeypatch, output="channel reply")
     state = _make_state()
 
     outcome = asyncio.run(
@@ -248,7 +247,7 @@ def test_channel_dispatch_span_and_ws_none(env, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_confirmation_sidecar_emitted_when_pending(env, monkeypatch):
-    _use_graph(monkeypatch, FakeGraph(output="the answer"))
+    _use_model(monkeypatch, output="the answer")
     prompt = SimpleNamespace(
         all_event_ids=["evt_1"],
         topic="preferences",
@@ -258,8 +257,8 @@ def test_confirmation_sidecar_emitted_when_pending(env, monkeypatch):
     state = _make_state(gate=StubGate(prompt=prompt))
     ws = FakeWS()
 
-    # A non-yes/no turn: the gate does not intercept, so the pending question is
-    # surfaced as a sidecar and the turn proceeds normally.
+    # A non-yes/no turn: the pending question is surfaced as a sidecar and the
+    # turn proceeds normally.
     asyncio.run(ts._execute_turn(ws, state, "tell me a joke", None, channel="web"))
 
     sidecars = ws.of_type("confirmation_prompt")
@@ -270,10 +269,14 @@ def test_confirmation_sidecar_emitted_when_pending(env, monkeypatch):
     assert ws.of_type("done")
 
 
-def test_confirmation_answer_intercepts_before_model(env, monkeypatch):
-    """A bare yes/no is intercepted; the model is never reached, reply relayed."""
-    # If the graph is reached it would raise — proving the intercept short-circuits.
-    _use_graph(monkeypatch, FakeGraph(raises=RuntimeError("model must not run")))
+def test_yes_turn_reaches_model_not_intercepted(env, monkeypatch):
+    """A bare "yes" is NOT intercepted: it reaches the model like any other turn.
+
+    (The chat-intercept half of the gate was deleted — confirmations happen via
+    the web UI's /api/memory/confirm panel, and a confirming chat turn is
+    auto-promoted in the memory funnel, not short-circuited here.)
+    """
+    _use_model(monkeypatch, output="reached-the-model")
     prompt = SimpleNamespace(
         all_event_ids=["evt_2"],
         topic="preferences",
@@ -285,11 +288,12 @@ def test_confirmation_answer_intercepts_before_model(env, monkeypatch):
 
     outcome = asyncio.run(ts._execute_turn(ws, state, "yes", None, channel="web"))
 
+    # The model WAS reached and its reply is the turn output — no interception.
     done = ws.of_type("done")
-    assert done, "confirmation intercept did not emit a done frame"
-    # No model reply to speak, but the acknowledgement is relayed to channels.
-    assert outcome.output_text is None
-    assert outcome.reply_text == done[0]["content"]
+    assert done and done[0]["content"] == "reached-the-model"
+    assert outcome.output_text == "reached-the-model"
+    # The pending question is still surfaced as a sidecar for the UI panel.
+    assert ws.of_type("confirmation_prompt")
     assert not ws.of_type("error")
 
 
@@ -297,8 +301,8 @@ def test_confirmation_answer_intercepts_before_model(env, monkeypatch):
 # (e) classified error handling
 # ---------------------------------------------------------------------------
 
-def test_graph_failure_is_classified_not_raw(env, monkeypatch):
-    _use_graph(monkeypatch, FakeGraph(raises=RuntimeError("raw internal boom")))
+def test_model_failure_is_classified_not_raw(env, monkeypatch):
+    _use_model(monkeypatch, raises=RuntimeError("raw internal boom"))
     state = _make_state()
     ws = FakeWS()
 
@@ -317,7 +321,7 @@ def test_graph_failure_is_classified_not_raw(env, monkeypatch):
 
 def test_channel_error_completes_with_ws_none(env, monkeypatch):
     """(b)+(e): a failing channel turn (ws=None) still returns a friendly reply."""
-    _use_graph(monkeypatch, FakeGraph(raises=RuntimeError("kaboom")))
+    _use_model(monkeypatch, raises=RuntimeError("kaboom"))
     state = _make_state()
 
     outcome = asyncio.run(

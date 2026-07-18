@@ -86,8 +86,6 @@ from core.email_flow import (
     validate_send_email_args,
 )
 from core.output_clean import clean_text_for_model, clean_text_for_tts
-from core.graph import select_graph as _select_graph
-from core.memory_store import MemoryStore
 from core.confirmation_gate import ConfirmationGate
 from core.guardrails import (
     StorageCapExceededError,
@@ -95,7 +93,6 @@ from core.guardrails import (
     ws_rate_limiter,
 )
 from core.telemetry import emit as emit_event, emit_once as emit_event_once
-from core.dream_pass import DreamPass
 from core.memory_journal import JournalStore, make_event
 from core.memory_schema import decide_write_policy, statement_for
 from core.memory_extractor import extract_memory_event_specs
@@ -124,7 +121,7 @@ from core.stt_fastrtc import FastRTCSTT
 from core.web_search import format_search_results, search_duckduckgo
 from rag.system.complete_rag import TurtleRAGSystem
 from tools.url_tools import fetch_url_content_async
-from tools.contracts import ToolResult, WebSearchArgs, UrlFetchArgs, EmailArgs, HistoryArgs, RecallArgs, CalendarCreateArgs, CalendarListArgs
+from tools.contracts import ToolResult, WebSearchArgs, UrlFetchArgs, EmailArgs, RecallArgs, CalendarCreateArgs, CalendarListArgs
 
 try:
     import logfire
@@ -173,9 +170,6 @@ def _load_config() -> dict[str, Any]:
         "STT_MODEL": "whisper-large-v3-turbo",
         "MAIN_AGENT_MODEL": "groq:openai/gpt-oss-120b",
         "EMAIL_AGENT_MODEL": "groq:llama-3.3-70b-versatile",
-        "DREAM_PASS_AGENT_MODEL": "",
-        "PERSONAL_MEMORY_DREAM_PASS_ENABLED": settings.personal_memory_dream_pass_enabled,
-        "ROUTER_AGENT_MODEL": "groq:llama-3.1-8b-instant",
         "SERVER_HOST": SERVER_HOST,
         "SERVER_PORT": SERVER_PORT,
     }
@@ -321,16 +315,6 @@ MEMORY_FLUSH_TURNS = int(config.get("TURTLE_MEMORY_FLUSH_TURNS", 8))
 MEMORY_FLUSH_TOKENS = int(config.get("TURTLE_MEMORY_FLUSH_TOKENS", 6000))
 MEMORY_PROFILE_MAX_LINES = int(config.get("TURTLE_MEMORY_PROFILE_MAX_LINES", 6))
 PERSONAL_MEMORY_ENABLED = settings.personal_memory_enabled
-
-
-def _dream_pass_enabled() -> bool:
-    """Read the dream-pass flag dynamically so the dev panel can hot-toggle it."""
-    raw = config.get("PERSONAL_MEMORY_DREAM_PASS_ENABLED")
-    if raw is None:
-        return bool(settings.personal_memory_dream_pass_enabled)
-    if isinstance(raw, bool):
-        return raw
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 PERSONAL_MEMORY_MAX_BYTES = settings.personal_memory_max_bytes
 PERSONAL_MEMORY_MAX_TOPIC_FILES = settings.personal_memory_max_topic_files
 TOOL_OUTPUT_MAX_CHARS = settings.tool_output_max_chars
@@ -346,7 +330,6 @@ groq_client = Groq(api_key=_groq_key)
 class SharedState:
     http_client: httpx.AsyncClient
     session_store: SessionStore
-    memory_store: MemoryStore | None
     personal_memory_store: PersonalMemoryStore
     personal_memory_prompt: PersonalMemoryPromptBuilder
     journal_store: JournalStore
@@ -359,10 +342,6 @@ class SharedState:
     search_cache: dict[str, str] = field(default_factory=dict)
     turn_counter: int = 0
     user_id: str = ""
-    # 3b: the routed intent for the current turn. Read by _scope_tools_by_intent
-    # to expose only the tools relevant to this turn (a chitchat turn ships no
-    # tool contracts at all). Set per-turn by the handlers before graph.run.
-    intent: str = ""
     # Phase 1: the memory block for the current turn. Delivered to the model
     # via per-turn instructions (never inside the persisted user prompt).
     memory_context: str = ""
@@ -661,9 +640,9 @@ def _compose_prompt_with_memory(user_text: str, memory_context: str | list[str])
 async def _resolve_memory_context(state: SharedState, *, task_type: str, user_text: str) -> str:
     """D4: Use RetrievalBroker (4-tier, 400-token budget) as the primary memory source.
 
-    Falls back to PersonalMemoryPromptBuilder, then to MemoryStore.get_context_lines.
-    The bypass path (_compose_prompt_with_memory calling build_memory_block directly)
-    is replaced by this function.
+    Falls back to PersonalMemoryPromptBuilder. The bypass path
+    (_compose_prompt_with_memory calling build_memory_block directly) is
+    replaced by this function.
     """
     # Tier 1: RetrievalBroker (4-tier budget-aware retrieval)
     if PERSONAL_MEMORY_ENABLED and state.retrieval_broker is not None:
@@ -689,11 +668,7 @@ async def _resolve_memory_context(state: SharedState, *, task_type: str, user_te
         except Exception:
             pass
 
-    # Tier 3: Raw MemoryStore lines (legacy; only populated for non-web entrypoints)
-    if state.memory_store is None:
-        return ""
-    fallback_lines = state.memory_store.get_context_lines(task_type=task_type, query=user_text)
-    return "\n".join(fallback_lines).strip()
+    return ""
 
 
 def _new_turn_id(state: SharedState) -> str:
@@ -712,100 +687,11 @@ def _normalize_url_for_cache(url: str) -> str:
         return raw
 
 
-def _parse_confirmation_answer(user_text: str) -> bool | None:
-    text = " ".join((user_text or "").strip().lower().split())
-    text = text.rstrip("!.?,")
-    if not text:
-        return None
-
-    yes_prefixes = (
-        "yes",
-        "y",
-        "yeah",
-        "yep",
-        "sure",
-        "ok",
-        "okay",
-        "please do",
-        "go ahead",
-        "affirmative",
-    )
-    no_prefixes = (
-        "no",
-        "n",
-        "nope",
-        "nah",
-        "not now",
-        "don't",
-        "do not",
-        "skip",
-        "negative",
-    )
-
-    if text in yes_prefixes:
-        return True
-    if text in no_prefixes:
-        return False
-
-    words = text.split()
-    single_word_yes = {token for token in yes_prefixes if " " not in token}
-    single_word_no = {token for token in no_prefixes if " " not in token}
-    # Bare-only confirmations: instruction-bearing turns must fall through to the agent.
-    if len(words) <= 2 and words:
-        if words[0] in single_word_yes:
-            return True
-        if words[0] in single_word_no:
-            return False
-    return None
-
-
-def _wants_preview(user_text: str) -> bool:
-    text = " ".join(str(user_text or "").strip().lower().split())
-    text = text.rstrip("!.?,")
-    if not text:
-        return False
-    triggers = (
-        "show me", "show it", "show the", "show what",
-        "what would you save", "what do you want to save",
-        "what is it", "what's it", "what pattern",
-        "preview", "details", "more info", "more context",
-        "which memory", "the exact",
-    )
-    # Substring matching hijacked ordinary requests containing words like "details".
-    return text in triggers
-
-
-def _maybe_handle_confirmation_turn(state: SharedState, user_text: str) -> str | None:
-    prompt = state.confirmation_gate.next_prompt()
-    if prompt is None:
-        return None
-
-    if _wants_preview(user_text):
-        preview = state.confirmation_gate.preview_pending(list(prompt.all_event_ids))
-        if preview:
-            return preview
-
-    accepted = _parse_confirmation_answer(user_text)
-    if accepted is None:
-        # C2+C3: don't hard-intercept; the turn proceeds normally and the
-        # caller is expected to surface the prompt as a sidecar message so
-        # the user can answer it next turn while the current question is
-        # answered now.
-        return None
-
-    for event_id in prompt.all_event_ids:
-        state.confirmation_gate.record_response(event_id, accepted=accepted)
-    if accepted:
-        if state.user_id:
-            emit_event_once(state.user_id, "memory_first_confirmed", topic=prompt.topic)
-        if prompt.topic == "workflow":
-            _register_user_routines_safe(state)
-        if len(prompt.all_event_ids) > 1:
-            return "Got it. I will remember those."
-        return "Got it. I will remember that."
-    if len(prompt.all_event_ids) > 1:
-        return "Understood. I will not store those."
-    return "Understood. I will not store that preference."
+# NOTE: chat-text confirmation parsing is gone entirely (Phase 4). A "yes" in
+# chat is just a word the model answers; memory confirmations happen ONLY in
+# the web UI panel via /api/memory/confirm. The old text-parsing path could
+# silently promote a stale pending candidate when the user said "yes" to a
+# completely unrelated question (Codex P4 review A#2/B#2).
 
 
 def _queue_confirmation_candidates_from_turn(
@@ -972,50 +858,6 @@ def _journal_and_queue_candidates(
     if queued:
         print(f"LOG: Queued {queued} confirmation candidate(s) for {session_id}")
     return queued
-
-
-async def _run_dream_pass_if_needed(
-    state: SharedState,
-    *,
-    session_id: str,
-) -> None:
-    """Run Stage C dream pass for pending memory candidates when trigger conditions are met."""
-    if not PERSONAL_MEMORY_ENABLED or not _dream_pass_enabled():
-        return
-    if not session_id:
-        return
-
-    dream_pass = DreamPass(
-        journal=state.journal_store,
-        store=state.personal_memory_store,
-        confirmation_gate=state.confirmation_gate,
-        state_path=personal_memory_dir(state.user_id) / "dream_pass_state.json",
-        snapshots_dir=personal_memory_dir(state.user_id) / "snapshots",
-    )
-
-    if not dream_pass.should_run():
-        print(f"LOG: Dream pass skipped for {session_id} (trigger not met)")
-        return
-
-    dream_model = _build_model_from_str(
-        str(config.get("DREAM_PASS_AGENT_MODEL", "") or ""),
-        agents_mgr.model_settings,
-    )
-    if dream_model is None:
-        dream_model = get_groq_model(
-            model_name="openai/gpt-oss-120b",
-            settings=agents_mgr.model_settings,
-        )
-
-    if dream_model is None:
-        print(f"LOG: Dream pass skipped for {session_id} (no dream model available)")
-        return
-
-    result = await dream_pass.run(session_id=session_id, model=dream_model)
-    if result.skipped_reason:
-        print(f"LOG: Dream pass skipped for {session_id}: {result.skipped_reason}")
-    if result.rolled_back:
-        print(f"LOG: Dream pass rolled back for {session_id}: {result.sanity_failures}")
 
 
 # ---------------------------------------------------------------------------
@@ -1344,46 +1186,6 @@ async def _sync_personal_memory_from_archive(
         )
     except Exception as e:
         print(f"LOG: Stage B session extractor failed for {session_id}: {e}")
-    try:
-        await _run_dream_pass_if_needed(state, session_id=session_id)
-    except Exception as e:
-        print(f"LOG: Dream pass failed for {session_id}: {e}")
-
-
-def _auto_promote_pending_workflow_on_confirm(
-    state: "SharedState",
-    *,
-    user_text: str,
-) -> int:
-    """B3: promote workflow.* pending candidates when user_text reads as confirm.
-
-    If the gate's next prompt belongs to topic='workflow' and the current turn's
-    user_text parses as a yes, accept the whole batch so the gate writes the
-    superseding `source=explicit, applied=True` event and the replayer picks
-    it up on the next memory load. Returns count of events promoted.
-
-    Note: when `_maybe_handle_confirmation_turn` already intercepts a pure
-    yes/no, this function never runs (intercepted before the agent reply).
-    This path matters when a turn carries BOTH new content AND a confirmation,
-    and the gate handler didn't intercept.
-    """
-    accepted = _parse_confirmation_answer(user_text)
-    if accepted is not True:
-        return 0
-
-    prompt = state.confirmation_gate.next_prompt()
-    if prompt is None or prompt.topic != "workflow":
-        return 0
-
-    promoted = 0
-    for event_id in prompt.all_event_ids:
-        result = state.confirmation_gate.record_response(event_id, accepted=True)
-        if result is not None:
-            promoted += 1
-    if promoted:
-        print(f"LOG: Auto-promoted {promoted} pending workflow event(s) on confirmation")
-        _register_user_routines_safe(state)
-    return promoted
 
 
 def _register_user_routines_safe(state: "SharedState") -> None:
@@ -1574,19 +1376,12 @@ def _apply_explicit_facts_from_turn(
     Called per-turn so disclosures like 'my email is X' are reflected in the
     next turn's memory context without waiting for session-end replay.
 
-    Phase 2 / B3: also auto-promote any pending workflow.* candidate when the
-    current user text reads as confirmation. This catches the multi-turn flow
-    where the candidate was queued by B1+B2's async extractor on an earlier
-    turn and the user's current message is a yes/save-it without going through
-    the dedicated confirmation_turn handler (e.g. when the message also
-    carries new content).
+    Phase 4: the old workflow auto-promote-on-"yes" step is gone — chat text
+    never confirms pending memory anymore; /api/memory/confirm is the one
+    confirmation surface.
     """
     if not PERSONAL_MEMORY_ENABLED:
         return
-    try:
-        _auto_promote_pending_workflow_on_confirm(state, user_text=user_text)
-    except Exception as e:
-        print(f"LOG: Workflow auto-promote failed for {session_id}: {e}")
     try:
         profile = state.personal_memory_store.load_profile_snapshot()
         # Use a minimal single-message history to reuse candidate extraction + dedup
@@ -1643,7 +1438,6 @@ def _apply_explicit_facts_from_turn(
 def _runtime_agent_registry() -> list[dict[str, Any]]:
     main_model = str(config.get("MAIN_AGENT_MODEL") or f"groq:{config.get('GROQ_PRIMARY_MODEL', 'llama-3.3-70b-versatile')}")
     email_model = str(config.get("EMAIL_AGENT_MODEL") or main_model)
-    dream_model = str(config.get("DREAM_PASS_AGENT_MODEL") or "auto (groq:openai/gpt-oss-120b)")
     stage_b_model = f"groq:{settings.personal_memory_stage_b_model}"
 
     return [
@@ -1662,29 +1456,6 @@ def _runtime_agent_registry() -> list[dict[str, Any]]:
             "editable": True,
             "config_key": "EMAIL_AGENT_MODEL",
             "status": "active",
-        },
-        {
-            "id": "dream_pass_reviewer",
-            "label": "Dream Pass Reviewer",
-            "model": dream_model,
-            "editable": True,
-            "config_key": "DREAM_PASS_AGENT_MODEL",
-            "status": "active" if _dream_pass_enabled() else "disabled",
-        },
-        {
-            "id": "router",
-            "label": "Intent Router",
-            "model": str(config.get("ROUTER_AGENT_MODEL") or "groq:llama-3.1-8b-instant"),
-            "editable": True,
-            "config_key": "ROUTER_AGENT_MODEL",
-            "status": "active",
-        },
-        {
-            "id": "planner",
-            "label": "Multi-step Planner",
-            "model": "groq:llama-3.1-8b-instant",
-            "editable": False,
-            "status": "hardcoded",
         },
         {
             "id": "stage_b_extractor",
@@ -1715,14 +1486,8 @@ def _runtime_agent_registry() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# 3b: intent-scoped tools
+# remember tool args
 # ---------------------------------------------------------------------------
-# The router classifies every turn; we expose only the tools that intent can
-# use, instead of shipping all 7 tool contracts (~3k tokens) on every request.
-# A "hey turtle" chitchat turn then carries ZERO tool contracts — which is what
-# pushed gpt-oss over Groq's 8k TPM cap (see problems/2026-05-30-*). An intent
-# absent from this map (incl. multi_step, where the planner may dispatch
-# anything, and any unknown/router-failure value) gets the full toolset.
 from pydantic import BaseModel as _RememberBaseModel, Field as _RememberField
 
 
@@ -1742,35 +1507,6 @@ class RememberArgs(_RememberBaseModel):
         ...,
         description="The fact as stated by the user.",
     )
-
-
-# Memory tools are infrastructure, not an intent: recall/history_tool stay
-# visible on every route so misroutes can't strip memory access (the email
-# flow in particular needs stored contacts at exactly the moment it runs).
-_TOOL_NAMES_BY_INTENT: dict[str, set[str]] = {
-    "chitchat": {"recall", "history_tool"},
-    "web": {"search_web", "search_url", "recall", "history_tool"},
-    "url": {"search_url", "search_web", "recall", "history_tool"},
-    "email": {"send_email_assistant", "recall", "history_tool"},
-    "calendar": {"calendar_create", "calendar_list", "recall", "history_tool"},
-    "memory_recall": {"recall", "history_tool"},
-}
-
-
-async def _scope_tools_by_intent(ctx: RunContext[SharedState], tool_defs: list) -> list:
-    """pydantic-ai prepare_tools hook: filter the toolset to the routed intent.
-
-    Returns the unfiltered list for unknown/multi_step intents (safe default),
-    or only the intent's allowed tools (possibly empty, e.g. chitchat).
-    """
-    try:
-        intent = (ctx.deps.intent or "").strip() if ctx.deps is not None else ""
-    except Exception:
-        intent = ""
-    allowed = _TOOL_NAMES_BY_INTENT.get(intent)
-    if allowed is None:
-        return tool_defs
-    return [td for td in tool_defs if getattr(td, "name", None) in allowed]
 
 
 def _build_model_from_str(model_str: str, settings: Any) -> Any | None:
@@ -1904,9 +1640,10 @@ class AgentManager:
                 "Cannot build agent chain — no usable model for main/email agent."
             )
 
-        # Main assistant. prepare_tools (3b) scopes the toolset to the routed
-        # intent per turn — applied to every rung so the cascade keeps the same
-        # tool-scoping behaviour on fallback.
+        # Main assistant. Every tool is offered on every turn and every rung of
+        # the cascade — no per-intent tool scoping. The _register_tools loop
+        # (F5) registers the identical toolset on each fallback so a model swap
+        # never silently loses a capability.
         self.main_assistant = Agent(
             main_chain[0],
             deps_type=SharedState,
@@ -1914,13 +1651,11 @@ class AgentManager:
             output_retries=OUTPUT_RETRIES,
             instructions=MAIN_ASSISTANT_PROMPT,
             history_processors=[_trim_history_for_context, _sanitize_tool_pairs],
-            prepare_tools=_scope_tools_by_intent,
         )
         self.main_assistant_fallbacks = [
             Agent(m, deps_type=SharedState, output_type=str,
                   output_retries=OUTPUT_RETRIES, instructions=MAIN_ASSISTANT_PROMPT,
-                  history_processors=[_trim_history_for_context, _sanitize_tool_pairs],
-                  prepare_tools=_scope_tools_by_intent)
+                  history_processors=[_trim_history_for_context, _sanitize_tool_pairs])
             for m in main_chain[1:]
         ]
 
@@ -2218,27 +1953,6 @@ class AgentManager:
             return clean_text_for_model(send_result)
 
 
-        async def history_tool(ctx: RunContext[SharedState], args: HistoryArgs) -> str:
-            """Search conversation history for past discussions. See tool contract for full spec."""
-            query = args.query.strip()
-            if not query:
-                return ToolResult.invalid("query must not be empty").to_agent_string()
-            try:
-                broker = ctx.deps.retrieval_broker
-                if broker is None:
-                    return ToolResult.empty("Recall is not available.").to_agent_string()
-                recall_text = await broker.recall(
-                    query=query,
-                    scope="episodic",
-                    message_history=ctx.deps.session_store.message_history,
-                    trim_fn=_trim_history_for_context,
-                )
-                if not recall_text:
-                    return ToolResult.empty("No relevant information found in previous conversations.").to_agent_string()
-                return ToolResult.ok(recall_text).to_agent_string()
-            except Exception as e:
-                return ToolResult.upstream_error(f"History lookup failed: {e}").to_agent_string()
-
         async def recall(ctx: RunContext[SharedState], args: RecallArgs) -> str:
             """Recall personal, episodic, task, or working context. See tool contract for full spec."""
             query = args.query.strip()
@@ -2321,7 +2035,6 @@ class AgentManager:
             ("search_web", search_web),
             ("search_url", search_url),
             ("send_email_assistant", send_email_assistant),
-            ("history_tool", history_tool),
             ("recall", recall),
             ("calendar_create", calendar_create),
             ("calendar_list", calendar_list),
@@ -2496,8 +2209,8 @@ async def _build_channel_state(user_id: str, channel: str) -> SharedState:
     """
     session_store = SessionStore(user_id=user_id)
     restore_result = await session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
-    # Legacy single-tenant MemoryStore intentionally not constructed (as WS).
-    memory_store = None
+    # Personal memory lives under personal_memory_dir(user_id); there is no
+    # single-tenant store to construct.
     personal_memory_store = PersonalMemoryStore(user_id=user_id)
     from core.memory_sqlite import MemorySQLiteIndex
     # Same derived-read-model None-degrade as the WS path.
@@ -2548,7 +2261,6 @@ async def _build_channel_state(user_id: str, channel: str) -> SharedState:
     state = SharedState(
         http_client=None,
         session_store=session_store,
-        memory_store=memory_store,
         personal_memory_store=personal_memory_store,
         personal_memory_prompt=personal_memory_prompt,
         journal_store=journal_store,
@@ -2574,10 +2286,10 @@ async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
     canonical turn pipeline (_execute_turn) with a full per-(user, channel)
     SharedState.
 
-    Channels therefore get exactly what web gets: router-driven graph selection,
-    memory context, the trace span, journaling, the confirmation gate, explicit
-    facts, silent candidate queuing, and cross-turn continuity via the session
-    store. No websocket exists here, so ``_execute_turn`` runs with ``ws=None``
+    Channels therefore get exactly what web gets: the single agent call with
+    fallbacks, memory context, the trace span, journaling, the confirmation gate,
+    explicit facts, silent candidate queuing, and cross-turn continuity via the
+    session store. No websocket exists here, so ``_execute_turn`` runs with ``ws=None``
     and every frame no-ops; the terminal user-facing text comes back on
     ``reply_text``.
 
@@ -2877,6 +2589,17 @@ async def confirm_memory(request: Request):
     result = state.confirmation_gate.record_response(event_id, accepted=accepted)
     if result is None:
         return JSONResponse({"error": "event_id not found in pending queue"}, status_code=404)
+    # This panel is now the ONLY confirmation surface (chat-text confirmation
+    # is gone entirely), so the side effects the old chat handler owned live
+    # here: routine registration on a workflow accept, and the first-confirm
+    # telemetry event.
+    if accepted:
+        # getattr-defensive: endpoint tests drive this with partial state stubs.
+        confirm_user = getattr(state, "user_id", "")
+        if confirm_user:
+            emit_event_once(confirm_user, "memory_first_confirmed", topic=result.topic)
+        if result.topic == "workflow":
+            _register_user_routines_safe(state)
     return JSONResponse({"status": "ok", "applied": accepted})
 
 
@@ -2898,9 +2621,8 @@ async def websocket_endpoint(ws: WebSocket):
         # Tenant-scoped: resume/sweep must never see another user's sessions.
         session_store = SessionStore(user_id=user_id)
         restore_result = await session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
-        # Legacy single-tenant MemoryStore intentionally not constructed here —
-        # personal memory now lives under personal_memory_dir(user_id).
-        memory_store = None
+        # Personal memory lives under personal_memory_dir(user_id); there is no
+        # single-tenant store to construct.
         personal_memory_store = PersonalMemoryStore(user_id=user_id)
         from core.memory_sqlite import MemorySQLiteIndex
         # The index is a derived read model — if it can't open (locked file,
@@ -2956,7 +2678,6 @@ async def websocket_endpoint(ws: WebSocket):
         state = SharedState(
             http_client=client,
             session_store=session_store,
-            memory_store=memory_store,
             personal_memory_store=personal_memory_store,
             personal_memory_prompt=personal_memory_prompt,
             journal_store=journal_store,
@@ -2985,10 +2706,6 @@ async def websocket_endpoint(ws: WebSocket):
                     )
                 except Exception as _e:
                     print(f"LOG: Stage B error for pending session {pending_sid}: {_e}")
-                try:
-                    await _run_dream_pass_if_needed(state, session_id=pending_sid)
-                except Exception as _e:
-                    print(f"LOG: Dream pass error for pending session {pending_sid}: {_e}")
             try:
                 await session_store.mark_finalized(pending_sid)
             except Exception as _e:
@@ -3099,12 +2816,9 @@ async def websocket_endpoint(ws: WebSocket):
             print(f"LOG: WebSocket error: {e}")
             traceback.print_exc()
         finally:
-            # Session cleanup
-            if state.session_store.session_id and state.memory_store is not None:
-                state.memory_store.force_checkpoint(
-                    session_id=state.session_store.session_id,
-                    reason="session_end",
-                )
+            # Session cleanup. The legacy single-tenant MemoryStore checkpoint
+            # was dropped here — personal memory is journaled per-turn and needs
+            # no session-end flush.
             session_id = state.session_store.session_id
             # Capture messages before archive_active() clears them.
             final_messages = list(state.session_store.message_history)
@@ -3127,10 +2841,6 @@ async def websocket_endpoint(ws: WebSocket):
                     )
                 except Exception as _e:
                     print(f"LOG: Stage B error for session {session_id}: {_e}")
-                try:
-                    await _run_dream_pass_if_needed(state, session_id=session_id)
-                except Exception as _e:
-                    print(f"LOG: Dream pass error on session end for {session_id}: {_e}")
             if session_id:
                 try:
                     # Extraction just ran on final_messages; without this flip the
@@ -3242,10 +2952,10 @@ async def _execute_turn(
 
     web (text), web_voice (audio), and every channel adapter (WhatsApp, iMessage,
     Slack, Twilio Voice) all funnel through here so a single code path owns
-    analytics, the confirmation intercept + sidecar, routing, memory context,
-    the per-turn trace span, graph execution + fallbacks, output cleaning,
-    persistence, explicit-fact application, silent candidate queuing, the
-    reflector/dream pass, timing, and classified error handling.
+    analytics, the confirmation sidecar, the heuristic task-type label, memory
+    context, the per-turn trace span, the single agent call + fallbacks, output
+    cleaning, persistence, explicit-fact application, silent candidate queuing,
+    the reflector, timing, and classified error handling.
 
     All websocket sends go through ``_emit`` so a channel caller may pass
     ``ws=None``; ``send_status`` suppresses the "thinking" status frame for
@@ -3264,25 +2974,13 @@ async def _execute_turn(
     # uses it to keep a computed answer alive when only post-processing failed.
     final_output: str | None = None
     try:
-        # Confirmation intercept + sidecar are websocket-only: a channel caller
-        # (ws=None) has no way to render the prompt, so its users have never
-        # seen a question — intercepting their bare "yes" would consume an
-        # answer to something they were never asked (Codex review R2#4).
-        # Channel users review pending memories in the web UI instead.
+        # The confirmation sidecar is websocket-only: a channel caller (ws=None)
+        # has no way to render the prompt. If a memory-confirmation prompt is
+        # pending, surface it as a sidecar frame before the agent reply so the
+        # user can answer it via the web UI's confirm panel (/api/memory/confirm
+        # — the ONLY confirmation surface). Chat turns are never intercepted or
+        # parsed for confirmation: a bare "yes" is just a word the model answers.
         if ws is not None:
-            confirmation_reply = _maybe_handle_confirmation_turn(state, user_text)
-            if confirmation_reply is not None:
-                await _emit(ws, {"type": "done", "content": confirmation_reply})
-                timings["total_ms"] = round((time.time() - overall_start) * 1000)
-                await _emit(ws, {"type": "timing", **timings})
-                # No model reply to speak, but the confirmation acknowledgement is
-                # the turn's user-facing text — callers relay it via reply_text.
-                return TurnOutcome(message_history, None, confirmation_reply)
-
-            # C2+C3: if a memory-confirmation prompt is pending and the user is
-            # not answering it right now, surface the question as a sidecar
-            # message before the agent reply. Their next yes/no will be picked
-            # up by _maybe_handle_confirmation_turn on the following turn.
             pending_prompt = state.confirmation_gate.next_prompt()
             if pending_prompt is not None:
                 await _emit(ws, {
@@ -3293,33 +2991,25 @@ async def _execute_turn(
                     "message": pending_prompt.question,
                 })
 
+        # Heuristic task type steers memory retrieval + trace labels only. With
+        # per-intent tool scoping gone, every tool is offered on every turn.
         task_type = _detect_task_type(user_text)
-
-        # A1: Router stage — runs concurrently with memory resolution.
-        # RouterDecision drives graph selection in Tier 1 (A2); here it feeds logs + timings.
-        from core.router import route_turn as _route_turn
-        router_start = time.time()
-        router_task = asyncio.create_task(_route_turn(user_text, model_name=str(config.get("ROUTER_AGENT_MODEL") or "")))
+        # Pending-email bypass: a half-finished draft means an AMBIGUOUS turn is
+        # almost certainly continuing it, even when the words don't say "email"
+        # (e.g. "the subject is lunch"). Only override the heuristic's "general"
+        # verdict — a turn that clearly asks for something else ("search the
+        # web for X") keeps its own label so a stale draft can't relabel
+        # unrelated work (Codex P4 review A#4/B#6). Drafts also TTL out.
+        if task_type == "general":
+            _pending_email = state.session_store.get_pending_email() or {}
+            if _pending_email.get("recipients") or _pending_email.get("subject") or _pending_email.get("content"):
+                task_type = "email"
 
         state.memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=user_text)
         # Memory travels via per-turn instructions (_build_turn_instructions);
         # the persisted user turn stays the user's bare words.
         prompt_input = user_text
         turn_id = _new_turn_id(state)
-
-        # Await router (likely already done by now)
-        try:
-            router_decision = await router_task
-            timings["router_ms"] = round((time.time() - router_start) * 1000)
-            # Update task_type from router for richer context
-            task_type = router_decision.intent if router_decision.intent != "clarify" else task_type
-        except Exception as _re:
-            print(f"LOG: Router await failed: {_re}")
-            timings["router_ms"] = -1
-
-        # Consume RouterDecision intent — route into the appropriate graph
-        graph = _select_graph(task_type)
-        state.intent = task_type  # 3b: scope tools to this turn's intent
 
         llm_start = time.time()
         # Phase 1: one local span per turn — the record that makes "why did
@@ -3331,18 +3021,31 @@ async def _execute_turn(
             turn_id=turn_id,
             intent=task_type,
             memory_context_chars=len(state.memory_context or ""),
-            tools_scoped=",".join(sorted(_TOOL_NAMES_BY_INTENT.get(task_type, {"unscoped"}))),
             channel=channel,
         ):
-            response = await graph.run(
-                agents_mgr.main_assistant,
-                prompt_input,
-                fallback_agents=agents_mgr.main_assistant_fallbacks,
-                deps=state,
-                message_history=message_history,
-                usage=RunUsage(),
-                usage_limits=agents_mgr.usage_limits,
-            )
+            # Preserve the rich Logfire span the deleted graph layer used to
+            # emit, so a turn's model spans still nest under one logical unit.
+            if _logfire_loaded:
+                import logfire as _lf_turn
+                _turn_span_cm = _lf_turn.span("turtle.turn", intent=task_type, channel=channel)
+            else:
+                from contextlib import nullcontext
+                _turn_span_cm = nullcontext()
+            with _turn_span_cm:
+                # ONE agent call with fallbacks. The 60s timeout is the one the
+                # deleted graph layer used to own.
+                response = await asyncio.wait_for(
+                    run_agent_with_fallbacks(
+                        agents_mgr.main_assistant,
+                        agents_mgr.main_assistant_fallbacks,
+                        prompt_input,
+                        deps=state,
+                        message_history=message_history,
+                        usage=RunUsage(),
+                        usage_limits=agents_mgr.usage_limits,
+                    ),
+                    timeout=60.0,
+                )
         timings["llm_ms"] = round((time.time() - llm_start) * 1000)
 
         final_output = clean_text_for_model(response.output)
@@ -3354,11 +3057,10 @@ async def _execute_turn(
         message_history = _persist_history(message_history, response)
         await state.session_store.replace_messages(message_history)
         state.rag_system.add_conversation(user_text, final_output)
-        # NOTE: the legacy memory_store.record_turn block was dropped here.
-        # state.memory_store is None on every live entrypoint (the WS/channel
-        # setup never constructs the single-tenant MemoryStore — personal
-        # memory lives under personal_memory_dir(user_id) instead), so the
-        # block was dead on all paths.
+        # NOTE: the legacy single-tenant memory_store.record_turn block was
+        # dropped here. Personal memory now lives under
+        # personal_memory_dir(user_id) and is journaled per-turn via the
+        # post-step extraction pipeline, so the old block was dead on all paths.
         # Immediately apply explicit facts (email, name) so next turn sees them
         _apply_explicit_facts_from_turn(
             state,
@@ -3391,7 +3093,6 @@ async def _execute_turn(
                 state,
                 session_id=state.session_store.session_id or "",
                 message_history=message_history or [],
-                dream_pass_runner=_run_dream_pass_if_needed,
             )
 
         timings["total_ms"] = round((time.time() - overall_start) * 1000)
@@ -3499,8 +3200,8 @@ async def _handle_audio_message(
         message_history = outcome.new_history
         final_output = outcome.output_text
 
-        # A confirmation intercept or a pipeline error returns no speakable
-        # text (and has already emitted its own done/error frame): stop here.
+        # A pipeline error returns no speakable text (and has already emitted its
+        # own error frame): stop here.
         if not final_output:
             return message_history
 

@@ -1,8 +1,8 @@
-"""Periodic reflector — runs Stage B + dream pass mid-session.
+"""Periodic reflector — runs Stage B mid-session.
 
 Phase 2 of the memory architecture. Memory writes used to wait until session
 archive (taskkill orphans them). The reflector fires every N turns OR after an
-idle gap, re-using the existing Stage B and dream-pass pipelines.
+idle gap, re-using the existing Stage B pipeline.
 
 Episodic summarization and rolling-window summary are wired in Phases 4 and 6;
 this module exposes the hook so they slot in without changing call sites.
@@ -12,13 +12,11 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from core.config import settings
 from core.personal_memory_extract import run_stage_b_session_extractor
 from core.episodic_summarizer import summarize_rolling_window
-
-DreamPassRunner = Callable[..., Awaitable[None]]
 
 
 @dataclass
@@ -69,7 +67,6 @@ class PeriodicReflector:
         *,
         session_id: str,
         message_history: list[Any],
-        dream_pass_runner: DreamPassRunner | None = None,
     ) -> None:
         if not settings.reflect_enabled or not session_id:
             return
@@ -99,7 +96,6 @@ class PeriodicReflector:
                 state,
                 session_id=session_id,
                 message_history=list(message_history),
-                dream_pass_runner=dream_pass_runner,
             ),
             name=f"reflect_{session_id}",
         )
@@ -110,7 +106,6 @@ class PeriodicReflector:
         *,
         session_id: str,
         message_history: list[Any],
-        dream_pass_runner: DreamPassRunner | None,
     ) -> None:
         sess = self._get(session_id)
         sess.in_flight = True
@@ -129,11 +124,6 @@ class PeriodicReflector:
                 session_id=session_id,
                 message_history=message_history,
             )
-            if dream_pass_runner is not None:
-                try:
-                    await dream_pass_runner(state, session_id=session_id)
-                except Exception as e:
-                    print(f"LOG: Reflector dream pass failed for {session_id}: {e}")
 
             if turn_records and getattr(state, "rag_system", None) is not None:
                 try:

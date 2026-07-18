@@ -59,9 +59,15 @@ def test_leftover_staging_is_indexed_before_new_session(tmp_path):
     asyncio.run(run())
 
 
-def test_history_tool_routes_personal_facts_to_recall():
-    prompt_path = Path(__file__).resolve().parents[1] / "core" / "system_prompts" / "tools" / "history_tool.md"
+def test_recall_prompt_documents_episodic_and_personal_scopes():
+    # history_tool folded into recall: the recall prompt now carries both the
+    # personal-store routing AND the past-conversation (episodic) guidance that
+    # used to live in history_tool.md.
+    prompt_path = Path(__file__).resolve().parents[1] / "core" / "system_prompts" / "tools" / "recall.md"
     text = prompt_path.read_text(encoding="utf-8")
 
-    assert 'recall(scope="personal")' in text or 'scope="personal"' in text
-    assert "authoritative source for anything the user has told Turtle before" not in text
+    # personal scope is the authoritative store for stored facts.
+    assert 'scope="personal"' in text or "personal:" in text
+    # episodic scope serves questions about a previous conversation.
+    assert 'scope="episodic"' in text or "episodic:" in text
+    assert "previous conversation" in text.lower()

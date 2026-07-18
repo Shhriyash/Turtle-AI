@@ -1,9 +1,8 @@
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.models.test import TestModel
 
 import apps.turtle_server as ts
-from core.graph import _RepairedHistoryResult
 
 
 def test_persist_history_appends_new_messages_without_shrinking_prior():
@@ -38,30 +37,6 @@ def test_persist_history_preserves_full_conversation_when_history_processor_trim
 
     assert any("turn 0" in str(m) for m in history)
     assert _count_user_turns(history) == 5
-
-
-def test_repaired_history_result_exposes_only_real_new_messages():
-    class FakeInner:
-        output = "final answer"
-
-        def all_messages(self):
-            return [
-                ModelRequest(parts=[UserPromptPart(content="INTERNAL SYNTHESIS PROMPT")]),
-                ModelResponse(parts=[TextPart(content="final answer")]),
-            ]
-
-    prior = [
-        ModelRequest(parts=[UserPromptPart(content="old q")]),
-        ModelResponse(parts=[TextPart(content="old a")]),
-    ]
-
-    r = _RepairedHistoryResult(FakeInner(), prior, "real question")
-    nm = r.new_messages()
-
-    assert len(nm) == 2
-    assert "real question" in str(nm[0])
-    assert "INTERNAL SYNTHESIS PROMPT" not in str(nm)
-    assert r.all_messages() == prior + nm
 
 
 def _count_user_turns(history):

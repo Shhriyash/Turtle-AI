@@ -4,7 +4,6 @@ import uuid
 from pathlib import Path
 
 from core.memory_journal import JournalStore, make_event
-from core.memory_migration import migrate_existing_topics
 from core.memory_replayer import replay
 from core.personal_memory_store import PersonalMemoryStore
 
@@ -297,55 +296,6 @@ class MemoryJournalTests(unittest.TestCase):
         event.rejected = True
         replay([event], store=self.store)
         self.assertFalse((self.base / "preferences.md").exists())
-
-    def test_migration_round_trip_preserves_topic_files(self) -> None:
-        self.store.write_topic(
-            "identity",
-            ["- Name: Shriyash", "- Primary email: user@example.com", "- Timezone: UTC"],
-            {"title": "Identity"},
-        )
-        self.store.update_index_entry("identity", "Name, email, timezone, preferred address")
-
-        self.store.write_topic(
-            "preferences",
-            ["- Response style: concise", "- Humor level: low"],
-            {"title": "Preferences"},
-        )
-        self.store.update_index_entry("preferences", "Tone, response style, and delivery defaults")
-
-        before_identity = (self.base / "identity.md").read_text(encoding="utf-8")
-        before_prefs = (self.base / "preferences.md").read_text(encoding="utf-8")
-
-        before_identity_body = _strip_frontmatter(before_identity)
-        before_prefs_body = _strip_frontmatter(before_prefs)
-
-        result = migrate_existing_topics(store=self.store, journal=self.journal)
-        self.assertGreater(result.emitted_event_count, 0)
-        self.assertIn("identity", result.written_topics)
-        self.assertIn("preferences", result.written_topics)
-
-        after_identity = _strip_frontmatter(
-            (self.base / "identity.md").read_text(encoding="utf-8")
-        )
-        after_prefs = _strip_frontmatter(
-            (self.base / "preferences.md").read_text(encoding="utf-8")
-        )
-        self.assertEqual(before_identity_body, after_identity)
-        self.assertEqual(before_prefs_body, after_prefs)
-
-        self.assertGreater(len(self.journal.load_all()), 0)
-        for event in self.journal.load_all():
-            self.assertEqual(event.source, "migration")
-            self.assertEqual(event.extractor, "migration")
-
-
-def _strip_frontmatter(text: str) -> str:
-    if not text.startswith("---\n"):
-        return text.strip()
-    parts = text.split("\n---\n", 1)
-    if len(parts) != 2:
-        return text.strip()
-    return parts[1].strip()
 
 
 if __name__ == "__main__":
