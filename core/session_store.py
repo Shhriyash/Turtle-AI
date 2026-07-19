@@ -17,6 +17,14 @@ from core.storage import Session, SessionStoreProtocol
 from core.storage.local.sqlite_store import SQLiteSessionStore
 
 
+# A completed session's messages blob only ever grows (real rows reached ~18KB
+# for 4 messages) yet has exactly one reader — scripts/trace_replay.py's
+# reconstruct CLI. On finalization we compact it down to this many trailing
+# messages; the rolling summary + personal-memory journal carry everything the
+# runtime needs, and the tail is enough for reconstruct fidelity.
+COMPLETED_SESSION_MESSAGE_TAIL = 12
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -263,7 +271,22 @@ class SessionStore:
 
     async def mark_finalized(self, session_id: str) -> None:
         """Flip a session to completed exactly once so the connect-time sweep
-        stops re-running LLM extraction over the same transcript forever."""
+        stops re-running LLM extraction over the same transcript forever.
+
+        Finalization also COMPACTS the row. By the time this runs, both
+        finalization paths have already completed Stage A+B extraction and the
+        reflector has written the rolling summary per-turn, so the full messages
+        blob has done its job. Left intact it only grows without bound (real
+        rows: ~18KB for 4 messages) while having a single reader — the
+        trace_replay reconstruct CLI. We therefore keep only the last
+        COMPLETED_SESSION_MESSAGE_TAIL messages (enough for reconstruct
+        fidelity; the summary + journal carry the durable memory) and reset
+        pending_email to its default-empty shape, since a completed session must
+        never gap-fill a future draft. summary / user_id / updated_at survive.
+
+        The cross-tenant refusal below returns BEFORE any of this, so a foreign
+        blob is never truncated.
+        """
         if not hasattr(self.backend, "get"):
             return
         session = await self.backend.get(session_id)
@@ -280,6 +303,10 @@ class SessionStore:
             )
             return
         session.data["status"] = "completed"
+        messages = session.data.get("messages")
+        if isinstance(messages, list):
+            session.data["messages"] = messages[-COMPLETED_SESSION_MESSAGE_TAIL:]
+        session.data["pending_email"] = self._default_pending_email()
         session.data["updated_at"] = _utc_now()
         await self.backend.put(session)
 

@@ -28,4 +28,6 @@ jobs:
 
       - name: Run test suite
         # Phase 2 W5 made test/evals genuinely offline — no ignore needed.
+        # Boot smoke (app imports + /healthz + /api/config + /) rides the suite
+        # via test/smoke_boot_test.py, so no separate CI boot job is needed.
         run: python -m pytest test -q

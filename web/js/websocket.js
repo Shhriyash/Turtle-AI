@@ -87,6 +87,11 @@ function handleServerMessage(msg) {
             // failing). Surface as an error-styled toast so the user knows.
             showToast(msg.message, true);
             break;
+        case 'routine':
+            // A scheduled routine fired (Phase 5 / W2). Informational, not an
+            // error — showToast without the error flag = accent-styled toast.
+            showToast(msg.message);
+            break;
         case 'pong':
             break;
         default:

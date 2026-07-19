@@ -1,8 +1,16 @@
 ﻿from __future__ import annotations
 
+import os
 import warnings
 from pathlib import Path
 import shutil
+
+# The suite must be deterministic and fully offline. Disable the personal-memory
+# embed background job so that write_topic under a running loop never fires a
+# live Cohere embed or a real data/ vector write (the exact tripwire documented
+# in test/retrieval_broker_test.py:134-136). setdefault so an explicit override
+# in the environment still wins.
+os.environ.setdefault("TURTLE_PERSONAL_EMBED_ENABLED", "0")
 
 
 def _safe_rmtree(path: Path) -> None:

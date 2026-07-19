@@ -130,14 +130,31 @@ class PersonalMemoryStore:
         enforce_storage_cap(self.user_id, self.base_dir, incoming_bytes=delta)
         atomic_write_text(path, serialized)
         
-        # D5/G3: Enqueue embedding job
-        try:
-            import asyncio
-            loop = asyncio.get_running_loop()
-            loop.create_task(queue_service.enqueue("embed_personal_memory", user_id=self.user_id, topic_name=topic_name, lines=lines))
-        except RuntimeError:
-            pass
-            
+        # D5/G3: Enqueue embedding job.
+        # Skip the enqueue entirely for the un-scoped default/empty tenant:
+        # single-tenant/"default" stores are test/legacy constructs (real
+        # tenants are usr_*), and embedding for them would land in the SHARED
+        # data/memory/personal/default/vector index — cross-tenant collapse.
+        if self.user_id and self.user_id not in {"", "default"}:
+            try:
+                import asyncio
+                from core.worker import track_task
+                loop = asyncio.get_running_loop()
+                # Never hand the job a bare string: it would iterate characters.
+                embed_lines = lines.splitlines() if isinstance(lines, str) else lines
+                embed_task = loop.create_task(
+                    queue_service.enqueue(
+                        "embed_personal_memory",
+                        user_id=self.user_id,
+                        topic_name=topic_name,
+                        lines=embed_lines,
+                    )
+                )
+                # Retain the outer task (GC hazard) and surface enqueue failures.
+                track_task(embed_task)
+            except RuntimeError:
+                pass
+
         return parse_markdown_memory(serialized, default_topic=normalized_metadata["topic"])
 
     def update_index_entry(self, name: str, summary_line: str, *, title: str | None = None) -> list[PersonalMemoryIndexEntry]:

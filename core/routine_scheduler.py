@@ -1,17 +1,31 @@
 """
 core/routine_scheduler.py
 -------------------------
-Phase 4 / E1+E2: APScheduler-based in-process routine firing.
+Phase 4 / E1+E2 + Phase 5 (W2): APScheduler-based in-process routine firing.
 
 Reads applied workflow.{morning_routine,daily_briefing,recurring_request.*}
 events from each user's journal, parses cadence + time + timezone, and
-registers an APScheduler CronTrigger per routine. On fire, appends a
-`workflow.scheduled_fire` event to the user's journal so the agent picks
-up the trigger as context on the user's next turn.
+registers an APScheduler CronTrigger per routine.
 
-Delivery channels (email push, voice push, etc.) are out of scope for
-Phase 4 — the journal-event handoff is the minimum viable delivery path
-the plan calls for.
+On fire (_fire_routine, which runs on a ThreadPoolExecutor worker thread), two
+things happen, in order:
+
+  1. Journal append (source of truth). A `workflow.scheduled_fire.<key>` event
+     is written with applied=False. NOTE: this event is an AUDIT record only —
+     it is NOT surfaced by any memory read path. The replayer renders
+     applied-only, the sqlite search defaults to applied_only, and nothing
+     reads scheduled_fire. The old docstring's claim that the agent "surfaces it
+     on the user's next turn" was fiction; there is no such consumer.
+
+  2. Live delivery (Phase 5 / W2, best-effort). A routine WS frame is pushed to
+     the user's open socket(s) via the server's deliver_routine_notice (imported
+     lazily through _delivery_hook so this module never hard-depends on
+     apps.turtle_server — tests drive _fire_routine standalone). If the user has
+     no live socket, the frame is queued server-side and drained on their next
+     connect. This live push is the ONLY real delivery of a routine fire.
+
+The journal write is first and unconditional; a delivery failure (import error,
+degraded server module, send error) only logs and never affects step 1.
 """
 from __future__ import annotations
 
@@ -252,13 +266,70 @@ def _routine_to_cron_trigger(value: dict[str, Any]) -> CronTrigger | None:
         return None
 
 
-def _fire_routine(user_id: str, routine_key: str, value: dict[str, Any]) -> None:
-    """APScheduler job body — runs at the cron tick.
+def _humanize_routine_key(routine_key: str) -> str:
+    """Fallback display name from a key: 'workflow.morning_routine' → 'morning routine'."""
+    tail = routine_key.rsplit(".", 1)[-1]
+    return tail.replace("_", " ").strip() or routine_key
 
-    Writes a `workflow.scheduled_fire` event into the user's journal so the
-    agent surfaces it on the user's next turn (via the workflow.md snapshot
-    + memory context). Real-time channel delivery (email/push) is layered on
-    top of this in a follow-up.
+
+def _build_routine_frame(routine_key: str, value: dict[str, Any], fired_at: str) -> dict[str, Any]:
+    """Build the WS frame the browser renders as a (non-error) routine toast.
+
+    Shape mirrors the storage-cap notice frame: type/code/message, plus routine
+    metadata. Handled by websocket.js case 'routine' → showToast(msg.message).
+    """
+    name = value.get("routine") or _humanize_routine_key(routine_key)
+    items = value.get("items") or []
+    message = f"⏰ Routine: {name}"
+    if items:
+        shown = ", ".join(str(i) for i in items[:3])
+        if len(items) > 3:
+            shown += f" (+{len(items) - 3} more)"
+        message += f" — {shown}"
+    return {
+        "type": "routine",
+        "code": "routine_fire",
+        "message": message,
+        "routine_key": routine_key,
+        "fired_at": fired_at,
+    }
+
+
+def _default_delivery_hook(user_id: str, frame: dict[str, Any]) -> bool:
+    """Bridge a routine frame to the server's live-socket delivery.
+
+    Imported LAZILY so this module carries no import-time dependency on
+    apps.turtle_server (tests exercise _fire_routine standalone; the server is
+    also a much heavier import). deliver_routine_notice itself never raises.
+    """
+    from apps.turtle_server import deliver_routine_notice
+    return deliver_routine_notice(user_id, frame)
+
+
+# Indirection seam for testability: production points at the lazy server bridge;
+# tests inject a fake to assert _fire_routine calls delivery with the right frame
+# without importing the server module.
+_delivery_hook = _default_delivery_hook
+
+
+def _fire_routine(user_id: str, routine_key: str, value: dict[str, Any]) -> None:
+    """APScheduler job body — runs at the cron tick (on a worker thread).
+
+    Two ordered steps (see the module docstring for the full contract):
+
+      1. Journal append — the SOURCE OF TRUTH. Writes a
+         `workflow.scheduled_fire.<key>` event with applied=False. This is an
+         AUDIT record: it is NOT surfaced by any memory read path (replayer /
+         sqlite search are applied-only; nothing consumes scheduled_fire).
+
+      2. Live delivery — best-effort. Builds a routine WS frame and hands it to
+         the delivery hook (the server's live-socket push, with a pending-queue
+         fallback drained on the user's next connect). This is the ONLY real
+         delivery of a fire.
+
+    The journal write is first and unconditional. A delivery failure (import
+    error, degraded server module, send error) only logs and never affects the
+    journal write.
     """
     fired_at = datetime.now(UTC).isoformat()
     fire_key = f"workflow.scheduled_fire.{routine_key}"
@@ -288,4 +359,16 @@ def _fire_routine(user_id: str, routine_key: str, value: dict[str, Any]) -> None
         journal.append(event)
         print(f"LOG: routine fired user={user_id} key={routine_key} event_id={event.event_id}")
     except Exception as e:
+        # Journal write is the source of truth; if it failed there is nothing to
+        # deliver. Do not attempt a push on a failed fire.
         print(f"LOG: routine fire failed user={user_id} key={routine_key}: {e}")
+        return
+
+    # Step 2: best-effort live delivery. Strictly additive — wrapped so a failed
+    # import or a degraded server module only logs and never re-raises into the
+    # scheduler (which would surface as an unhandled job error).
+    try:
+        frame = _build_routine_frame(routine_key, value, fired_at)
+        _delivery_hook(user_id, frame)
+    except Exception as e:
+        print(f"LOG: routine delivery skipped user={user_id} key={routine_key}: {e}")

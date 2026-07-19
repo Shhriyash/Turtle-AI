@@ -21,6 +21,7 @@ import os
 import signal
 import sys
 import threading
+import weakref
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -366,6 +367,38 @@ def _unregister_shutdown_state(state: "SharedState") -> None:
     _ACTIVE_STATES.pop(id(state), None)
     if state.user_id:
         _ACTIVE_STATES_BY_USER.pop(state.user_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 (W2): live-socket registry for routine delivery
+# ---------------------------------------------------------------------------
+# Maps user_id -> set of open WebSockets for that user. The routine scheduler
+# fires on a ThreadPoolExecutor worker thread and reads this registry from there
+# (deliver_routine_notice), so every access is guarded by a threading.Lock.
+_LIVE_SOCKETS: dict[str, set[Any]] = {}
+_LIVE_SOCKETS_LOCK = threading.Lock()
+
+
+def _register_live_socket(user_id: str, ws: Any) -> None:
+    """Record an open socket so a firing routine can find it (cross-thread)."""
+    if not user_id:
+        return
+    with _LIVE_SOCKETS_LOCK:
+        _LIVE_SOCKETS.setdefault(user_id, set()).add(ws)
+
+
+def _discard_live_socket(user_id: str, ws: Any) -> None:
+    """Drop a closed socket; remove the user key entirely when its last socket
+    goes so the registry doesn't accumulate empty sets."""
+    if not user_id:
+        return
+    with _LIVE_SOCKETS_LOCK:
+        sockets = _LIVE_SOCKETS.get(user_id)
+        if sockets is None:
+            return
+        sockets.discard(ws)
+        if not sockets:
+            _LIVE_SOCKETS.pop(user_id, None)
 
 
 async def _shutdown_state(state: "SharedState") -> None:
@@ -2058,10 +2091,21 @@ app = FastAPI(title="Turtle AI", docs_url=None, redoc_url=None)
 # Phase 4 / E1: routine scheduler — singleton, started/stopped with the app.
 _routine_scheduler = None  # type: ignore[var-annotated]
 
+# Phase 5 (W2): the event loop the app runs on. The scheduler fires routines on
+# a worker thread; that thread needs this loop to bridge sends back onto the app
+# loop via asyncio.run_coroutine_threadsafe. None until startup captures it.
+_APP_LOOP: "asyncio.AbstractEventLoop | None" = None
+
 
 @app.on_event("startup")
 async def _start_routine_scheduler() -> None:
-    global _routine_scheduler
+    global _routine_scheduler, _APP_LOOP
+    # Capture the running app loop so the scheduler thread can bridge routine
+    # notices back onto it (run_coroutine_threadsafe). Must happen on the loop.
+    try:
+        _APP_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        _APP_LOOP = None
     try:
         from core.routine_scheduler import RoutineScheduler
         _routine_scheduler = RoutineScheduler()
@@ -2361,6 +2405,17 @@ async def serve_index(request: Request):
     if not index_path.exists():
         return JSONResponse({"error": "Frontend not built yet"}, status_code=404)
     return FileResponse(index_path, media_type="text/html")
+
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness probe for container orchestration and CI boot smoke.
+
+    Intentionally does no auth and no I/O — it only proves the ASGI app booted
+    and is routing. The Dockerfile HEALTHCHECK and test/smoke_boot_test.py both
+    hit this.
+    """
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/favicon.ico")
@@ -2690,6 +2745,9 @@ async def websocket_endpoint(ws: WebSocket):
             user_id=user_id,
         )
         _register_shutdown_state(state)
+        # Phase 5 (W2): expose this socket to the routine scheduler so a fire can
+        # reach the user live. Symmetrically discarded in the teardown finally.
+        _register_live_socket(user_id, ws)
 
         # Process pending sessions from previous runs (personal memory finalization).
         # list_pending_finalization_archives now returns (session_id, message_history)
@@ -2728,6 +2786,21 @@ async def websocket_endpoint(ws: WebSocket):
             })
 
         await _ws_send_json(ws, {"type": "status", "status": "ready"})
+
+        # Phase 5 (W2): drain any routine fires that arrived while this user had
+        # no live socket (queued by deliver_routine_notice). Verified sends: a
+        # frame popped from the queue is only gone once a socket actually
+        # accepted it — if this socket dies mid-drain, the remainder re-queues
+        # for the next connect instead of vanishing (Codex P5 #2).
+        _pending_routines = pop_pending_routine_notices(user_id)
+        for _i, _pending_routine in enumerate(_pending_routines):
+            try:
+                async with _ws_send_lock(ws):
+                    await ws.send_json(_pending_routine)
+            except Exception:
+                for _frame in _pending_routines[_i:]:
+                    _stash_pending_routine_notice(user_id, _frame)
+                break
 
         try:
             while True:
@@ -2855,6 +2928,8 @@ async def websocket_endpoint(ws: WebSocket):
                     pass
             print("LOG: Session archived and cleaned up")
             _unregister_shutdown_state(state)
+            # Phase 5 (W2): stop advertising this socket to the scheduler.
+            _discard_live_socket(user_id, ws)
 
 
 # ---------------------------------------------------------------------------
@@ -2862,11 +2937,184 @@ async def websocket_endpoint(ws: WebSocket):
 # ---------------------------------------------------------------------------
 
 async def _ws_send_json(ws: WebSocket, data: dict[str, Any]) -> None:
-    """Send a JSON message to the WebSocket client."""
+    """Send a JSON message to the WebSocket client.
+
+    Serialized per socket: routine delivery runs as a separate loop task from
+    the connection handler, and interleaved multi-writer sends on one Starlette
+    websocket are not safe (Codex P5 #4).
+    """
     try:
-        await ws.send_json(data)
+        async with _ws_send_lock(ws):
+            await ws.send_json(data)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 (W2): routine delivery
+# ---------------------------------------------------------------------------
+# When a routine fires but the user has no live socket (offline, or the app loop
+# was never captured), its frame is stashed here and drained on the user's next
+# connect. A small LIST per user so multiple fires queue instead of clobbering
+# each other. Stashed from the scheduler worker thread, drained on the app loop,
+# so access is lock-guarded.
+_PENDING_ROUTINE_NOTICES: dict[str, list[dict[str, Any]]] = {}
+_PENDING_ROUTINE_NOTICES_LOCK = threading.Lock()
+# Cap on queued fires PER USER (most recent kept). The number of distinct users
+# held is bounded by _STORAGE_CAP_REGISTRY_CAP, mirroring the storage-cap path.
+_PENDING_ROUTINE_MAX_PER_USER = 5
+
+
+def _stash_pending_routine_notice(user_id: str, frame: dict[str, Any]) -> None:
+    """Queue a routine frame for delivery on the user's next connect (bounded).
+
+    NOTE (v1 durability limit, documented deliberately): this queue is
+    in-memory. A process restart between a fire and its delivery drops the
+    notice — the journal keeps the audit record, but no read path surfaces it.
+    A durable outbox is future work; routine notices are reminders, not
+    transactions.
+    """
+    with _PENDING_ROUTINE_NOTICES_LOCK:
+        queue = _PENDING_ROUTINE_NOTICES.get(user_id)
+        if queue is None:
+            # Cap distinct users held. Evict the OLDEST user's queue (dict
+            # preserves insertion order) rather than clearing wholesale — a
+            # clear would drop every queued reminder for 500+ unrelated users
+            # because one more showed up (Codex P5 review #4).
+            if len(_PENDING_ROUTINE_NOTICES) >= _STORAGE_CAP_REGISTRY_CAP:
+                _PENDING_ROUTINE_NOTICES.pop(next(iter(_PENDING_ROUTINE_NOTICES)), None)
+            queue = []
+            _PENDING_ROUTINE_NOTICES[user_id] = queue
+        queue.append(frame)
+        # Keep only the most recent N fires for this user.
+        if len(queue) > _PENDING_ROUTINE_MAX_PER_USER:
+            del queue[:-_PENDING_ROUTINE_MAX_PER_USER]
+
+
+def pop_pending_routine_notices(user_id: str) -> list[dict[str, Any]]:
+    """Handler-facing: fetch and clear a user's queued routine frames (drain)."""
+    with _PENDING_ROUTINE_NOTICES_LOCK:
+        return _PENDING_ROUTINE_NOTICES.pop(user_id, [])
+
+
+# Per-socket send locks. Routine delivery runs as its own loop task, concurrent
+# with the connection handler's frame sends — Starlette websockets are not a
+# safe multi-writer queue, so every writer serializes per socket (Codex P5 #4).
+# WeakKeyDictionary: a closed socket's lock dies with it.
+_WS_SEND_LOCKS: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = weakref.WeakKeyDictionary()
+
+
+def _ws_send_lock(ws: Any) -> asyncio.Lock:
+    lock = _WS_SEND_LOCKS.get(ws)
+    if lock is None:
+        lock = asyncio.Lock()
+        _WS_SEND_LOCKS[ws] = lock
+    return lock
+
+
+async def _deliver_routine_on_loop(user_id: str, frame: dict[str, Any]) -> None:
+    """Runs ON the app loop: try each of the user's sockets, verify the send.
+
+    A registered-but-dead socket (abnormal disconnect whose teardown hasn't run
+    yet) must not count as delivered — _ws_send_json swallows errors, so we call
+    ws.send_json directly here, discard sockets whose send raises, and stash the
+    frame for next-connect delivery when NO socket actually accepted it
+    (Codex P5 review #2: scheduled != delivered).
+    """
+    with _LIVE_SOCKETS_LOCK:
+        sockets = list(_LIVE_SOCKETS.get(user_id, ()))
+    delivered = False
+    for ws in sockets:
+        try:
+            async with _ws_send_lock(ws):
+                await ws.send_json(frame)
+            delivered = True
+        except Exception:
+            # Dead socket: stop advertising it so future fires skip it.
+            _discard_live_socket(user_id, ws)
+    if not delivered:
+        _stash_pending_routine_notice(user_id, frame)
+
+
+async def _drain_pending_routines_on_loop(user_id: str) -> None:
+    """Runs ON the app loop: deliver any queued frames to a now-live socket.
+
+    Used to close the connect-vs-stash race — same verified-send semantics as
+    the connect-time drain (undelivered frames re-queue).
+    """
+    with _LIVE_SOCKETS_LOCK:
+        sockets = list(_LIVE_SOCKETS.get(user_id, ()))
+    if not sockets:
+        return
+    pending = pop_pending_routine_notices(user_id)
+    for i, frame in enumerate(pending):
+        delivered = False
+        for ws in sockets:
+            try:
+                async with _ws_send_lock(ws):
+                    await ws.send_json(frame)
+                delivered = True
+                break
+            except Exception:
+                _discard_live_socket(user_id, ws)
+        if not delivered:
+            for remaining in pending[i:]:
+                _stash_pending_routine_notice(user_id, remaining)
+            return
+
+
+def deliver_routine_notice(user_id: str, frame: dict[str, Any]) -> bool:
+    """Push a routine frame to the user's live socket(s), or queue it.
+
+    Called from the routine scheduler's worker thread when a routine fires. The
+    ONLY safe cross-thread bridge is asyncio.run_coroutine_threadsafe against the
+    captured app loop (_APP_LOOP) — we never create_task/get_running_loop from
+    this thread, and never block on the returned future's .result(). The bridged
+    coroutine verifies each send and stashes the frame itself when no socket
+    accepted it, so a stale registry entry cannot lose a fire.
+
+    Returns True when the delivery attempt was scheduled onto the app loop;
+    False when it was stashed directly (no live socket / no captured loop /
+    closed loop). Never raises — a delivery failure must never affect the
+    journal write that already happened upstream.
+    """
+    try:
+        loop = _APP_LOOP
+        with _LIVE_SOCKETS_LOCK:
+            has_sockets = bool(_LIVE_SOCKETS.get(user_id))
+        if loop is not None and not loop.is_closed() and has_sockets:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _deliver_routine_on_loop(user_id, frame), loop
+                )
+                return True
+            except Exception as e:
+                print(f"LOG: routine notice bridge failed user={user_id}: {e}")
+        # No socket / no usable loop / bridge raised → queue for next connect.
+        _stash_pending_routine_notice(user_id, frame)
+        # Close the connect-vs-stash race (Codex P5 #3): if the user connected
+        # between our no-socket snapshot and the stash above, their connect-time
+        # drain may have already run against an empty queue — re-check and, if a
+        # socket is now live, bridge a delivery pass so the frame doesn't wait
+        # for a future reconnect.
+        if loop is not None and not loop.is_closed():
+            with _LIVE_SOCKETS_LOCK:
+                connected_now = bool(_LIVE_SOCKETS.get(user_id))
+            if connected_now:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _drain_pending_routines_on_loop(user_id), loop
+                    )
+                except Exception:
+                    pass  # queue still holds the frame for next connect
+        return False
+    except Exception as e:  # defensive: this path must never raise
+        print(f"LOG: deliver_routine_notice error user={user_id}: {e}")
+        try:
+            _stash_pending_routine_notice(user_id, frame)
+        except Exception:
+            pass
+        return False
 
 
 def _classify_handler_error(exc: Exception) -> tuple[str, str]:

@@ -280,6 +280,12 @@ def _read_session_messages(sessions_path: Path, session_id: str) -> tuple[list[A
 
     Opens the SQLite file strictly read-only (mode=ro URI) so replay never
     mutates production session state.
+
+    Note: completed sessions are compacted to a trailing message tail at
+    finalization (SessionStore.mark_finalized keeps only the last
+    COMPLETED_SESSION_MESSAGE_TAIL messages), so reconstruct can show at most
+    that retained tail for a completed session — earlier turns live only in the
+    rolling summary and the personal-memory journal.
     """
     # as_uri() requires an absolute path — the default "data/sessions.sqlite"
     # is relative and would raise ValueError, so resolve first.
