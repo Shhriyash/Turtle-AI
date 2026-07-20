@@ -105,7 +105,7 @@ class _FakeWS:
         self.sent.append(data)
 
 
-def test_delivery_helper_sends_to_all_user_sockets_only(monkeypatch):
+def test_delivery_helper_sends_to_all_user_sockets_only(pm_root, monkeypatch):
     import apps.turtle_server as ts
 
     ws_a1, ws_a2, ws_b = _FakeWS(), _FakeWS(), _FakeWS()
@@ -138,7 +138,7 @@ def test_delivery_helper_sends_to_all_user_sockets_only(monkeypatch):
 
 # ── (c) no live socket: stash then drain exactly once ────────────────────
 
-def test_no_socket_stashes_and_drains_once(monkeypatch):
+def test_no_socket_stashes_and_drains_once(pm_root, monkeypatch):
     import apps.turtle_server as ts
 
     monkeypatch.setattr(ts, "_APP_LOOP", None)
@@ -155,7 +155,7 @@ def test_no_socket_stashes_and_drains_once(monkeypatch):
     assert ts.pop_pending_routine_notices("ghost") == []
 
 
-def test_live_socket_but_no_loop_falls_back_to_stash(monkeypatch):
+def test_live_socket_but_no_loop_falls_back_to_stash(pm_root, monkeypatch):
     import apps.turtle_server as ts
 
     ws = _FakeWS()
@@ -172,7 +172,7 @@ def test_live_socket_but_no_loop_falls_back_to_stash(monkeypatch):
 
 # ── (d) pending queue cap ────────────────────────────────────────────────
 
-def test_pending_cap_respected(monkeypatch):
+def test_pending_cap_respected(pm_root, monkeypatch):
     import apps.turtle_server as ts
 
     monkeypatch.setattr(ts, "_APP_LOOP", None)

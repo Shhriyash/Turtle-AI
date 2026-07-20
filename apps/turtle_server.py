@@ -40,7 +40,7 @@ import core.background_tasks  # Register background tasks
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from apps.auth import authenticate_websocket
@@ -2407,6 +2407,23 @@ async def serve_index(request: Request):
     return FileResponse(index_path, media_type="text/html")
 
 
+@app.get("/admin")
+async def serve_admin():
+    """Serve the operator admin dashboard.
+
+    The PAGE itself is intentionally unauthenticated — it ships no secrets and
+    no data. The gate is the API it calls: /admin/users requires a matching
+    X-Admin-Token header (401/503 from apps.admin_routes._require_admin). The
+    operator pastes the token into the page at runtime; it is never embedded
+    here. Serving the static shell freely is harmless and keeps the login UX
+    simple (the page renders, then asks for the token).
+    """
+    admin_path = STATIC_DIR / "admin.html"
+    if not admin_path.exists():
+        return JSONResponse({"error": "Admin page missing"}, status_code=404)
+    return FileResponse(admin_path, media_type="text/html")
+
+
 @app.get("/healthz")
 async def healthz():
     """Liveness probe for container orchestration and CI boot smoke.
@@ -2436,9 +2453,36 @@ async def get_config():
 
 
 @app.post("/api/config")
-async def update_config(body: dict[str, Any] | None = None):
-    """Update config and hot-reload agent chain."""
+async def update_config(
+    body: dict[str, Any] | None = None,
+    x_admin_token: str | None = Header(default=None),
+):
+    """Update config and hot-reload agent chain.
+
+    Hot-swapping models is a privileged side effect reachable by any same-origin
+    visitor, so gate it behind the admin token WHEN one is configured: with
+    TURTLE_ADMIN_TOKEN set, every POST must carry a matching X-Admin-Token header
+    (401 otherwise). When the token is unset (local dev) the endpoint stays open,
+    preserving the current zero-config developer flow. GET /api/config is left
+    open on purpose — the dev panel reads config to render, and it exposes no
+    secrets.
+    """
     global config
+    expected = (
+        settings.admin_token.get_secret_value()
+        if settings.admin_token is not None
+        else None
+    )
+    if not expected and settings.is_cloud:
+        # Cloud with no admin token: fail CLOSED like /admin/* does — an open
+        # model-hot-swap endpoint on a public deployment is not acceptable
+        # (Codex P6 #1). Local dev (not cloud, no token) stays open.
+        return JSONResponse(
+            {"error": "Config updates are disabled (TURTLE_ADMIN_TOKEN not set)."},
+            status_code=503,
+        )
+    if expected and x_admin_token != expected:
+        return JSONResponse({"error": "Unauthorized."}, status_code=401)
     if not body:
         return JSONResponse({"error": "Empty body"}, status_code=400)
 
@@ -2964,37 +3008,124 @@ _PENDING_ROUTINE_NOTICES_LOCK = threading.Lock()
 # held is bounded by _STORAGE_CAP_REGISTRY_CAP, mirroring the storage-cap path.
 _PENDING_ROUTINE_MAX_PER_USER = 5
 
+# Durable write-through: the in-memory dict above is the hot cache; each user's
+# queue is mirrored to <personal_memory_dir(user_id)>/routine_outbox.json
+# (core.routine_outbox) so a process restart between a fire and its delivery no
+# longer drops the notice. Best-effort — save/load only LOG on error.
+from core.routine_outbox import load_outbox as _load_outbox, save_outbox as _save_outbox
+
 
 def _stash_pending_routine_notice(user_id: str, frame: dict[str, Any]) -> None:
     """Queue a routine frame for delivery on the user's next connect (bounded).
 
-    NOTE (v1 durability limit, documented deliberately): this queue is
-    in-memory. A process restart between a fire and its delivery drops the
-    notice — the journal keeps the audit record, but no read path surfaces it.
-    A durable outbox is future work; routine notices are reminders, not
-    transactions.
+    Durable write-through outbox under the user's memory dir; survives restarts;
+    loaded lazily on next connect. The in-memory queue is the hot cache, but
+    after mutating it we persist the user's (capped) queue to a small JSON outbox
+    under their personal-memory dir (core.routine_outbox). A process restart
+    between a fire and its delivery therefore no longer drops the notice — the
+    frames survive on disk and are surfaced on the user's next connect (see
+    pop_pending_routine_notices; no startup scan is needed). The persist happens
+    under the same lock (the write is per-user and tiny — bounded work) and is
+    best-effort: an I/O or storage-cap error is LOGged inside save_outbox and
+    swallowed, leaving the in-memory queue intact (memory-only fallback).
     """
     with _PENDING_ROUTINE_NOTICES_LOCK:
         queue = _PENDING_ROUTINE_NOTICES.get(user_id)
         if queue is None:
-            # Cap distinct users held. Evict the OLDEST user's queue (dict
-            # preserves insertion order) rather than clearing wholesale — a
+            # Cap distinct users held in MEMORY. Evict the OLDEST user's queue
+            # (dict preserves insertion order) rather than clearing wholesale — a
             # clear would drop every queued reminder for 500+ unrelated users
-            # because one more showed up (Codex P5 review #4).
+            # because one more showed up (Codex P5 review #4). The evicted user's
+            # on-disk outbox is deliberately LEFT in place: memory eviction only
+            # bounds RAM, and their frames should survive to their next connect
+            # rather than be lost — memory eviction != data loss (Phase 6 W1).
             if len(_PENDING_ROUTINE_NOTICES) >= _STORAGE_CAP_REGISTRY_CAP:
                 _PENDING_ROUTINE_NOTICES.pop(next(iter(_PENDING_ROUTINE_NOTICES)), None)
-            queue = []
+            # HYDRATE from disk before the first write-through for this user
+            # (Codex P6 #2): after a restart or memory eviction the hot cache is
+            # empty while the outbox file still holds frames — saving only the
+            # new frame would clobber them. A load failure (None) hydrates
+            # nothing; the subsequent save then overwrites, accepting the rare
+            # loss over blocking the stash.
+            disk_frames = _load_outbox(user_id)
+            queue = list(disk_frames) if disk_frames else []
             _PENDING_ROUTINE_NOTICES[user_id] = queue
         queue.append(frame)
         # Keep only the most recent N fires for this user.
         if len(queue) > _PENDING_ROUTINE_MAX_PER_USER:
             del queue[:-_PENDING_ROUTINE_MAX_PER_USER]
+        # Write-through the (capped) queue to the durable outbox.
+        _save_outbox(user_id, queue)
+
+
+def _routine_frame_identity(frame: dict[str, Any]) -> tuple:
+    """Dedupe identity for a routine frame.
+
+    (routine_key, fired_at) when either is present — real frames always carry
+    both. Frames lacking both fall back to canonical content so a write-through
+    mirror copy (same content, freshly deserialized → different object) still
+    collapses against its in-memory twin.
+    """
+    rk = frame.get("routine_key")
+    fa = frame.get("fired_at")
+    if rk is not None or fa is not None:
+        return ("k", rk, fa)
+    try:
+        return ("c", json.dumps(frame, sort_keys=True, ensure_ascii=False))
+    except Exception:
+        return ("i", id(frame))
+
+
+def _merge_routine_frames(
+    disk_frames: list[dict[str, Any]], mem_frames: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge disk-first + memory frames, deduping by frame identity.
+
+    Normal write-through case: disk mirrors memory, so the dedupe collapses the
+    mirror to one copy each (disk-order preserved). Restart case: memory is
+    empty and every disk frame is surfaced.
+    """
+    merged: list[dict[str, Any]] = []
+    seen: set = set()
+    for frame in list(disk_frames) + list(mem_frames):
+        ident = _routine_frame_identity(frame)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        merged.append(frame)
+    return merged
 
 
 def pop_pending_routine_notices(user_id: str) -> list[dict[str, Any]]:
-    """Handler-facing: fetch and clear a user's queued routine frames (drain)."""
+    """Handler-facing: fetch and clear a user's queued routine frames (drain).
+
+    Consults BOTH stores: the in-memory hot cache AND the durable on-disk outbox.
+    After a process restart the memory dict is empty but the outbox file still
+    holds the frames, so the merged result is disk-frames-first + memory-frames,
+    deduped by (routine_key, fired_at) — frames lacking both are deduped by
+    canonical content so the write-through mirror collapses to one copy. Both the
+    memory queue and the disk file are then cleared. This is what makes
+    durability lazy: no startup scan is needed — a user's outbox loads on their
+    next connect-time drain (which calls this).
+    """
+    # Memory mutation under the lock; disk I/O OUTSIDE it (Codex P6 #3 — pop
+    # runs on the app loop, and file I/O under the global lock would stall both
+    # the loop and every scheduler-thread stash). A stash landing between the
+    # two steps keeps its frame in the memory dict (picked up by the next pop);
+    # its write-through may be cleared below, but the frame itself survives.
     with _PENDING_ROUTINE_NOTICES_LOCK:
-        return _PENDING_ROUTINE_NOTICES.pop(user_id, [])
+        mem_frames = _PENDING_ROUTINE_NOTICES.pop(user_id, [])
+    disk_frames = _load_outbox(user_id)
+    if disk_frames is None:
+        # Load failed — the file may still hold frames we never read. Do NOT
+        # clear it (Codex P6 #4); deliver what memory had and leave disk for a
+        # later, healthier pop.
+        return mem_frames
+    merged = _merge_routine_frames(disk_frames, mem_frames)
+    _save_outbox(user_id, [])  # clear disk; both stores now drained
+    # Cap coherence after the merge: disk(≤5) + memory(≤5) could return 10;
+    # keep the most-recent N like every other bound on this queue (Codex P6 #7).
+    return merged[-_PENDING_ROUTINE_MAX_PER_USER:]
 
 
 # Per-socket send locks. Routine delivery runs as its own loop task, concurrent

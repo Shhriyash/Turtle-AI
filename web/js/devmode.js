@@ -21,12 +21,33 @@ function bindTtsSpeedPreview() {
     slider.dataset.bound = '1';
 }
 
-async function postConfigPatch(cfgPatch) {
+const ADMIN_TOKEN_KEY = 'turtle_admin_token';
+
+async function postConfigPatch(cfgPatch, allowPrompt = true) {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = sessionStorage.getItem(ADMIN_TOKEN_KEY);
+    if (token) headers['X-Admin-Token'] = token;
+
     const res = await fetch('/api/config', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(cfgPatch),
     });
+
+    // When TURTLE_ADMIN_TOKEN is set server-side, POST /api/config is gated.
+    // On 401, drop any stale token, prompt once, cache it in sessionStorage
+    // (session-scoped — cleared when the tab closes, smaller blast radius than
+    // localStorage), then retry a single time (allowPrompt guards the recursion).
+    if (res.status === 401) {
+        sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+        if (allowPrompt) {
+            const entered = window.prompt('Admin token required to change server config:');
+            if (entered && entered.trim()) {
+                sessionStorage.setItem(ADMIN_TOKEN_KEY, entered.trim());
+                return postConfigPatch(cfgPatch, false);
+            }
+        }
+    }
     return await res.json();
 }
 

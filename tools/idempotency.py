@@ -40,10 +40,21 @@ _DB_PATH: Path | None = None        # Resolved lazily from env / default
 def _get_db_path() -> Path:
     global _DB_PATH
     if _DB_PATH is None:
-        import os
-        from pathlib import Path as _P
-        base = _P(os.getenv("TURTLE_DATA_DIR", "data"))
+        # Anchor to settings.data_dir (repo-root default, honors TURTLE_DATA_DIR).
+        # The old bare Path("data") was CWD-relative: launching the server from
+        # another directory silently created a fresh tool_invocations.db beside
+        # that CWD instead of under <repo>/data — the exact hazard core/config.py
+        # (data_dir field + _anchor_data_dir) fixed for everything else. Reusing
+        # settings.data_dir keeps idempotency state co-located with the rest of
+        # the data volume. Safe from import cycles: core.config is a leaf module
+        # (stdlib + pydantic only) and tools/ already imports it (calendar_tool).
+        from core.config import settings
+        base = settings.data_dir
         base.mkdir(parents=True, exist_ok=True)
+        # Log the resolved location once: deployments that previously launched
+        # from a non-repo CWD had a stray CWD-relative DB; the log makes the
+        # anchor change visible instead of silently "losing" old entries.
+        print(f"LOG: idempotency DB at {base / 'tool_invocations.db'}")
         _DB_PATH = base / "tool_invocations.db"
     return _DB_PATH
 

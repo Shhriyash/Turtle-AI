@@ -358,6 +358,20 @@ SLACK_SIGNING_SECRET="your_slack_signing_secret"
 GOOGLE_CALENDAR_CREDENTIALS_JSON='{"installed":{"client_id":"..."}}'
 GOOGLE_CALENDAR_TOKEN_JSON='{"token":"..."}'
 
+# Additional LLM provider (Gemini) — key rotation: _1 unset falls through to _2/_3
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_API_KEY_2=your_gemini_api_key_2
+GEMINI_API_KEY_3=your_gemini_api_key_3
+
+# Web search
+TAVILY_API_KEY=your_tavily_api_key
+
+# Cloud deployment — REQUIRED when TURTLE_DEPLOY=cloud (see ## Deployment below)
+TURTLE_DEPLOY=cloud                              # local | cloud (alias is TURTLE_DEPLOY, not TURTLE_DEPLOY_MODE)
+AUTH_SECRET_KEY=generate_a_long_random_secret    # signs session cookies — no default in cloud
+TURTLE_PUBLIC_BASE_URL=https://turtle.example.com  # externally reachable URL for magic/forget-me links
+TURTLE_ADMIN_TOKEN=generate_a_random_admin_token   # unlocks /admin + gates POST /api/config; unset = admin disabled
+
 # Optional monitoring
 LOGFIRE_TOKEN=your_logfire_token
 ```
@@ -367,6 +381,106 @@ LOGFIRE_TOKEN=your_logfire_token
 ```bash
 python -m pip install -r requirements.txt
 ```
+
+---
+
+## Deployment
+
+This section is for running Turtle as a multi-user cloud service. For local
+single-user development you can skip it — just run the server (see Usage) with
+`TURTLE_DEPLOY` unset (defaults to `local`).
+
+### Quickstart (Docker Compose)
+
+```bash
+# 1. Put real values in a .env file next to docker-compose.yml (see below).
+# 2. Build + run:
+docker compose up --build -d
+# 3. Health check:
+curl http://localhost:8000/healthz          # -> {"status":"ok"}
+```
+
+Or with plain Docker:
+
+```bash
+docker build -t turtle .
+docker run -d -p 8000:8000 \
+  -v "$(pwd)/data:/app/data" \
+  --env-file .env \
+  turtle
+```
+
+The container runs `gunicorn` with 2 uvicorn workers on port 8000 and a
+`HEALTHCHECK` that polls `/healthz` (see `Dockerfile`). `TURTLE_DEPLOY=cloud` is
+baked into the image.
+
+### The persistent-volume contract
+
+**Everything under `data/` is stateful and must live on a persistent volume**
+(`./data:/app/data` in compose). Losing it means losing users and their memory —
+there is no re-derivation. In order of irreplaceability:
+
+| Path | What it is | Losing it means |
+| --- | --- | --- |
+| `data/users.sqlite` | **Identity** — email → user_id bindings | Every user is orphaned; next login mints a brand-new id and their memory is unreachable |
+| `data/memory/personal/<uid>/` | **Irreplaceable** per-user memory + journal | Permanent loss of everything Turtle learned about that user |
+| `data/scheduler.sqlite` | Routine/recurring-job schedules | All routines stop firing |
+| `data/rag/<uid>/` | Per-user conversation RAG vectors | Rebuildable-ish, but recall degrades until it repopulates |
+| `data/sessions.sqlite` | Session message history | In-flight conversations reset |
+| `data/tool_invocations.db` | Email idempotency window (60 s) | Negligible — self-heals |
+| `data/traces/` | Optional turn-trace forensics | Optional; only used by `trace_replay.py` |
+
+### Required environment (cloud mode)
+
+| Var | Purpose |
+| --- | --- |
+| `TURTLE_DEPLOY=cloud` | Enables strict auth: secure cookies, no dev-anon, no dev JWT fallback. The config alias is `TURTLE_DEPLOY` — **not** `TURTLE_DEPLOY_MODE` (which is silently ignored). |
+| `AUTH_SECRET_KEY` | Long random secret that signs session cookies. No default in cloud — set a real one. |
+| `TURTLE_PUBLIC_BASE_URL` | The externally reachable base URL; used to build magic-link login and forget-me links. |
+| `TURTLE_ADMIN_TOKEN` | Unlocks `/admin` and gates `POST /api/config`. Unset → admin endpoints return 503 and config POST stays open (fine for local, unsafe for cloud). |
+| LLM keys | `GROQ_API_KEY`, `GROQ_API_KEY2`, `GEMINI_API_KEY` (`_2`/`_3` for rotation), `OPEN_ROUTER_API_KEY_1..3` |
+| RAG / search | `COHERE_API_KEY`, `TAVILY_API_KEY` |
+| Voice | `DEEPGRAM_API_KEY` |
+| Email | `TURTLE_EMAIL_NAME`, `TURTLE_EMAIL_ADDRESS`, `TURTLE_EMAIL_PASSKEY` (magic-link login, routine delivery, forget-me) |
+
+**Optional tuning** (sane defaults in `core/config.py` — override only as needed):
+per-user storage cap `TURTLE_USER_STORAGE_CAP_MB` (default 50), WebSocket rate
+limits `TURTLE_WS_MESSAGES_PER_HOUR` / `TURTLE_WS_MESSAGES_PER_DAY`, personal
+embedding `TURTLE_PERSONAL_EMBED_ENABLED`, and the various latency-budget knobs.
+See `core/config.py` for the full list — don't duplicate it here.
+
+### Operations
+
+- **Health:** `GET /healthz` (no auth, no I/O). The Dockerfile `HEALTHCHECK` and
+  `test/smoke_boot_test.py` both hit it.
+- **Admin dashboard:** `GET /admin` — paste `TURTLE_ADMIN_TOKEN` into the page to
+  list users with storage/activity stats. The page ships no secret; the token is
+  held in the browser's `sessionStorage` and sent as `X-Admin-Token`.
+- **Backups:** `python -m scripts.backup_personal_memory [--out DIR] [--retention-days 30]`
+  snapshots per-user memory to a dated `tar.gz` and prunes old snapshots. Run it
+  from cron / Task Scheduler.
+  **Gap to know:** the snapshot covers `data/memory/personal/` **only** — it does
+  **not** include `data/users.sqlite` (identity), `data/rag/`, or
+  `data/sessions.sqlite`. For real disaster recovery, back up the **entire
+  `data/` volume** (e.g. a volume snapshot), not just the memory tarball.
+- **GDPR delete:** users self-serve via `POST /forget-me` (emailed confirmation
+  link); the admin dashboard is read-only.
+- **Wipe (fresh start):** `python -m scripts.wipe_data --confirm` clears RAG,
+  sessions, memory, and task history. Dry-runs without `--confirm`. Destructive —
+  operator-only.
+- **Forensics:** `python -m scripts.trace_replay [--sessions data/sessions.sqlite]`
+  replays a stored turn for debugging.
+
+### Hazards
+
+- **Never set `TURTLE_DEV_ANON` in production** — it bypasses auth and serves the
+  chat UI to anonymous visitors. It is honored only in local mode, but do not
+  ship it.
+- **Set `TURTLE_DATA_DIR` to an absolute path** if you override it. A relative
+  value is anchored to the repo root by `core/config.py`, but an absolute path is
+  unambiguous and matches the mounted volume.
+- **`AUTH_SECRET_KEY` has no fallback in cloud** — a shared/hardcoded value lets
+  anyone forge session cookies. Generate a unique long random secret per deploy.
 
 ---
 
