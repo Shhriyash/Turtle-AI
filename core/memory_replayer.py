@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Iterable
 
 from core.memory_journal import MemoryEvent
-from core.memory_schema import TOPICS, render_statement
+from core.memory_schema import DECAY_DAYS, TOPICS, is_decayed, render_statement
 from core.personal_memory_store import PersonalMemoryStore
 
 
-DECAY_DAYS = 30
-# Topics whose events never expire (name, email, timezone are load-bearing identity facts).
-_DECAY_EXEMPT_TOPICS = frozenset({"identity"})
-# Events written by the migration pass are considered authoritative until explicitly corrected.
-_DECAY_EXEMPT_SOURCE = "migration"
+# Decay policy now lives in core.memory_schema so the markdown projection here
+# and the SQLite read model apply the identical rule (brutal review H2).
+# DECAY_DAYS is re-exported above for backwards-compat with existing importers.
 
 
 # Topic titles/summaries and the topic tuple all derive from the single registry
@@ -173,32 +171,16 @@ def _sort_lines(lines: list[str]) -> list[str]:
 
 
 def _is_decayed(event: MemoryEvent, reference_time: datetime) -> bool:
-    """Return True if the event has aged past DECAY_DAYS without reinforcement.
+    """Thin adapter over the shared ``memory_schema.is_decayed`` predicate.
 
-    "Reinforcement" is implicit: the replayer has already selected the *latest*
-    event per (topic, key) via ``_resolve_latest_by_key``, so if a newer event
-    exists for the same key it will be in ``resolved`` instead of this one.
-    Therefore we only need to check whether this (latest) event is stale.
-
-    Exemptions:
-    - ``topic in _DECAY_EXEMPT_TOPICS`` (identity facts never expire)
-    - ``source == _DECAY_EXEMPT_SOURCE`` (migration events are authoritative)
-    - ``source == "explicit"`` (explicit user statements persist until
-      superseded or corrected; decay is for inferred behavioral signals)
+    The replayer has already selected the *latest* event per (topic, key) via
+    ``_resolve_latest_by_key``, so a newer restatement would be here instead —
+    we only check whether this (latest) event is stale. Identity topics,
+    explicit statements, and migration events are exempt (see the predicate).
     """
-    if event.topic in _DECAY_EXEMPT_TOPICS:
-        return False
-    if event.source == _DECAY_EXEMPT_SOURCE:
-        return False
-    if event.source == "explicit":
-        return False
-    if not event.observed_at:
-        return False
-    try:
-        observed = datetime.fromisoformat(event.observed_at.replace("Z", "+00:00"))
-    except Exception:
-        return False
-    return (reference_time - observed) > timedelta(days=DECAY_DAYS)
+    return is_decayed(
+        event.topic, event.source, event.observed_at, reference_time=reference_time
+    )
 
 
 def _prune_stale_index_entries(store: PersonalMemoryStore, written_topics: list[str]) -> None:

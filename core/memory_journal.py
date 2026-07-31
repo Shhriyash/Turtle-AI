@@ -162,34 +162,58 @@ class JournalStore:
         return event
 
     def append_many(self, events: Iterable[MemoryEvent]) -> list[MemoryEvent]:
-        # Phase 1: dedup-on-append. Skip only true duplicates: same topic,
-        # kind, KEY, APPLIED flag, and normalized value as one of the last 50
-        # events. Key and applied are part of the signature so an applied=True
-        # event is never suppressed by a lingering applied=False candidate —
-        # restating a fact the gate is still holding must always journal.
+        # Dedup-on-append: skip only TRUE no-ops — an incoming event whose
+        # (kind, applied, value) matches the CURRENT latest event for its
+        # (topic, key). Comparing against the current latest (not set-membership
+        # over the last 50) is what fixes the flip-back bug: with the journal at
+        # [humor=high, humor=low], a user restating "high" differs from the
+        # current latest ("low") and MUST journal — the old signature-set logic
+        # matched it against the earlier "high" and silently dropped it, leaving
+        # the stale "low" served (brutal review H1). Key+applied still matter so
+        # an applied=True restatement is never suppressed by a lingering
+        # applied=False candidate the gate is holding.
         recent: list[MemoryEvent] = []
         try:
-            all_events = self.load_all()
-            recent = all_events[-50:]
+            recent = self.load_all()[-50:]
         except Exception:
             recent = []
 
-        def _signature(ev: MemoryEvent) -> tuple[str, str, str, bool, str]:
+        def _normalized(ev: MemoryEvent) -> str:
             try:
-                normalized = json.dumps(ev.value, ensure_ascii=False, sort_keys=True)
+                return json.dumps(ev.value, ensure_ascii=False, sort_keys=True)
             except Exception:
-                normalized = str(ev.value)
-            return (str(ev.topic), str(ev.kind), str(ev.key), bool(ev.applied), normalized)
+                return str(ev.value)
 
-        recent_sigs = {_signature(ev) for ev in recent}
+        def _sort_key(ev: MemoryEvent) -> tuple[str, str]:
+            return (str(ev.observed_at), str(ev.event_id))
+
+        # Current latest event per (topic, key) among recent journal events.
+        latest_by_key: dict[tuple[str, str], MemoryEvent] = {}
+        for ev in recent:
+            composite = (str(ev.topic), str(ev.key))
+            current = latest_by_key.get(composite)
+            if current is None or _sort_key(ev) > _sort_key(current):
+                latest_by_key[composite] = ev
+
+        def _is_noop(event: MemoryEvent) -> bool:
+            current = latest_by_key.get((str(event.topic), str(event.key)))
+            if current is None:
+                return False
+            return (
+                str(current.kind) == str(event.kind)
+                and bool(current.applied) == bool(event.applied)
+                and _normalized(current) == _normalized(event)
+            )
 
         results: list[MemoryEvent] = []
         for event in events:
-            sig = _signature(event)
-            if sig in recent_sigs:
+            if _is_noop(event):
                 continue
             results.append(self.append(event))
-            recent_sigs.add(sig)
+            # A freshly appended event is now the latest for its key, so a later
+            # event in this same batch dedups against it (in-batch no-ops still
+            # collapse, and a within-batch flip-back still lands).
+            latest_by_key[(str(event.topic), str(event.key))] = event
         return results
 
     def append_rejection(self, original: "MemoryEvent") -> "MemoryEvent":

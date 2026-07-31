@@ -15,6 +15,7 @@ import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from core.memory_schema import is_decayed
 from core.paths import personal_memory_dir
 
 if TYPE_CHECKING:
@@ -449,7 +450,19 @@ class MemorySQLiteIndex:
                 latest_by_key[key] = row
 
         survivors = set(id(row) for row in latest_by_key.values())
-        rows = [row for row in rows if id(row) in survivors][:requested_limit]
+        rows = [row for row in rows if id(row) in survivors]
+        # Decay: a fact aged past the shared cutoff is dropped from retrieval so
+        # the FTS read model agrees with the markdown projection — otherwise a
+        # "forgotten" inferred fact reappears the moment the user asks about it
+        # (brutal review H2). Applied AFTER the latest-per-key collapse (matching
+        # the replayer, which decays the latest event) and BEFORE the limit slice
+        # so a decayed hit doesn't consume a result slot.
+        rows = [
+            row
+            for row in rows
+            if not is_decayed(row["topic"], row["source"], row["observed_at"])
+        ]
+        rows = rows[:requested_limit]
         results: list[MemoryEventRow] = []
         for row in rows:
             try:
@@ -561,7 +574,12 @@ class MemorySQLiteIndex:
         ).fetchone()
         if row is None:
             return None
-        return _build_event_row(row)
+        built = _build_event_row(row)
+        # Same decay rule as search()/the replayer: a served "current value"
+        # that has aged out is no value (brutal review H2).
+        if is_decayed(built.topic, built.source, built.observed_at):
+            return None
+        return built
 
     def events_for_key(
         self, topic: str, key: str, *, limit: int | None = None

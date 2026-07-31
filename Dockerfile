@@ -33,5 +33,16 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status==200 else 1)"
 
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", \
+# IMPORTANT: single worker (-w 1) is REQUIRED, not a performance choice.
+# The routine scheduler, live-socket registry (_LIVE_SOCKETS/_APP_LOOP), the
+# WebSocket rate limiter, and the active-session/confirmation state are all
+# per-process in-memory globals. Under -w 2 they break: every routine fires
+# once per worker (duplicate journal events + duplicate delivery against one
+# shared scheduler.sqlite jobstore), a routine firing in worker A cannot reach
+# a socket held by worker B, rate limits are counted per-worker (~2x the cap),
+# and POST /api/memory/confirm 404s when it lands on a different worker than the
+# WebSocket that populated the state. Multi-worker requires a scheduler leader
+# (one process) + a shared broker (e.g. Redis) for socket routing and limits —
+# see docs/TURTLE_BRUTAL_REVIEW.md C1. Until that lands, run exactly one worker.
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "1", \
      "--bind", "0.0.0.0:8000", "--timeout", "120", "apps.turtle_server:app"]

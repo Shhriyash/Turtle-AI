@@ -17,6 +17,7 @@ typing rather than importing ``MemoryEvent``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 
@@ -24,6 +25,53 @@ from types import SimpleNamespace
 class TopicSpec:
     title: str
     summary: str
+
+
+# ---------------------------------------------------------------------------
+# Decay policy — the SINGLE definition of "this fact has aged out".
+#
+# Previously the decay rule lived only in the markdown replayer, so the
+# markdown projection would forget an aged inferred fact while the SQLite FTS
+# read model (which retrieval actually queries) kept returning it — two
+# contradictory truths injected into the same prompt (brutal review H2). Both
+# projections now import this one predicate so they agree.
+# ---------------------------------------------------------------------------
+DECAY_DAYS = 30
+# Identity facts (name, email, timezone) are load-bearing and never expire.
+DECAY_EXEMPT_TOPICS = frozenset({"identity"})
+# Explicit user statements persist until superseded/corrected; migration events
+# are authoritative. Only *inferred/synthesized behavioral* signals decay.
+DECAY_EXEMPT_SOURCES = frozenset({"explicit", "migration"})
+
+
+def is_decayed(
+    topic: str,
+    source: str,
+    observed_at: str,
+    *,
+    reference_time: datetime | None = None,
+    decay_days: int = DECAY_DAYS,
+) -> bool:
+    """True if a fact has aged past ``decay_days`` without reinforcement.
+
+    Reinforcement is implicit at every call site: callers pass the *latest*
+    event for a (topic, key), so a newer restatement resets the clock. Pure and
+    side-effect-free so the replayer (markdown) and MemorySQLiteIndex (FTS +
+    read model) can share it verbatim. Unparseable/missing timestamps and
+    exempt topics/sources never decay.
+    """
+    if topic in DECAY_EXEMPT_TOPICS:
+        return False
+    if source in DECAY_EXEMPT_SOURCES:
+        return False
+    if not observed_at:
+        return False
+    try:
+        observed = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
+    except Exception:
+        return False
+    ref = reference_time or datetime.now(UTC)
+    return (ref - observed) > timedelta(days=decay_days)
 
 
 # The 11 canonical topics. Titles/summaries are lifted verbatim from the
