@@ -73,6 +73,41 @@ def test_harmony_400_cooldown_is_family_bucket_wide():
     assert health_tracker.is_cooling(b) is False
 
 
+def test_402_credits_cool_the_whole_family_not_just_one_key():
+    # A 402 (credits exhausted) is an account-level state shared by every key of
+    # a provider; cooling one rung for 60s left siblings 402ing every turn.
+    a = _FakeModel()
+    b = _FakeModel()
+    health_tracker.mark_failure(a, _http_error(402, body="requires more credits"))
+    assert health_tracker.is_cooling(a) is True
+    assert health_tracker.is_cooling(b) is True  # bucket-wide
+
+
+def test_gemini_tool_pairing_400_cools_the_family():
+    # Gemini rejects a tool-turn ordering violation with a 400 that used to get
+    # 0s cooldown, so the dead rung was retried every turn (14-36s TTFR live).
+    a = _FakeModel()
+    b = _FakeModel()
+    health_tracker.mark_failure(
+        a,
+        _http_error(
+            400,
+            body="Please ensure that function response turn comes immediately after a function call turn.",
+        ),
+    )
+    assert health_tracker.is_cooling(a) is True
+    assert health_tracker.is_cooling(b) is True  # bucket-wide
+
+
+def test_plain_400_still_not_cooled():
+    # A generic 400 (genuine bad request) must NOT bench the family.
+    a = _FakeModel()
+    b = _FakeModel()
+    health_tracker.mark_failure(a, _http_error(400, body="malformed field 'foo'"))
+    assert health_tracker.is_cooling(a) is False
+    assert health_tracker.is_cooling(b) is False
+
+
 def test_groq_primary_and_fallback_use_distinct_selected_keys(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "k1")
     monkeypatch.setenv("GROQ_API_KEY2", "k2")

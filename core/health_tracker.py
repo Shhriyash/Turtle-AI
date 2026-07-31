@@ -7,9 +7,11 @@ Tracks per-model cooldown timestamps so the fallback cascade can skip
 recently-failed models instead of burning every key in the pool on a
 provider outage. Cooldowns are deterministic per failure class:
 
-  - transient (5xx, 429, 402)         -> 60s
-  - deterministic provider bug (400)  -> 300s
-  - success                            -> clears entry
+  - transient, per-key (5xx, 429, 413)      -> 60s (rung scope)
+  - deterministic, provider-wide            -> 300s (bucket scope):
+      * 402 credits exhausted (account state, all keys share it)
+      * 400 tool-format rejection (gpt-oss harmony, Gemini tool-turn ordering)
+  - success                                  -> clears entry
 
 State is in-process only (a dict). No persistence, no cross-worker sync.
 That's enough for single-instance Turtle; the multi-instance story is
@@ -101,16 +103,41 @@ def _cooldown_seconds(exc: Exception) -> tuple[float, str]:
 
     if ModelHTTPError is not None and isinstance(exc, ModelHTTPError):
         status = getattr(exc, "status_code", None)
-        # 413 = Groq TPM "request too large" (per-minute budget). Back off
-        # briefly so the cascade prefers a higher-limit provider for ~1 min.
-        if status in (413, 429, 402) or (isinstance(status, int) and status >= 500):
+        # 413 = Groq TPM "request too large" (per-minute budget); 429 = rate
+        # limit. Both are per-key and transient — back off briefly, per rung, so
+        # the cascade prefers a higher-limit sibling/provider for ~1 min.
+        if status in (413, 429) or (isinstance(status, int) and status >= 500):
             return _COOLDOWN_TRANSIENT_S, "rung"
+        # 402 = payment required / credits exhausted. This is an ACCOUNT-level
+        # state shared by every key of that provider and it will NOT clear in
+        # 60s (it needs the operator to add credits). Cooling one rung for 60s
+        # left the sibling keys 402ing on every turn, so each turn wasted a full
+        # round-trip per key. Cool the whole family for the long window instead
+        # so the cascade skips a known-broke provider until it's plausibly
+        # topped up. (Observed live: OpenRouter 402 on all 3 keys every turn.)
+        if status == 402:
+            return _COOLDOWN_DETERMINISTIC_S, "bucket"
         if status == 400:
             message = str(exc).lower()
             body = getattr(exc, "body", None)
             if body is not None:
                 message = f"{message} {str(body).lower()}"
-            if "harmony" in message or "render tokens" in message or "tools should have a name" in message:
+            # Deterministic provider/tool-format rejections that recur identically
+            # on the same model family. Includes gpt-oss "harmony" render errors
+            # AND Gemini's strict tool-turn ordering ("function response turn
+            # comes immediately after a function call turn" / INVALID_ARGUMENT),
+            # which otherwise 400s on every tool-using turn and was never cooled —
+            # so the cascade re-tried the dead Gemini rungs each turn (observed
+            # live: ~14-36s TTFR while grinding through them to reach Groq).
+            deterministic_400 = (
+                "harmony" in message
+                or "render tokens" in message
+                or "tools should have a name" in message
+                or "function response" in message
+                or "immediately after a function call" in message
+                or ("invalid_argument" in message and "function" in message)
+            )
+            if deterministic_400:
                 return _COOLDOWN_DETERMINISTIC_S, "bucket"
             return 0.0, "rung"
         return 0.0, "rung"
