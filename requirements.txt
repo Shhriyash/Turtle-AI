@@ -1,5 +1,6 @@
 # Core
 pydantic-ai==1.67.0
+pydantic-settings==2.13.1   # core/config settings (imported directly)
 openai==2.26.0
 python-dotenv==1.2.2
 httpx==0.28.1
@@ -27,6 +28,9 @@ sounddevice==0.5.5
 scipy==1.17.1
 fastrtc==0.0.34
 keyboard==0.13.5
+# stdlib `audioop` was removed in Python 3.13; twilio_voice transcodes μ-law
+# through it, so pull the back-port on 3.13+ (no-op on older interpreters).
+audioop-lts==0.2.2; python_version >= "3.13"
 
 # Web server
 fastapi>=0.115.0
@@ -39,6 +43,10 @@ logfire==4.27.0
 # Scheduler (Phase 4 / E1)
 apscheduler>=3.10.4
 sqlalchemy>=2.0
+
+# Storage / auth (imported directly; previously relied on a transitive install)
+aiosqlite==0.22.1   # async SQLite — core/identity + session store
+PyJWT==2.12.1       # apps/auth session tokens
 
 # Discord gateway (natural DM/@mention bot mode ONLY). The interactions-webhook
 # mode in apps/channels/discord.py needs no extra deps — it verifies Ed25519
