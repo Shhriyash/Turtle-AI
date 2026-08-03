@@ -73,3 +73,19 @@ class TestLLMClientFallbackFix:
         exc.__class__ = ModelHTTPError
 
         assert is_key_failure_error(exc) is True
+
+    def test_402_out_of_credits_is_key_failure(self):
+        """402 (provider out of credits/quota, e.g. OpenRouter) MUST be
+        fallback-eligible — otherwise the cascade aborts before the Groq rescue
+        rung and a tool turn fails outright. Regression for the live Discord turn
+        where OpenRouter's 402 stranded llama-3.3-70b and the turn failed."""
+        from unittest.mock import MagicMock
+        from pydantic_ai.exceptions import ModelHTTPError
+        from core.llm_client import is_key_failure_error
+
+        exc = MagicMock(spec=ModelHTTPError)
+        exc.status_code = 402
+        exc.__str__ = lambda self: "This request requires more credits, or fewer max_tokens."
+        exc.__class__ = ModelHTTPError
+
+        assert is_key_failure_error(exc) is True

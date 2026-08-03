@@ -184,9 +184,12 @@ def is_rate_limit_error(exc: Exception) -> bool:
 
 def is_key_failure_error(exc: Exception) -> bool:
     if isinstance(exc, ModelHTTPError):
-        # 413 = TPM "request too large" (rate_limit_exceeded) — capacity, not a
-        # client error. Fall over to a model on a different provider/limit.
-        if exc.status_code in {401, 403, 404, 413, 429}:
+        # 402 = provider/key out of credits or quota (e.g. OpenRouter "requires
+        # more credits"). 413 = TPM "request too large" (rate_limit_exceeded).
+        # Both are capacity/quota signals for THIS provider, not client errors —
+        # fall over to a model on a different provider/limit rather than aborting
+        # the cascade (a 402 on OpenRouter must not strand the Groq rescue rung).
+        if exc.status_code in {401, 402, 403, 404, 413, 429}:
             return True
         if exc.status_code == 400:
             # Only treat 400 as fallback-eligible when it's a known provider-level
@@ -395,6 +398,14 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
 
     last_exc: Exception | None = None
     for idx, agent in enumerate(eligible):
+        # An earlier failure THIS call may have cooled a model family that
+        # recurs later in the chain (the same model appears once per API key —
+        # e.g. gemini-2.5-flash on three Google keys). Re-check and skip such a
+        # rung rather than burn an identical, already-doomed call. Never skip the
+        # primary (idx 0); if everything remaining is cooling the final
+        # `raise last_exc` still fires.
+        if idx > 0 and last_exc is not None and health_tracker.is_cooling(agent):
+            continue
         try:
             result = await agent.run(*args, **kwargs)
             health_tracker.mark_success(agent)
@@ -432,6 +443,10 @@ def run_agent_sync_with_fallbacks(primary_agent: Any, fallback_agents: list[Any]
 
     last_exc: Exception | None = None
     for idx, agent in enumerate(eligible):
+        # Skip a rung whose model family was cooled by an earlier failure this
+        # call (see run_agent_with_fallbacks for the rationale).
+        if idx > 0 and last_exc is not None and health_tracker.is_cooling(agent):
+            continue
         try:
             result = agent.run_sync(*args, **kwargs)
             health_tracker.mark_success(agent)
