@@ -93,7 +93,18 @@ async def start_discord_gateway() -> None:
 
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_mention = client.user is not None and client.user in message.mentions
+        # Visibility: log EVERY human message the gateway receives, before any
+        # filtering, so a delivered-but-dropped message is never silent. (The
+        # previous handler logged only on exception, so a successful — or
+        # filtered — message left no trace at all.)
+        print(
+            f"LOG: discord on_message from {message.author} ({message.author.id}) "
+            f"channel={type(message.channel).__name__} dm={is_dm} "
+            f"mention={is_mention} content_len={len(message.content or '')}",
+            flush=True,
+        )
         if not (is_dm or is_mention):
+            print("LOG: discord on_message ignored (not a DM, not an @mention)", flush=True)
             return
 
         # Strip the leading @mention so the pipeline sees clean text.
@@ -102,10 +113,16 @@ async def start_discord_gateway() -> None:
             text = text.replace(f"<@{client.user.id}>", "").replace(f"<@!{client.user.id}>", "")
         text = text.strip()
         if not text:
+            print(
+                "LOG: discord on_message dropped — empty text after mention-strip "
+                "(the message_content intent may be OFF, or the message carried no text)",
+                flush=True,
+            )
             return
 
         try:
             user_id = await identity_manager.resolve_user("discord", str(message.author.id))
+            print(f"LOG: discord dispatching turn user_id={user_id} text={text[:80]!r}", flush=True)
             turtle_event = TurtleEvent(
                 user_id=user_id,
                 channel="discord",
@@ -116,8 +133,9 @@ async def start_discord_gateway() -> None:
             )
             response: TurtleResponse = await dispatch_event(turtle_event)
             await message.channel.send(response.content[:_MAX_REPLY_CHARS])
+            print(f"LOG: discord replied to {message.author} ({len(response.content or '')} chars)", flush=True)
         except Exception as e:
-            print(f"LOG: discord gateway on_message error: {e}")
+            print(f"LOG: discord gateway on_message error: {e}", flush=True)
 
     _client = client
     # client.start() blocks until disconnect — run it as a background task so
