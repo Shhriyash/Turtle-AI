@@ -33,7 +33,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        # pytest is a test-only dependency, deliberately not in requirements.txt
+        # (the app doesn't need it at runtime). Install it here so the suite can
+        # run. Pinned to match local dev.
+        run: |
+          pip install -r requirements.txt
+          pip install pytest==9.0.3
 
       - name: Run test suite
         # Phase 2 W5 made test/evals genuinely offline — no ignore needed.
