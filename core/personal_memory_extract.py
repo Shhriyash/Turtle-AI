@@ -705,6 +705,38 @@ def _stage_b_turns_from_messages(
     return turns[-max_turns:]
 
 
+# Request markers: keys the Stage-B model invents when it mis-models a one-off
+# request ("give me a quick high-protein breakfast idea") as a durable
+# preference — e.g. value {"requested": true}. A value dict whose keys are ALL
+# request markers and that carries no substantive text leaf is a transient ask,
+# not a standing fact, so we drop it. Deliberately narrow: keyed on this marker
+# set, NOT on "value is boolean", so legitimate boolean prefs like
+# {"prefers_draft_before_send": true} pass through untouched.
+_REQUEST_MARKER_KEYS = frozenset({
+    "requested", "request", "asked", "asking", "one_off", "one_time",
+    "wants", "want", "query", "ask", "requesting",
+})
+
+
+def _is_request_shaped(value: Any) -> bool:
+    """True when a Stage-B value dict encodes a one-off request, not a fact.
+
+    Rejects only dicts whose keys are all request markers AND that carry no
+    substantive string content (a real preference would describe the preference
+    in text). This precisely kills {"requested": true} while leaving legitimate
+    boolean-valued preferences intact.
+    """
+    if not isinstance(value, dict) or not value:
+        return False
+    keys = {str(k).strip().lower() for k in value.keys()}
+    if not keys <= _REQUEST_MARKER_KEYS:
+        return False
+    for leaf in value.values():
+        if isinstance(leaf, str) and len(leaf.strip()) > 2:
+            return False  # descriptive text present — may be a real fact, keep it
+    return True
+
+
 async def run_stage_b_session_extractor(
     state: Any,
     *,
@@ -765,6 +797,11 @@ async def run_stage_b_session_extractor(
         "\"time\": \"08:00\", \"timezone\": \"Asia/Kolkata\"}. "
         "time is 24-hour HH:MM. timezone is an IANA name. Omit time/timezone only when the "
         "user genuinely did not state one. Treat these as preferences, not one-off tasks.\n"
+        "- Do NOT emit a candidate for a one-off request, question, or task "
+        "instruction (\"give me...\", \"show me...\", \"what's...\", \"suggest...\", "
+        "\"recommend...\"). Only durable standing facts or preferences the user will "
+        "still hold next week. A single request for a breakfast idea is NOT a food "
+        "preference.\n"
         f"- Max candidates: {max_candidates}.\n\n"
         f"Current profile snapshot:\n{json.dumps(profile, ensure_ascii=False, indent=2)}\n\n"
         f"Session turns:\n{json.dumps(turns, ensure_ascii=False, indent=2)}"
@@ -814,6 +851,12 @@ async def run_stage_b_session_extractor(
         if topic not in ALLOWED_TOPICS:
             continue
         if not key or not isinstance(value, dict):
+            continue
+        # Bug A: a one-off request ("give me a quick high-protein breakfast idea")
+        # mis-modeled as a preference — value like {"requested": true} with no
+        # standing content. Drop it rather than journaling a durable pref the user
+        # never actually expressed.
+        if _is_request_shaped(value):
             continue
         # D1: validate the routine value shape; drop half-formed entries
         # rather than half-storing them. Non-routine workflow events pass through.

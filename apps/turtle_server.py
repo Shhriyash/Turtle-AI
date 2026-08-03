@@ -1350,6 +1350,34 @@ def _store_remembered_fact(
     """
     from core.memory_journal import generate_event_id
 
+    # Bug B backstop: the model sometimes calls `remember` twice for one fact
+    # under two keys (e.g. projects.codename_atlas="I'm working on a project
+    # codenamed Atlas." AND projects.project_codename="Atlas"). Collapse a
+    # restated fact — same topic, same session, where one applied value contains
+    # the other — into the entry already stored. Length-gated (>=4 chars) and
+    # skip-not-supersede so short distinct facts ("Sam" vs "Sam Smith") and
+    # already-applied data are never clobbered. The tool contract (remember.md)
+    # is the primary fix; this only catches the model's redundant second call.
+    new_norm = (value_text or "").strip().lower()
+    session_id = state.session_store.session_id or "unknown_session"
+    if len(new_norm) >= 4:
+        try:
+            recent = state.journal_store.load_all()[-50:]
+        except Exception:
+            recent = []
+        for ev in recent:
+            if ev.topic != topic or not getattr(ev, "applied", False):
+                continue
+            if getattr(ev, "session_id", None) != session_id:
+                continue
+            existing = " ".join(str(v) for v in (ev.value or {}).values()).strip().lower()
+            if len(existing) < 4:
+                continue
+            if existing == new_norm or existing in new_norm or new_norm in existing:
+                return ToolResult.ok(
+                    f"Already remembered ({ev.key}): {topic}.{key_slug} = {value_text}"
+                ).to_agent_string()
+
     try:
         event = make_event(
             event_id=generate_event_id(),
