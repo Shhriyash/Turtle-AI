@@ -1664,23 +1664,34 @@ class AgentManager:
                 and getattr(override, "model_name", None) == getattr(head, "model_name", None)
             )
 
-        # main_assistant: Gemini direct → Gemini via OpenRouter → gpt-oss → Llama.
-        # a1: Gemini leads. It's a strong tool-caller, and on the free tier its
-        # token limits dwarf Groq's 8k TPM — which gpt-oss-120b blows on Turtle's
-        # tool surface (see problems/2026-05-30-groq-tpm-and-gemini-thinking.md).
-        # gpt-oss is demoted to a deep fallback: still there if Google is fully
-        # down, but no longer the rung that 413s on every turn. The override goes
-        # through get_google_models, so it inherits thinking-disabled settings;
-        # the _override_redundant guard collapses it onto gemini_models[0].
+        # main_assistant fallback cascade — order is TOOL-TURN-AWARE:
+        #   Gemini direct → Groq llama → Groq llama (2nd key) → Gemini via
+        #   OpenRouter → gpt-oss (last resort).
+        #
+        # Why llama sits right behind direct Gemini, AHEAD of OpenRouter + gpt-oss
+        # (the previous order tried openrouter → gpt-oss → llama, burning two
+        # guaranteed-dead hops on every tool turn — observed live on Discord):
+        #   - Gemini leads: big free-tier context, strong tool-caller when it has
+        #     quota, and fine for non-tool turns.
+        #   - When a TOOL turn fails on direct Gemini (its function-call adjacency
+        #     400, or a 429), the NEXT rung must be able to actually finish a tool
+        #     turn. OpenRouter's "gemini-2.5-flash" proxies the SAME Google backend
+        #     and reproduces the SAME adjacency 400; gpt-oss-120b deterministically
+        #     rejects Turtle's tool surface ("Tools should have a name" / 413 TPM).
+        #     Both were pure wasted round-trips in front of the real rescue.
+        #   - llama-3.3-70b on Groq is lenient about message order — it's the rung
+        #     that actually LANDS the tool turn, so it goes first after Gemini.
+        #   - OpenRouter (a Gemini variant) stays as a mid fallback for NON-tool
+        #     turns when direct Gemini is down; gpt-oss is the true last resort.
+        # The override goes through get_google_models, so it inherits
+        # thinking-disabled settings; _override_redundant collapses it onto
+        # gemini_models[0].
         main_override = _build_model_from_str(cfg.get("MAIN_AGENT_MODEL", ""), settings)
         if _override_redundant(main_override, gemini_models):
             main_override = None
-        main_head: Any = main_override or (gemini_models[0] if gemini_models else gpt_oss)
-        # Groq llama is the final rescue: if every Gemini variant 400s on
-        # function-call adjacency (Google strict, OR often proxies to the same
-        # backend), llama-3.3-70b on Groq is lenient about message order.
+        main_head: Any = main_override or (gemini_models[0] if gemini_models else groq_llama or gpt_oss)
         main_chain = build_chain(
-            main_head, gemini_models, openrouter_models, gpt_oss, groq_llama, groq_llama_small,
+            main_head, gemini_models, groq_llama, groq_llama_small, openrouter_models, gpt_oss,
         )
 
         # email_agent: Gemini direct → Gemini via OpenRouter → Llama (Groq).
