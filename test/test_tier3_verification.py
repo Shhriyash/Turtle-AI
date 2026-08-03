@@ -284,6 +284,190 @@ class TestF3Slack:
 
 
 # ---------------------------------------------------------------------------
+# F6 — Discord adapter (interactions webhook + gateway import guard)
+# ---------------------------------------------------------------------------
+
+class TestF6Discord:
+    """F6: Discord Interactions webhook — Ed25519 sig, PING, deferred command."""
+
+    def test_discord_router_importable(self):
+        from apps.channels.discord import router
+        assert router is not None
+        print("[PASS] Discord router importable")
+
+    def test_signature_verify_no_key_local_noop_cloud_fail_closed(self):
+        # No public key: no-op (accept) in local/dev, but FAIL CLOSED in cloud so
+        # a public webhook can't be driven with unsigned/spoofed requests.
+        import unittest.mock as mock
+        import apps.channels.discord as d
+        from core.config import settings
+        with mock.patch.object(d, "_public_key", return_value=""):
+            with mock.patch.object(settings, "deploy_mode", "local"):
+                assert d._verify_discord_signature(b"body", "deadbeef", "12345") is True
+            with mock.patch.object(settings, "deploy_mode", "cloud"):
+                assert d._verify_discord_signature(b"body", "deadbeef", "12345") is False
+        print("[PASS] Discord sig: local no-op, cloud fails closed without a public key")
+
+    def test_signature_verify_real_keypair(self):
+        """Prove REAL Ed25519 verification: a valid sig passes, tampering fails."""
+        from apps.channels.discord import _verify_discord_signature
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives import serialization
+        import unittest.mock as mock
+
+        private_key = ed25519.Ed25519PrivateKey.generate()
+        pub_hex = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        ).hex()
+
+        timestamp = "1700000000"
+        body = b'{"type":1}'
+        signature = private_key.sign(timestamp.encode() + body).hex()
+
+        with mock.patch("apps.channels.discord._public_key", return_value=pub_hex):
+            assert _verify_discord_signature(body, signature, timestamp) is True
+            # Tampered body must fail
+            assert _verify_discord_signature(b'{"type":2}', signature, timestamp) is False
+            # Tampered signature (all zeros) must fail
+            assert _verify_discord_signature(body, "0" * len(signature), timestamp) is False
+        print("[PASS] Discord signature verifies real Ed25519 signatures and rejects tampering")
+
+    def test_ping_returns_pong(self):
+        """PING (type 1) must be answered with PONG {'type': 1}."""
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from apps.channels.discord import router
+        import unittest.mock as mock
+
+        test_app = FastAPI()
+        test_app.include_router(router)
+
+        with mock.patch("apps.channels.discord._verify_discord_signature", return_value=True):
+            with TestClient(test_app) as client:
+                resp = client.post(
+                    "/channels/discord",
+                    json={"type": 1},
+                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": "0"},
+                )
+        assert resp.status_code == 200
+        assert resp.json().get("type") == 1
+        print("[PASS] Discord PING answered with PONG (type 1)")
+
+    def test_bad_signature_returns_401(self):
+        """Discord REQUIRES 401 (not 403) on a bad signature."""
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from apps.channels.discord import router
+        import unittest.mock as mock
+
+        test_app = FastAPI()
+        test_app.include_router(router)
+
+        with mock.patch("apps.channels.discord._verify_discord_signature", return_value=False):
+            with TestClient(test_app) as client:
+                resp = client.post(
+                    "/channels/discord",
+                    json={"type": 1},
+                    headers={"X-Signature-Ed25519": "bad", "X-Signature-Timestamp": "0"},
+                )
+        assert resp.status_code == 401
+        print("[PASS] Discord returns 401 on invalid signature")
+
+    def test_application_command_returns_deferred(self):
+        """An APPLICATION_COMMAND (type 2) must ACK with DEFERRED (type 5)."""
+        import unittest.mock as mock
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from apps.channels.discord import router
+        from apps.channels import TurtleResponse
+
+        test_app = FastAPI()
+        test_app.include_router(router)
+
+        async def _fake_dispatch(event):
+            return TurtleResponse(content="hi", channel="discord", user_id=event.user_id)
+
+        async def _fake_resolve(channel, uid):
+            return "usr_test"
+
+        async def _fake_followup(token, text):
+            return None
+
+        payload = {
+            "type": 2,
+            "id": "interaction_123",
+            "token": "tok_abc",
+            "channel_id": "chan_1",
+            "member": {"user": {"id": "999", "bot": False}},
+            "data": {"name": "turtle", "options": [{"name": "message", "value": "hello turtle"}]},
+        }
+        with mock.patch("apps.channels.discord._verify_discord_signature", return_value=True), \
+             mock.patch("apps.channels.discord.dispatch_event", side_effect=_fake_dispatch), \
+             mock.patch("apps.channels.discord._send_followup", side_effect=_fake_followup), \
+             mock.patch.object(
+                 __import__("apps.channels.discord", fromlist=["identity_manager"]).identity_manager,
+                 "resolve_user", side_effect=_fake_resolve):
+            with TestClient(test_app) as client:
+                resp = client.post(
+                    "/channels/discord",
+                    json=payload,
+                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": "0"},
+                )
+        assert resp.status_code == 200
+        assert resp.json().get("type") == 5
+        print("[PASS] Discord APPLICATION_COMMAND returns DEFERRED (type 5) and schedules dispatch")
+
+    def test_bot_authored_command_ignored(self):
+        """A bot-authored interaction must not trigger dispatch (loop guard)."""
+        import unittest.mock as mock
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from apps.channels.discord import router
+
+        test_app = FastAPI()
+        test_app.include_router(router)
+
+        dispatch_spy = mock.MagicMock()
+        payload = {
+            "type": 2,
+            "id": "interaction_456",
+            "token": "tok_def",
+            "channel_id": "chan_2",
+            "member": {"user": {"id": "888", "bot": True}},
+            "data": {"name": "turtle", "options": [{"name": "message", "value": "loop me"}]},
+        }
+        with mock.patch("apps.channels.discord._verify_discord_signature", return_value=True), \
+             mock.patch("apps.channels.discord.dispatch_event", dispatch_spy):
+            with TestClient(test_app) as client:
+                resp = client.post(
+                    "/channels/discord",
+                    json=payload,
+                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": "0"},
+                )
+        assert resp.status_code == 200
+        assert resp.json().get("type") != 5  # not deferred — ignored
+        dispatch_spy.assert_not_called()
+        print("[PASS] Discord bot-authored interaction ignored — no dispatch loop")
+
+    def test_gateway_imports_and_noops_without_deps(self):
+        """Gateway module imports cleanly without discord.py; start no-ops w/o token."""
+        import asyncio, unittest.mock as mock
+        from apps.channels import discord_gateway
+
+        # discord.py is not installed in CI — gateway must not be 'available'.
+        assert discord_gateway.gateway_available() is False
+
+        async def run():
+            with mock.patch("apps.channels.discord_gateway._bot_token", return_value=""):
+                await discord_gateway.start_discord_gateway()  # must not raise
+                await discord_gateway.stop_discord_gateway()   # must not raise
+
+        asyncio.run(run())
+        print("[PASS] Discord gateway imports cleanly and no-ops without discord.py / token")
+
+
+# ---------------------------------------------------------------------------
 # E5 — Twilio Voice adapter
 # ---------------------------------------------------------------------------
 
@@ -413,6 +597,25 @@ class TestChannelConfig:
         assert "sendblue_api_key" in fields
         assert "sendblue_api_secret" in fields
         print("[PASS] SendBlue fields declared in TurtleSettings")
+
+    def test_discord_fields_present(self):
+        from core.config import TurtleSettings
+        fields = TurtleSettings.model_fields
+        assert "discord_bot_token" in fields
+        assert "discord_public_key" in fields
+        assert "discord_application_id" in fields
+        print("[PASS] Discord fields declared in TurtleSettings")
+
+    def test_discord_fields_default_to_none(self):
+        import unittest.mock as mock, os
+        with mock.patch.dict(os.environ):
+            for var in ("DISCORD_BOT_TOKEN", "DISCORD_PUBLIC_KEY", "DISCORD_APPLICATION_ID"):
+                os.environ.pop(var, None)
+            from core.config import TurtleSettings
+            s = TurtleSettings(_env_file=None)
+        for field in ("discord_bot_token", "discord_public_key", "discord_application_id"):
+            assert getattr(s, field) is None, f"{field} should default to None"
+        print("[PASS] Discord credential fields default to None")
 
     def test_all_channel_fields_default_to_none(self):
         import unittest.mock as mock, os

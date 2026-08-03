@@ -27,6 +27,7 @@ import { escapeHtml, showToast } from './utils.js';
 
 const PENDING_URL = '/api/memory/pending';
 const CONFIRM_URL = '/api/memory/confirm';
+const PROFILE_URL = '/api/memory/profile';
 
 // ── Server calls ─────────────────────────────────────────────
 
@@ -78,6 +79,22 @@ async function fetchPending() {
         throw new Error(data.error || `Request failed (${res.status})`);
     }
     return Array.isArray(data.pending) ? data.pending : [];
+}
+
+/** What Turtle already remembers about the caller (durable, confirmed). */
+async function fetchProfile() {
+    let res;
+    try {
+        res = await fetch(PROFILE_URL, { credentials: 'same-origin' });
+    } catch (_) {
+        throw new Error('Network error');
+    }
+    let data = {};
+    try { data = await res.json(); } catch (_) { /* non-JSON body */ }
+    if (!res.ok) {
+        throw new Error(data.error || `Request failed (${res.status})`);
+    }
+    return Array.isArray(data.topics) ? data.topics : [];
 }
 
 // ── Small builders ───────────────────────────────────────────
@@ -177,6 +194,10 @@ function panelEls() {
         panel: document.getElementById('memory-panel'),
         toggle: document.getElementById('btn-memory-toggle'),
         list: document.getElementById('memory-pending-list'),
+        remembered: document.getElementById('memory-remembered-list'),
+        tabRemembered: document.getElementById('memory-tab-remembered'),
+        tabPending: document.getElementById('memory-tab-pending'),
+        pendingCount: document.getElementById('memory-pending-count'),
     };
 }
 
@@ -270,14 +291,94 @@ export async function refreshPendingPanel() {
     }
 }
 
-/** Open/close the pending-memories panel. */
+// ── "What I remember" panel (durable profile) ────────────────
+
+/** Fetch the caller's remembered profile and render it as topic groups. */
+export async function refreshRememberedPanel() {
+    const { remembered } = panelEls();
+    if (!remembered) return;
+
+    let topics;
+    try {
+        topics = await fetchProfile();
+    } catch (e) {
+        remembered.innerHTML = '';
+        const errEl = document.createElement('div');
+        errEl.className = 'memory-empty';
+        errEl.textContent = e.message || 'Could not load your memory.';
+        remembered.appendChild(errEl);
+        return;
+    }
+
+    remembered.innerHTML = '';
+    if (!topics.length) {
+        const empty = document.createElement('div');
+        empty.className = 'memory-empty';
+        empty.textContent = "I don't know anything about you yet — tell me about yourself and I'll remember.";
+        remembered.appendChild(empty);
+        return;
+    }
+    for (const t of topics) {
+        const group = document.createElement('div');
+        group.className = 'mem-topic';
+        const title = document.createElement('div');
+        title.className = 'mem-topic-title';
+        title.textContent = t.title || t.topic || 'Memory';
+        group.appendChild(title);
+        const ul = document.createElement('ul');
+        ul.className = 'mem-topic-lines';
+        for (const line of (t.lines || [])) {
+            const li = document.createElement('li');
+            li.textContent = line;
+            ul.appendChild(li);
+        }
+        group.appendChild(ul);
+        remembered.appendChild(group);
+    }
+}
+
+// ── Tab switching ────────────────────────────────────────────
+
+let _activeView = 'remembered';
+
+function setActiveView(view) {
+    const { list, remembered, tabRemembered, tabPending } = panelEls();
+    _activeView = view === 'pending' ? 'pending' : 'remembered';
+    const showPending = _activeView === 'pending';
+    if (remembered) remembered.style.display = showPending ? 'none' : '';
+    if (list) list.style.display = showPending ? '' : 'none';
+    if (tabRemembered) tabRemembered.classList.toggle('active', !showPending);
+    if (tabPending) tabPending.classList.toggle('active', showPending);
+    if (showPending) refreshPendingPanel();
+    else refreshRememberedPanel();
+}
+
+/** Update the "To confirm" badge with the pending count (best-effort). */
+async function updatePendingBadge() {
+    const { pendingCount } = panelEls();
+    if (!pendingCount) return;
+    try {
+        const items = await fetchPending();
+        const n = items.length;
+        pendingCount.textContent = n ? String(n) : '';
+        pendingCount.style.display = n ? '' : 'none';
+    } catch (_) {
+        pendingCount.textContent = '';
+        pendingCount.style.display = 'none';
+    }
+}
+
+/** Open/close the memory panel. */
 export function toggleMemoryPanel() {
     const { panel, toggle } = panelEls();
     if (!panel) return;
     const open = !panel.classList.contains('open');
     panel.classList.toggle('open', open);
     if (toggle) toggle.classList.toggle('active', open);
-    if (open) refreshPendingPanel();
+    if (open) {
+        setActiveView('remembered');  // default to "what I remember"
+        updatePendingBadge();
+    }
 }
 
 function closeMemoryPanel() {
@@ -286,14 +387,21 @@ function closeMemoryPanel() {
     if (toggle) toggle.classList.remove('active');
 }
 
-/** Wire the panel toggle + close button. Safe if elements are absent. */
+/** Wire the panel toggle + close + tabs. Safe if elements are absent. */
 export function initMemoryUI() {
-    const { toggle } = panelEls();
+    const { toggle, tabRemembered, tabPending } = panelEls();
     if (toggle) toggle.addEventListener('click', toggleMemoryPanel);
 
     const closeBtn = document.getElementById('btn-memory-close');
     if (closeBtn) closeBtn.addEventListener('click', closeMemoryPanel);
 
     const refreshBtn = document.getElementById('btn-memory-refresh');
-    if (refreshBtn) refreshBtn.addEventListener('click', refreshPendingPanel);
+    if (refreshBtn) refreshBtn.addEventListener('click', () => {
+        // Refresh whichever view is active, plus the badge.
+        setActiveView(_activeView);
+        updatePendingBadge();
+    });
+
+    if (tabRemembered) tabRemembered.addEventListener('click', () => setActiveView('remembered'));
+    if (tabPending) tabPending.addEventListener('click', () => setActiveView('pending'));
 }

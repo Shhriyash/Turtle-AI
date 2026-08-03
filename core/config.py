@@ -78,6 +78,11 @@ class TurtleSettings(BaseSettings):
     slack_bot_token: Optional[SecretStr] = Field(default=None, alias="SLACK_BOT_TOKEN")
     slack_signing_secret: Optional[SecretStr] = Field(default=None, alias="SLACK_SIGNING_SECRET")
 
+    # Channel Adapters — Discord (registered BOT application; never a self-bot)
+    discord_bot_token: Optional[SecretStr] = Field(default=None, alias="DISCORD_BOT_TOKEN")
+    discord_public_key: Optional[SecretStr] = Field(default=None, alias="DISCORD_PUBLIC_KEY")
+    discord_application_id: Optional[str] = Field(default=None, alias="DISCORD_APPLICATION_ID")
+
     # Channel Adapters — SendBlue (iMessage)
     sendblue_api_key: Optional[SecretStr] = Field(default=None, alias="SENDBLUE_API_KEY")
     sendblue_api_secret: Optional[SecretStr] = Field(default=None, alias="SENDBLUE_API_SECRET")

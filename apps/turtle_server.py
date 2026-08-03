@@ -2126,6 +2126,30 @@ async def _stop_routine_scheduler() -> None:
     _routine_scheduler = None
 
 
+@app.on_event("startup")
+async def _start_discord_gateway_hook() -> None:
+    # Optional natural-DM/@mention bot. Guarded so absence of discord.py or a
+    # bot token is a clean no-op (see apps/channels/discord_gateway.py). The
+    # zero-dependency slash-command webhook (/channels/discord) works regardless.
+    try:
+        from apps.channels.discord_gateway import start_discord_gateway
+        # start_discord_gateway spawns the gateway client as its own background
+        # task and returns immediately, so awaiting it here is safe (no startup
+        # block) and avoids leaving an untracked outer task.
+        await start_discord_gateway()
+    except Exception as e:
+        print(f"LOG: discord gateway startup skipped: {e}")
+
+
+@app.on_event("shutdown")
+async def _stop_discord_gateway_hook() -> None:
+    try:
+        from apps.channels.discord_gateway import stop_discord_gateway
+        await stop_discord_gateway()
+    except Exception as e:
+        print(f"LOG: discord gateway shutdown error: {e}")
+
+
 @app.on_event("shutdown")
 async def _flush_trace_spans() -> None:
     # Drain the BatchSpanProcessor's in-memory buffer; without this, spans from
@@ -2171,11 +2195,13 @@ from apps.channels.whatsapp import router as _whatsapp_router
 from apps.channels.imessage import router as _imessage_router
 from apps.channels.slack import router as _slack_router
 from apps.channels.twilio_voice import router as _twilio_voice_router
+from apps.channels.discord import router as _discord_router
 
 app.include_router(_whatsapp_router)
 app.include_router(_imessage_router)
 app.include_router(_slack_router)
 app.include_router(_twilio_voice_router)
+app.include_router(_discord_router)
 
 from apps.onboarding_routes import router as _onboarding_router, verify_session_cookie
 app.include_router(_onboarding_router)
@@ -2700,6 +2726,48 @@ async def confirm_memory(request: Request):
         if result.topic == "workflow":
             _register_user_routines_safe(state)
     return JSONResponse({"status": "ok", "applied": accepted})
+
+
+@app.get("/api/memory/profile")
+async def get_memory_profile(request: Request):
+    """Return everything Turtle currently remembers ABOUT THE CALLER.
+
+    Read straight from the rendered topic files on disk (the applied, confirmed
+    projection), so it reflects the durable memory and works even without an
+    active WebSocket session. This is the user-facing "what do you remember
+    about me" view; /api/memory/pending is the separate confirm-these queue.
+    """
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    from core.personal_memory_store import PersonalMemoryStore  # noqa: PLC0415
+    from core.memory_schema import TOPICS  # noqa: PLC0415
+
+    store = PersonalMemoryStore(user_id=user_id)
+    topics: list[dict[str, Any]] = []
+    for topic_key, spec in TOPICS.items():
+        try:
+            doc = store.load_topic(topic_key)
+        except Exception:
+            continue
+        # Rendered lines look like "- Name: Maya Chen"; strip the bullet for a
+        # clean display list, drop blanks.
+        lines = [
+            str(line).strip().lstrip("- ").strip()
+            for line in (doc.lines or [])
+            if str(line).strip()
+        ]
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            continue
+        topics.append({
+            "topic": topic_key,
+            "title": spec.title,
+            "summary": spec.summary,
+            "lines": lines,
+        })
+    return JSONResponse({"topics": topics, "empty": len(topics) == 0})
 
 
 # ---------------------------------------------------------------------------

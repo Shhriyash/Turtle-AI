@@ -194,3 +194,69 @@
         z-index: 100;
     }
 }
+
+/* ── Tabs (What I remember | To confirm) ─────────────────────── */
+.memory-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 8px 12px 0;
+    border-bottom: 1px solid var(--border);
+}
+.memory-tab {
+    flex: 1;
+    padding: 8px 10px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.15s var(--ease-out), border-color 0.15s var(--ease-out);
+}
+.memory-tab:hover { color: var(--text-primary); }
+.memory-tab.active {
+    color: var(--accent-secondary);
+    border-bottom-color: var(--accent-secondary);
+}
+.memory-pending-badge:not(:empty) {
+    display: inline-block;
+    margin-left: 6px;
+    min-width: 16px;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: var(--accent-secondary);
+    color: #fff;
+    font-size: 10px;
+    line-height: 16px;
+    text-align: center;
+}
+
+/* ── "What I remember" topic groups ──────────────────────────── */
+.mem-topic {
+    padding: 12px 14px;
+    border-radius: var(--radius-md);
+    background: var(--bg-glass);
+    border: 1px solid var(--border);
+}
+.mem-topic + .mem-topic { margin-top: 8px; }
+.mem-topic-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--accent-secondary);
+    margin-bottom: 6px;
+}
+.mem-topic-lines {
+    margin: 0;
+    padding-left: 16px;
+    list-style: disc;
+}
+.mem-topic-lines li {
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--text-primary);
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}

@@ -40,3 +40,10 @@ logfire==4.27.0
 apscheduler>=3.10.4
 sqlalchemy>=2.0
 
+# Discord gateway (natural DM/@mention bot mode ONLY). The interactions-webhook
+# mode in apps/channels/discord.py needs no extra deps — it verifies Ed25519
+# signatures with `cryptography` (already present above). Not importing this at
+# module load: apps/channels/discord_gateway.py guards the import so the app and
+# test suite run cleanly without it installed.
+discord.py>=2.3
+

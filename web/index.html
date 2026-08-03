@@ -144,7 +144,14 @@
                     </button>
                 </div>
             </div>
-            <div class="memory-panel-list" id="memory-pending-list">
+            <div class="memory-tabs" role="tablist">
+                <button class="memory-tab active" id="memory-tab-remembered" data-view="remembered" role="tab">What I remember</button>
+                <button class="memory-tab" id="memory-tab-pending" data-view="pending" role="tab">To confirm<span class="memory-pending-badge" id="memory-pending-count"></span></button>
+            </div>
+            <div class="memory-panel-list" id="memory-remembered-list">
+                <!-- Remembered profile rendered here by memory.js -->
+            </div>
+            <div class="memory-panel-list" id="memory-pending-list" style="display:none">
                 <!-- Pending candidates rendered here by memory.js -->
             </div>
         </aside>
@@ -161,24 +168,12 @@
                 <div class="dev-section">
                     <div class="dev-section-title">Agent Models</div>
                     <div class="dev-field">
-                        <label for="dev-main-agent-model">Main Orchestrator</label>
+                        <label for="dev-main-agent-model">Main Assistant</label>
                         <select id="dev-main-agent-model"></select>
                     </div>
                     <div class="dev-field">
-                        <label for="dev-email-agent-model">Email Agent</label>
+                        <label for="dev-email-agent-model">Email Specialist</label>
                         <select id="dev-email-agent-model"></select>
-                    </div>
-                    <div class="dev-field">
-                        <label for="dev-dream-agent-model">Dream Pass Reviewer</label>
-                        <select id="dev-dream-agent-model"></select>
-                    </div>
-                    <div class="dev-field">
-                        <label for="dev-router-agent-model">Intent Router (Groq only)</label>
-                        <select id="dev-router-agent-model"></select>
-                    </div>
-                    <div class="dev-field dev-field-inline">
-                        <label for="dev-dream-pass-enabled">Enable Dream Pass</label>
-                        <input type="checkbox" id="dev-dream-pass-enabled">
                     </div>
                 </div>
                 <div class="dev-section">
