@@ -502,15 +502,25 @@ def _trim_history_for_context(history: list[ModelMessage]) -> list[ModelMessage]
     while trimmed and sum(len(str(m)) // 4 for m in trimmed) > ACTIVE_HISTORY_MAX_TOKENS:
         trimmed = trimmed[1:]
 
-    while trimmed and isinstance(trimmed[0], ModelResponse):
-        trimmed = trimmed[1:]
+    # ── Front normalization (pair-aware) ──────────────────────────────────
+    # Gemini rejects a window that starts with an ORPHAN function_response
+    # ("Please ensure that function response turn comes immediately after a
+    # function call turn"), and pydantic-ai's empty-user-turn prepend repairs a
+    # leading function_CALL but NOT a leading function_RESPONSE. Two rules:
+    #   1. Drop a leading dangling assistant turn (ModelResponse) — UNLESS it
+    #      carries a ToolCallPart whose ToolReturnPart still survives, because
+    #      dropping it would orphan that return (the exact bug that made the
+    #      token-trim above turn [user, call, return] into a lone [return] and
+    #      400 Gemini on every memory-context-bloated tool turn).
+    #   2. Drop leading orphan tool-return turns whose call was trimmed away.
+    def _surviving_return_ids(msgs: list[ModelMessage]) -> set[str]:
+        return {
+            p.tool_call_id
+            for m in msgs if isinstance(m, ModelRequest)
+            for p in m.parts
+            if isinstance(p, ToolReturnPart) and p.tool_call_id
+        }
 
-    # Pair-aware front trim: a leading ModelRequest whose only parts are
-    # ToolReturnPart / tool-tied RetryPromptPart is necessarily an orphan —
-    # the originating ToolCallPart precedes it in conversation order, and
-    # anything before the front of `trimmed` has already been discarded. Drop
-    # it. Gemini direct rejects such histories with INVALID_ARGUMENT, and
-    # even on lenient providers it confuses the model.
     def _is_leading_orphan(msg: ModelMessage) -> bool:
         if not isinstance(msg, ModelRequest):
             return False
@@ -522,33 +532,43 @@ def _trim_history_for_context(history: list[ModelMessage]) -> list[ModelMessage]
             for p in msg.parts
         )
 
-    while len(trimmed) > 1 and _is_leading_orphan(trimmed[0]):
-        trimmed = trimmed[1:]
-
-    # Guardrail: ensure at least one real user prompt remains in context.
-    # Without this, long tool-call loops can leave only tool request/return turns,
-    # causing the model to respond as if no user question was asked.
-    if trimmed and not any(_is_user_turn_request(m) for m in trimmed):
-        latest_user_index = -1
-        for index in range(len(history) - 1, -1, -1):
-            if _is_user_turn_request(history[index]):
-                latest_user_index = index
+    def _front_normalize(msgs: list[ModelMessage]) -> list[ModelMessage]:
+        out = list(msgs)
+        while out:
+            head = out[0]
+            if isinstance(head, ModelResponse):
+                rids = _surviving_return_ids(out[1:])
+                if any(
+                    isinstance(p, ToolCallPart) and p.tool_call_id in rids
+                    for p in head.parts
+                ):
+                    break  # leading model(tool_call) paired with a surviving return — keep the pair
+                out = out[1:]
+            elif _is_leading_orphan(head):
+                out = out[1:]  # orphan return (call already gone) — drop even at length 1
+            else:
                 break
-        if latest_user_index >= 0:
-            candidate = history[latest_user_index:]
-            if len(candidate) > ACTIVE_HISTORY_MAX_MESSAGES:
-                candidate = candidate[-ACTIVE_HISTORY_MAX_MESSAGES:]
-            while (
-                len(candidate) > 1
-                and sum(len(str(m)) // 4 for m in candidate) > ACTIVE_HISTORY_MAX_TOKENS
-            ):
-                candidate = candidate[1:]
-            while candidate and not _is_user_turn_request(candidate[0]):
-                candidate = candidate[1:]
-            if candidate:
-                return candidate
+        return out
 
-    return trimmed or history[-ACTIVE_HISTORY_MAX_MESSAGES:]
+    trimmed = _front_normalize(trimmed)
+
+    # Validity guardrail. The window must be non-empty, contain a real user
+    # prompt, and NOT start with an orphan tool-return. If trimming left it
+    # empty/invalid, fall back to the tail of the ORIGINAL history — which keeps
+    # the active turn's user→call→return intact. A slightly-over-budget but VALID
+    # window always beats a malformed one that 400s the model.
+    def _valid_window(msgs: list[ModelMessage]) -> bool:
+        return (
+            bool(msgs)
+            and not _is_leading_orphan(msgs[0])
+            and any(_is_user_turn_request(m) for m in msgs)
+        )
+
+    if not _valid_window(trimmed):
+        tail = _front_normalize(history[-ACTIVE_HISTORY_MAX_MESSAGES:])
+        return tail or history[-ACTIVE_HISTORY_MAX_MESSAGES:]
+
+    return trimmed
 
 
 def _persist_history(prior: list[ModelMessage] | None, response: Any) -> list[ModelMessage]:
