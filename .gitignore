@@ -29,6 +29,12 @@ venv.bak/
 # Markdown (keep only root README.md)
 **/*.md
 !README.md
+# ...but tool-contract prompts are load-bearing: _load_tool_contract() reads
+# them at runtime as each tool's description, and tests assert they exist. They
+# must be tracked, or a fresh clone (incl. CI) degrades every tool to
+# "Tool: {name}" and the contract tests fail.
+!core/system_prompts/tools/
+!core/system_prompts/tools/*.md
 
 # IDE / OS
 .vscode/
