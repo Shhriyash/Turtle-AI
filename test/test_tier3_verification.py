@@ -450,21 +450,31 @@ class TestF6Discord:
         dispatch_spy.assert_not_called()
         print("[PASS] Discord bot-authored interaction ignored — no dispatch loop")
 
-    def test_gateway_imports_and_noops_without_deps(self):
-        """Gateway module imports cleanly without discord.py; start no-ops w/o token."""
+    def test_gateway_imports_and_noops_without_token(self):
+        """Gateway module imports cleanly and no-ops with no token.
+
+        Environment-independent: whether or not discord.py is installed and
+        whether or not a real DISCORD_BOT_TOKEN is present in the ambient env,
+        an EMPTY token must make the gateway unavailable and start/stop clean
+        no-ops. (The old form asserted discord.py was absent, which breaks the
+        moment the gateway dependency is actually installed for live testing.)
+        """
         import asyncio, unittest.mock as mock
         from apps.channels import discord_gateway
 
-        # discord.py is not installed in CI — gateway must not be 'available'.
-        assert discord_gateway.gateway_available() is False
+        # Import guard resolves to a bool either way (deps present or not).
+        assert isinstance(discord_gateway._DISCORD_IMPORT_OK, bool)
 
-        async def run():
-            with mock.patch("apps.channels.discord_gateway._bot_token", return_value=""):
+        with mock.patch("apps.channels.discord_gateway._bot_token", return_value=""):
+            # No token → never 'available', regardless of discord.py presence.
+            assert discord_gateway.gateway_available() is False
+
+            async def run():
                 await discord_gateway.start_discord_gateway()  # must not raise
                 await discord_gateway.stop_discord_gateway()   # must not raise
 
-        asyncio.run(run())
-        print("[PASS] Discord gateway imports cleanly and no-ops without discord.py / token")
+            asyncio.run(run())
+        print("[PASS] Discord gateway imports cleanly and no-ops without a token")
 
 
 # ---------------------------------------------------------------------------

@@ -124,13 +124,27 @@ async def start_discord_gateway() -> None:
     # startup returns immediately.
     _client_task = asyncio.create_task(client.start(_bot_token()))
 
+    def _log_gateway_exit(task: "asyncio.Task") -> None:
+        # Surface a silent connection failure instead of letting the exception
+        # die inside the detached task. The common causes are an invalid bot
+        # token (LoginFailure) or the privileged message_content intent not
+        # being enabled under Bot → Privileged Gateway Intents in the Developer
+        # Portal (PrivilegedIntentsRequired) — both otherwise vanish here.
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            print(f"LOG: discord gateway stopped: {exc.__class__.__name__}: {exc}", flush=True)
+
+    _client_task.add_done_callback(_log_gateway_exit)
+
     try:
         from core.worker import track_task
         track_task(_client_task)
     except Exception:
         pass
 
-    print("LOG: discord gateway starting")
+    print("LOG: discord gateway starting", flush=True)
 
 
 async def stop_discord_gateway() -> None:

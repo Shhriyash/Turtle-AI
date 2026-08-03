@@ -2159,6 +2159,15 @@ async def _start_discord_gateway_hook() -> None:
     # Optional natural-DM/@mention bot. Guarded so absence of discord.py or a
     # bot token is a clean no-op (see apps/channels/discord_gateway.py). The
     # zero-dependency slash-command webhook (/channels/discord) works regardless.
+    #
+    # Never open a REAL gateway connection under pytest: many tests enter the
+    # app lifespan via `with TestClient(app)`, and with a live token present in
+    # the environment each would connect+disconnect a bot session. That churn
+    # can exhaust Discord's session-start/IDENTIFY allowance and temporarily
+    # lock the live bot out of the gateway. Tests that need the gateway patch it.
+    import sys
+    if "pytest" in sys.modules:
+        return
     try:
         from apps.channels.discord_gateway import start_discord_gateway
         # start_discord_gateway spawns the gateway client as its own background
