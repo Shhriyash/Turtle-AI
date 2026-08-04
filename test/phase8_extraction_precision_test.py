@@ -142,6 +142,32 @@ def test_short_substring_facts_are_length_gated(pm_root):
     assert len(_applied_topic_events(state, "identity")) == 2
 
 
+def test_add_mode_accumulates_multiple_values(pm_root):
+    """mode='add' keeps every distinct value (the 3-emails bug): each lands on
+    its own value-embedded key and survives the latest-per-key collapse."""
+    state = _real_state("usr_multi", "sess_multi")
+    emails = ["shriyashbeohar1@gmail.com", "shriyashbeohar@gmail.com", "beoharshriyash@gmail.com"]
+    for addr in emails:
+        r = ts._store_remembered_fact(
+            state, topic="identity", key_slug="email", value_text=addr, mode="add"
+        )
+        assert r.startswith("Stored:")
+    evs = _applied_topic_events(state, "identity")
+    keys = {e.key for e in evs}
+    assert len(keys) == 3, f"emails clobbered — expected 3 distinct keys, got {keys}"
+    stored = {list(e.value.values())[0] for e in evs}
+    assert stored == set(emails)
+
+
+def test_replace_mode_keeps_single_canonical_slot(pm_root):
+    """mode='replace' (default) keeps one slot per key — a correction supersedes."""
+    state = _real_state("usr_repl", "sess_repl")
+    ts._store_remembered_fact(state, topic="identity", key_slug="city", value_text="Indore")
+    ts._store_remembered_fact(state, topic="identity", key_slug="city", value_text="Mumbai", mode="replace")
+    keys = {e.key for e in _applied_topic_events(state, "identity")}
+    assert keys == {"identity.city"}  # single canonical slot; projection shows the latest
+
+
 def test_contained_value_different_session_does_not_collapse(pm_root):
     """The containment backstop is session-scoped: it only catches the model's
     redundant double-call within ONE session. A contained restatement in a LATER

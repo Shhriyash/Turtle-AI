@@ -1360,6 +1360,7 @@ def _store_remembered_fact(
     topic: str,
     key_slug: str,
     value_text: str,
+    mode: str = "replace",
 ) -> str:
     """Persist an explicit user-stated fact; return the agent-facing result string.
 
@@ -1367,8 +1368,22 @@ def _store_remembered_fact(
     the storage-cap failure path can be unit tested. On a cap breach the fact is
     NOT saved: the user is notified and an honest failure string is returned
     instead of a fabricated "Stored".
+
+    mode="add" (model-chosen) stores an ADDITIONAL value for a multi-valued fact
+    (another email, phone, project…): the value is slugged into the key so each
+    distinct value gets its own (topic,key) slot and survives the latest-per-key
+    projection collapse — instead of overwriting the previous value. mode="replace"
+    (default) keeps the single canonical slot for single-valued facts/corrections.
     """
     from core.memory_journal import generate_event_id
+    import re as _re
+
+    additive = (mode or "replace").strip().lower() == "add"
+    if additive:
+        value_slug = _re.sub(r"[^a-z0-9]+", "_", value_text.lower()).strip("_")[:40] or "value"
+        stored_key_slug = f"{key_slug}.{value_slug}"
+    else:
+        stored_key_slug = key_slug
 
     # Bug B backstop: the model sometimes calls `remember` twice for one fact
     # under two keys (e.g. projects.codename_atlas="I'm working on a project
@@ -1376,11 +1391,12 @@ def _store_remembered_fact(
     # restated fact — same topic, same session, where one applied value contains
     # the other — into the entry already stored. Length-gated (>=4 chars) and
     # skip-not-supersede so short distinct facts ("Sam" vs "Sam Smith") and
-    # already-applied data are never clobbered. The tool contract (remember.md)
-    # is the primary fix; this only catches the model's redundant second call.
+    # already-applied data are never clobbered. SKIPPED for mode="add": additive
+    # values are meant to accumulate, and one email being a substring of another
+    # must never silently drop it.
     new_norm = (value_text or "").strip().lower()
     session_id = state.session_store.session_id or "unknown_session"
-    if len(new_norm) >= 4:
+    if not additive and len(new_norm) >= 4:
         try:
             recent = state.journal_store.load_all()[-50:]
         except Exception:
@@ -1403,7 +1419,7 @@ def _store_remembered_fact(
             event_id=generate_event_id(),
             kind="fact",
             topic=topic,
-            key=f"{topic}.{key_slug}",
+            key=f"{topic}.{stored_key_slug}",
             value={"value": value_text},
             confidence=1.0,
             source="explicit",
@@ -1434,14 +1450,14 @@ def _store_remembered_fact(
         # regenerates on the next successful replay.
         _notify_storage_cap(state)
         return (
-            f"Noted: {topic}.{key_slug} = {value_text}. But memory storage is at "
+            f"Noted: {topic}.{stored_key_slug} = {value_text}. But memory storage is at "
             "its cap, so my memory files couldn't refresh — ask me to forget "
             "things to free up space."
         )
     except Exception as e:
         print(f"LOG: remember-tool replay failed after journal append: {e}")
 
-    return ToolResult.ok(f"Stored: {topic}.{key_slug} = {value_text}").to_agent_string()
+    return ToolResult.ok(f"Stored: {topic}.{stored_key_slug} = {value_text}").to_agent_string()
 
 
 def _apply_explicit_facts_from_turn(
@@ -1587,6 +1603,18 @@ class RememberArgs(_RememberBaseModel):
     value: str = _RememberField(
         ...,
         description="The fact as stated by the user.",
+    )
+    mode: str = _RememberField(
+        "replace",
+        description=(
+            "'replace' (default) for a single-valued fact or a correction — the "
+            "new value supersedes any previous value under this key. 'add' when "
+            "the user is providing ANOTHER value for something they can have "
+            "several of (e.g. an additional email, phone, address, or project) — "
+            "it accumulates alongside the existing values instead of overwriting "
+            "them. Use 'add' whenever the user says things like 'also', 'another', "
+            "'add', or lists more than one."
+        ),
     )
 
 
@@ -2112,11 +2140,14 @@ class AgentManager:
 
             import re as _re
             key_slug = _re.sub(r"[^a-z0-9]+", "_", key_slug).strip("_") or "note"
+            mode = (args.mode or "replace").strip().lower()
+            if mode not in {"replace", "add"}:
+                mode = "replace"
 
             # Store + storage-cap handling lives in a module-level helper so the
             # cap-failure path is unit testable (this tool is a closure).
             return _store_remembered_fact(
-                ctx.deps, topic=topic, key_slug=key_slug, value_text=value_text
+                ctx.deps, topic=topic, key_slug=key_slug, value_text=value_text, mode=mode
             )
 
         # Register the identical toolset on every rung of the cascade:
