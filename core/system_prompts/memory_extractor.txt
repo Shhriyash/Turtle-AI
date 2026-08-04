@@ -23,6 +23,14 @@ Do NOT extract:
 - Facts that are already confirmed in the profile snapshot (no duplicates)
 </task>
 
+<source_classification>
+Set "source" to "explicit" when the user stated the fact about THEMSELVES, in first person, in this conversation — even if they said it while asking for something else. Examples that are explicit: "my email is X", "that's my gmail", "send it to X (that's mine)", "call me Y", "I'm Y", "I live in Z", "I work at W", "my number is N". A self-disclosure is explicit regardless of the surrounding task.
+
+Set "source" to "inferred" only when you DEDUCED the fact indirectly rather than the user stating it (e.g. guessing their timezone from a mentioned city, or their role from how they describe their work).
+
+Put the user's own words in "evidence" so an explicit fact stays grounded.
+</source_classification>
+
 <output_format>
 Return a single JSON object with a "facts" array. Each facts item has:
 {
@@ -33,7 +41,7 @@ Return a single JSON object with a "facts" array. Each facts item has:
       "value": "<the extracted value as a string>",
       "confidence": "<confirmed|inferred>",
       "source": "<explicit|inferred>",
-      "evidence": "<exact user quote or paraphrase>"
+      "evidence": "<the user's EXACT words containing the value — quote verbatim, never paraphrase>"
     }
   ]
 }

@@ -672,13 +672,31 @@ def _extract_stage_b_json_array(raw_text: str) -> list[dict[str, object]]:
 
 
 def _evidence_supports_value(value: dict, evidence: dict) -> bool:
-    """Explicit facts must be grounded: every leaf string of the value must
-    appear (case-insensitively) in the evidence text, else downgrade."""
+    """Explicit facts must be grounded in what the user actually said — every leaf
+    of the value must be traceable to the evidence, else it's downgraded to
+    inferred (→ pending). Normalization-robust: a lightly-canonicalized value
+    still counts as grounded (the model rendering the user's "...@gmail" as
+    "...@gmail.com", or spacing/casing differences), while a hallucinated value
+    (a distinctive token the user never said) does not.
+
+    A verbatim case-insensitive substring passes immediately. Otherwise every
+    SIGNIFICANT (>=4 char) token of the value must appear in the evidence,
+    ignoring case/punctuation/spacing — short tokens (a trailing "com", articles)
+    are not required, so canonicalization doesn't strand a genuine self-disclosure.
+    """
     evidence_text = json.dumps(evidence, ensure_ascii=False).lower()
+    ev_squashed = re.sub(r"[^a-z0-9]", "", evidence_text)
     leaves = [str(v).strip().lower() for v in value.values() if isinstance(v, (str, int, float)) and str(v).strip()]
     if not leaves:
         return False
-    return all(leaf in evidence_text for leaf in leaves)
+    for leaf in leaves:
+        if leaf in evidence_text:
+            continue
+        sig = [t for t in re.split(r"[^a-z0-9]+", leaf) if len(t) >= 4]
+        if sig and all(t in ev_squashed for t in sig):
+            continue
+        return False
+    return True
 
 
 def _stage_b_turns_from_messages(
@@ -782,7 +800,10 @@ async def run_stage_b_session_extractor(
         "Return ONLY JSON array. No prose.\n"
         "Each item must include: kind, topic, key, value, confidence, source, evidence.\n"
         "Rules:\n"
-        "- source: explicit ONLY when the user stated the fact in their own words and evidence quotes them verbatim; otherwise inferred or synthesized.\n"
+        "- source: explicit when the user stated the fact about THEMSELVES in their "
+        "own words (a first-person self-disclosure like \"my email is X\", \"that's my "
+        "gmail\", \"call me Y\", \"I live in Z\") — even if said while asking for "
+        "something else — and evidence quotes them verbatim; otherwise inferred or synthesized.\n"
         "- confidence in [0,1].\n"
         "- topic in: identity, preferences, workflow, contacts, relations, projects, corrections, working_style, communication_style, tool_preferences, decision_style.\n"
         "- key should be stable dotted path.\n"
