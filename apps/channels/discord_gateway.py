@@ -123,6 +123,15 @@ async def start_discord_gateway() -> None:
         try:
             user_id = await identity_manager.resolve_user("discord", str(message.author.id))
             print(f"LOG: discord dispatching turn user_id={user_id} text={text[:80]!r}", flush=True)
+            # Discord hands us a display name on every message; pass it so a
+            # first-contact user gets a seeded profile instead of being a
+            # nameless shell. Prefer the friendly display name over the handle.
+            sender_name = (
+                getattr(message.author, "display_name", "")
+                or getattr(message.author, "global_name", "")
+                or getattr(message.author, "name", "")
+                or ""
+            )
             turtle_event = TurtleEvent(
                 user_id=user_id,
                 channel="discord",
@@ -130,6 +139,7 @@ async def start_discord_gateway() -> None:
                 content=text,
                 message_id=str(message.id),
                 thread_id=str(message.channel.id),
+                sender_name=str(sender_name),
             )
             response: TurtleResponse = await dispatch_event(turtle_event)
             await message.channel.send(response.content[:_MAX_REPLY_CHARS])

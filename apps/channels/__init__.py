@@ -34,6 +34,11 @@ class TurtleEvent:
     message_id: str = ""
     thread_id: str = ""
     attachments: list[dict] = field(default_factory=list)
+    # Platform display name of the sender, when the channel supplies one.
+    # Used for first-contact provisioning so a channel user isn't a nameless
+    # shell (see core/user_provisioning.py). A weak signal — never overrides a
+    # name the user states themselves.
+    sender_name: str = ""
 
 
 @dataclass

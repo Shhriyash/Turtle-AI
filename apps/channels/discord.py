@@ -224,6 +224,11 @@ async def discord_interactions(request: Request):
             # Discord's timeout. Deliver a graceful message instead.
             try:
                 user_id = await identity_manager.resolve_user("discord", discord_user_id)
+                sender_name = str(
+                    user_obj.get("global_name")
+                    or user_obj.get("username")
+                    or ""
+                )
                 turtle_event = TurtleEvent(
                     user_id=user_id,
                     channel="discord",
@@ -231,6 +236,7 @@ async def discord_interactions(request: Request):
                     content=text,
                     message_id=interaction_id,
                     thread_id=channel_id,
+                    sender_name=sender_name,
                 )
                 response: TurtleResponse = await dispatch_event(turtle_event)
                 await _send_followup(interaction_token, response.content or "…")

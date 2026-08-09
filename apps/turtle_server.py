@@ -2528,6 +2528,20 @@ async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
     """
     now = time.monotonic()
     _evict_stale_channel_states(now)
+
+    # First-contact provisioning. Web users are seeded at /onboarding/start;
+    # channel users arrived as empty shells with no name and no identity.md,
+    # so Turtle greeted a stranger every time and had nothing to personalise
+    # with. Idempotent + non-destructive (never overrides a user-stated name),
+    # and offloaded because it touches disk. Best-effort: never fail a turn.
+    if getattr(event, "sender_name", ""):
+        try:
+            from core.user_provisioning import provision_channel_user
+
+            await asyncio.to_thread(provision_channel_user, event)
+        except Exception as exc:
+            print(f"LOG: channel provisioning skipped: {exc}")
+
     key = (event.user_id, event.channel)
     async with _channel_state_lock(key):
         cached = _CHANNEL_STATES.get(key)
