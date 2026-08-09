@@ -2639,8 +2639,40 @@ async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
         except Exception as exc:
             print(f"LOG: channel provisioning skipped: {exc}")
 
-    key = (event.user_id, event.channel)
-    async with _channel_state_lock(key):
+    # Codex verification: event.user_id was resolved by the adapter BEFORE
+    # dispatch. If an account-link redemption re-points channel_mappings while
+    # this event is in flight, we would run under the STALE source user_id and
+    # our post-turn writers would append to the (now unreachable) source
+    # journal. Lock on the CHANNEL identity, then re-resolve inside the lock so
+    # a queued turn picks up the new mapping.
+    lock_key = (str(event.channel or ""), str(getattr(event, "channel_user_id", "") or event.user_id))
+    async with _channel_state_lock(lock_key):
+        # Re-resolve inside the lock: if a link redemption committed while we
+        # were queued, this returns the NEW target user_id.
+        chan_uid = getattr(event, "channel_user_id", "") or ""
+        if chan_uid:
+            from core.identity import identity_manager as _idm
+
+            resolved = await _idm.resolve_user(event.channel, chan_uid)
+            if resolved != event.user_id:
+                print(
+                    f"LOG: turn re-resolved after link: {event.user_id} -> {resolved} "
+                    f"({event.channel}/{chan_uid[:12]}***)"
+                )
+                event = TurtleEvent(
+                    user_id=resolved,
+                    channel=event.channel,
+                    modality=event.modality,
+                    content=event.content,
+                    message_id=event.message_id,
+                    thread_id=event.thread_id,
+                    attachments=event.attachments,
+                    sender_name=event.sender_name,
+                    channel_user_id=event.channel_user_id,
+                    is_private=event.is_private,
+                )
+
+        key = (event.user_id, event.channel)
         cached = _CHANNEL_STATES.get(key)
         state = cached[0] if cached is not None else None
         if state is None:
@@ -3097,16 +3129,21 @@ async def link_account_redeem(request: Request):
         await asyncio.to_thread(store.consume, code)
         return JSONResponse({"status": "ok", "already_linked": True, "merged": {}})
 
-    source_lock = _channel_state_lock((claim.source_user_id, claim.channel))
+    # Lock on the CHANNEL IDENTITY (channel, channel_user_id), same key the
+    # dispatch handler now uses. Any in-flight or queued turn for this Discord
+    # user waits behind us — and on the other side of the lock, it re-resolves
+    # user_id and picks up the NEW mapping. If we locked on the old user_id
+    # instead, a queued turn resolving after our re-point could enter concurrently.
+    source_lock = _channel_state_lock((claim.channel, claim.channel_user_id))
     async with source_lock:
         # Drain detached writers (per-turn extraction, reflector Stage-B +
-        # rolling summary) that started under the source user_id — they
-        # outlive _channel_dispatch_handler and would otherwise append into a
-        # journal that is about to become unreachable, silently stranding those
-        # writes. drain_user_tasks is bounded (5s) so a hung task can't stall
-        # linking indefinitely. Evict the cached source SharedState UP FRONT
-        # so anything that resolves the mapping AFTER this line sees the new
-        # target on their next turn.
+        # rolling summary, embed jobs) that started under the source user_id.
+        # They outlive _channel_dispatch_handler and would otherwise append
+        # into a journal that is about to become unreachable, silently
+        # stranding those writes. drain_user_tasks is bounded (5s) so a hung
+        # task can't stall linking indefinitely. Evict the cached source
+        # SharedState UP FRONT so anything that resolves after this sees the
+        # new target on the next turn.
         from core.worker import drain_user_tasks
 
         _CHANNEL_STATES.pop((claim.source_user_id, claim.channel), None)

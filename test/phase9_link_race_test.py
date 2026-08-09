@@ -233,3 +233,42 @@ def test_personal_memory_store_write_tags_embed_by_user(tmp_path, monkeypatch):
         # importing already ran the decorator, but reimport just to be sure
     except Exception:
         pass
+
+
+# ── channel dispatch re-resolves under the lock after a link redemption ──────
+
+def test_dispatch_re_resolves_user_id_inside_the_lock(tmp_path, monkeypatch):
+    """A queued channel turn that resolved user_id BEFORE a link redemption
+    must, on the other side of the lock, pick up the NEW target user_id — not
+    run under the stale source id and strand its post-turn writes into a
+    now-unreachable journal."""
+    import apps.turtle_server as ts
+    from apps.channels import TurtleEvent
+    from core.identity import IdentityManager
+
+    db = tmp_path / "users.sqlite"
+    mgr = IdentityManager(db_path=db)
+    monkeypatch.setattr("core.identity.identity_manager", mgr, raising=False)
+
+    async def scenario():
+        await mgr.init_db()
+        source = await mgr.resolve_user("discord", "759")
+        target = await mgr.resolve_user("web_email", "me@example.com")
+
+        # A link redemption just re-pointed the discord id.
+        await mgr.link_channel(user_id=target, channel="discord", channel_user_id="759")
+
+        # A queued dispatch was assembled with the STALE source user_id.
+        stale_event = TurtleEvent(
+            user_id=source, channel="discord", modality="text",
+            content="hi", message_id="m", thread_id="t",
+            channel_user_id="759",
+        )
+
+        # Simulate ONLY the re-resolve block from _channel_dispatch_handler.
+        chan_uid = stale_event.channel_user_id
+        resolved = await mgr.resolve_user(stale_event.channel, chan_uid)
+        assert resolved == target, "re-resolve must return the NEW target user_id"
+        assert resolved != stale_event.user_id, "would have run under stale source"
+
+    asyncio.run(scenario())
