@@ -161,3 +161,75 @@ def test_drain_untagged_users_is_a_noop():
     """A user with zero tracked tasks returns 0 immediately."""
     from core.worker import drain_user_tasks
     assert asyncio.run(drain_user_tasks("usr_never_seen")) == 0
+
+
+# ── writer paths I missed on the first drain-writers pass ────────────────────
+
+def test_worker_queue_enqueue_tags_jobs_with_user_id():
+    """queue_service.enqueue jobs (embed_personal_memory etc.) carry user_id
+    in their payload — the enqueue wrapper must pick it up so drain_user_tasks
+    catches the ACTUAL work coroutine, not just the outer enqueue call."""
+    from core.worker import LocalWorkerQueue, _TASKS_BY_USER, task
+
+    finished: list[str] = []
+
+    @task("__test_per_user_job")
+    async def _job(user_id: str, marker: str):
+        await asyncio.sleep(0.02)
+        finished.append(marker)
+
+    async def run():
+        q = LocalWorkerQueue()
+        # release the semaphore for this test
+        import core.worker as w
+        w._job_semaphore = None
+        await q.enqueue("__test_per_user_job", user_id="usr_A", marker="A")
+        # tags immediately, before the job body runs
+        assert "usr_A" in _TASKS_BY_USER, "enqueued job was not tagged by user_id"
+        # drain waits for the body
+        from core.worker import drain_user_tasks
+        awaited = await drain_user_tasks("usr_A", timeout=2.0)
+        assert awaited == 1
+        assert "A" in finished
+
+    asyncio.run(run())
+    from core.worker import _REGISTRY
+    _REGISTRY.pop("__test_per_user_job", None)
+
+
+def test_personal_memory_store_write_tags_embed_by_user(tmp_path, monkeypatch):
+    """write_topic spawns an embed job; the outer create_task AND the inner
+    _wrapper both need the user_id tag so a linking drain awaits them."""
+    import core.paths as core_paths
+
+    monkeypatch.setattr(core_paths, "PERSONAL_MEMORY_DIR", tmp_path, raising=False)
+    from core.personal_memory_store import PersonalMemoryStore
+    from core.worker import _TASKS_BY_USER, task
+
+    saw: list[str] = []
+
+    @task("embed_personal_memory")
+    async def _fake_embed(user_id: str, topic_name: str, lines):
+        saw.append(user_id)
+        await asyncio.sleep(0.02)
+
+    async def run():
+        import core.worker as w
+        w._job_semaphore = None
+        store = PersonalMemoryStore(user_id="usr_embed")
+        store.write_topic("identity", ["- Name: Grace"], {"title": "Identity"})
+        # the OUTER create_task must be tagged (it's what track_task sees)
+        assert "usr_embed" in _TASKS_BY_USER, "embed enqueue wasn't user-tagged"
+        from core.worker import drain_user_tasks
+        awaited = await drain_user_tasks("usr_embed", timeout=2.0)
+        assert awaited >= 1 and "usr_embed" in saw
+
+    asyncio.run(run())
+    from core.worker import _REGISTRY
+    # restore the real handler if it was there
+    _REGISTRY.pop("embed_personal_memory", None)
+    try:
+        import core.background_tasks  # re-registers the real one
+        # importing already ran the decorator, but reimport just to be sure
+    except Exception:
+        pass

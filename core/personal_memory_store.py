@@ -183,8 +183,12 @@ class PersonalMemoryStore:
                         lines=embed_lines,
                     )
                 )
-                # Retain the outer task (GC hazard) and surface enqueue failures.
-                track_task(embed_task)
+                # Retain the outer task (GC hazard) and surface enqueue
+                # failures. Tag by user_id so account-link merge can drain
+                # this user's in-flight embed before snapshotting the source
+                # (missed in the first drain-writers pass — every write_topic
+                # spawns one of these).
+                track_task(embed_task, user_id=self.user_id)
             except RuntimeError:
                 pass
 

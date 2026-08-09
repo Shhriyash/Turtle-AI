@@ -128,6 +128,12 @@ class LocalWorkerQueue(Queue):
         job_id = f"job_{uuid.uuid4().hex[:12]}"
         semaphore = _get_job_semaphore()
 
+        # Any per-user job MUST be drainable, or account-link merge will snapshot
+        # a source journal while its embed/etc is still writing. Job payloads for
+        # per-tenant work already carry user_id in kwargs (embed_personal_memory,
+        # etc.); pick it up so track_task can index this job under that user.
+        job_user_id = str(kwargs.get("user_id", "") or "") or None
+
         async def _wrapper() -> None:
             try:
                 async with semaphore:
@@ -136,7 +142,7 @@ class LocalWorkerQueue(Queue):
                 logger.error(f"Background job '{job_name}' failed: {e}", exc_info=True)
 
         task_obj = asyncio.create_task(_wrapper(), name=job_id)
-        track_task(task_obj)
+        track_task(task_obj, user_id=job_user_id)
         return job_id
 
 
