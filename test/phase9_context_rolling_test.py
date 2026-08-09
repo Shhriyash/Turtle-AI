@@ -171,3 +171,32 @@ def test_carryover_rejects_stale_pending_session(monkeypatch):
 
     out = asyncio.run(store.get_summary_tail_with_carryover(max_entries=6))
     assert out == []
+
+
+# ── 5. no-op topic writes must not fsync ─────────────────────────────────────
+# `updated_at` is stamped fresh on every render, so every replay rewrote every
+# topic file even when nothing changed — an atomic_write_text (temp file + fsync
+# on the file AND its parent dir) per topic, per replay, on every fact-storing
+# turn. It also made the replayer non-deterministic byte-wise, which is why
+# test_replayer_is_deterministic flaked whenever two replays straddled a second.
+
+def test_unchanged_topic_write_is_elided(tmp_path, monkeypatch):
+    import core.paths as core_paths
+
+    monkeypatch.setattr(core_paths, "PERSONAL_MEMORY_DIR", tmp_path, raising=False)
+    from core.personal_memory_store import PersonalMemoryStore
+
+    store = PersonalMemoryStore(user_id="usr_elide")
+    store.write_topic("identity", ["- Name: Ada"], {"title": "Identity"})
+    path = tmp_path / "usr_elide" / "identity.md"
+    first_mtime = path.stat().st_mtime_ns
+    first_text = path.read_text(encoding="utf-8")
+
+    # identical content -> no rewrite, and the bytes stay stable (deterministic)
+    store.write_topic("identity", ["- Name: Ada"], {"title": "Identity"})
+    assert path.stat().st_mtime_ns == first_mtime, "no-op write still fsynced"
+    assert path.read_text(encoding="utf-8") == first_text
+
+    # a real change must still land
+    store.write_topic("identity", ["- Name: Grace"], {"title": "Identity"})
+    assert "Grace" in path.read_text(encoding="utf-8")

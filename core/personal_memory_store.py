@@ -22,6 +22,22 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _body_of(document: str) -> str:
+    """Everything after the YAML frontmatter, for change detection.
+
+    Used to elide no-op topic writes: the frontmatter carries a fresh
+    `updated_at` on every render, so comparing whole documents would always
+    report a difference and force a needless fsync.
+    """
+    text = document or ""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            newline = text.find("\n", end + 1)
+            return text[newline + 1:] if newline != -1 else ""
+    return text
+
+
 @dataclass(frozen=True)
 class PersonalMemoryIndexEntry:
     title: str
@@ -121,6 +137,23 @@ class PersonalMemoryStore:
 
         lines = content if isinstance(content, str) else list(content)
         serialized = serialize_markdown_memory(normalized_metadata, lines)
+
+        # NO-OP WRITE ELISION. `updated_at` is stamped fresh on every call, so a
+        # byte comparison always differs and every replay rewrote every topic
+        # file — an atomic_write_text (temp file + fsync on the file AND its
+        # parent dir) per topic, per replay. replay() runs on every fact-storing
+        # turn, so this was pure fsync latency on the hot path for content that
+        # had not changed. Compare the BODY (everything after the frontmatter);
+        # if it is identical, keep the existing file and skip the write.
+        # Side benefit: the rendered projection is now content-deterministic —
+        # replaying the same journal twice no longer produces differing bytes.
+        if path.exists():
+            try:
+                if _body_of(path.read_text(encoding="utf-8")) == _body_of(serialized):
+                    return parse_markdown_memory(path.read_text(encoding="utf-8"))
+            except Exception:
+                pass  # unreadable/corrupt — fall through and rewrite
+
         # Phase 6: enforce per-user storage cap before writing.
         try:
             existing_size = path.stat().st_size if path.exists() else 0
@@ -129,7 +162,7 @@ class PersonalMemoryStore:
         delta = max(0, len(serialized.encode("utf-8")) - existing_size)
         enforce_storage_cap(self.user_id, self.base_dir, incoming_bytes=delta)
         atomic_write_text(path, serialized)
-        
+
         # D5/G3: Enqueue embedding job.
         # Skip the enqueue entirely for the un-scoped default/empty tenant:
         # single-tenant/"default" stores are test/legacy constructs (real
