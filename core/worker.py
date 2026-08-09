@@ -58,18 +58,37 @@ def task(name: str) -> Callable[[Callable[..., Awaitable[Any]]], Callable[..., A
     return decorator
 
 
+# Cap on background jobs executing at once. Without it, enqueue() was a bare
+# create_task: a burst (e.g. an embed job per journal event) launched unbounded
+# coroutines, each doing blocking-ish work, and starved the turn pipeline.
+# Excess jobs queue on the semaphore instead of all running at once.
+MAX_CONCURRENT_JOBS = 8
+_job_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_job_semaphore() -> asyncio.Semaphore:
+    # Created lazily: a Semaphore binds to the running loop, and this module is
+    # imported long before the app loop exists (and re-used across test loops).
+    global _job_semaphore
+    if _job_semaphore is None:
+        _job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+    return _job_semaphore
+
+
 class LocalWorkerQueue(Queue):
-    """Local mode queue using asyncio.create_task."""
+    """Local mode queue using asyncio.create_task, bounded by a semaphore."""
     async def enqueue(self, job_name: str, **kwargs: Any) -> str:
         func = _REGISTRY.get(job_name)
         if not func:
             raise ValueError(f"Job {job_name} not registered")
 
         job_id = f"job_{uuid.uuid4().hex[:12]}"
+        semaphore = _get_job_semaphore()
 
         async def _wrapper() -> None:
             try:
-                await func(**kwargs)
+                async with semaphore:
+                    await func(**kwargs)
             except Exception as e:
                 logger.error(f"Background job '{job_name}' failed: {e}", exc_info=True)
 

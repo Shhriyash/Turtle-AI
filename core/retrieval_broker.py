@@ -634,9 +634,17 @@ class RetrievalBroker:
             return ""
 
     def _build_task_tier(self, query: str) -> str:
-        """Tier 4: single best task history hit."""
+        """Tier 4: single best task history hit — scoped to THIS user.
+
+        task history lives in one global sqlite shared by every user, so the
+        owner is passed explicitly here as well as being set on the store: this
+        tier feeds straight into the prompt, and an unscoped hit would splice
+        another user's task text into this user's context.
+        """
         try:
-            return self.task_store.format_search_results(query, max_results=1)
+            return self.task_store.format_search_results(
+                query, max_results=1, user_id=self.user_id
+            )
         except Exception:
             return ""
 

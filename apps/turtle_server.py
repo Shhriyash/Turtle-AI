@@ -812,11 +812,21 @@ def _queue_confirmation_candidates_from_turn(
             state, session_id=session_id, user_text=user_text
         )
 
-    loop.create_task(
+    # RETAINED: asyncio holds only a weak ref to a bare create_task, so this —
+    # the per-turn memory candidate extraction — could be GC'd mid-flight and
+    # silently drop everything the user just disclosed. track_task keeps a
+    # strong ref and logs failures instead of swallowing them.
+    task = loop.create_task(
         _queue_confirmation_candidates_async(
             state, session_id=session_id, user_text=user_text
         )
     )
+    try:
+        from core.worker import track_task
+
+        track_task(task)
+    except Exception:
+        pass
     return 0
 
 
@@ -2457,7 +2467,7 @@ async def _build_channel_state(user_id: str, channel: str) -> SharedState:
             max_topic_files=PERSONAL_MEMORY_MAX_TOPIC_FILES,
         ),
     )
-    task_history_store = TaskHistoryStore(TASK_HISTORY_FILE)
+    task_history_store = TaskHistoryStore(TASK_HISTORY_FILE, user_id=user_id)
     rag_system = TurtleRAGSystem(user_id=user_id)
 
     from core.storage.local.faiss_store import FAISSVectorStore
@@ -2970,7 +2980,7 @@ async def websocket_endpoint(ws: WebSocket):
                 max_topic_files=PERSONAL_MEMORY_MAX_TOPIC_FILES,
             ),
         )
-        task_history_store = TaskHistoryStore(TASK_HISTORY_FILE)
+        task_history_store = TaskHistoryStore(TASK_HISTORY_FILE, user_id=user_id)
         rag_system = TurtleRAGSystem(user_id=user_id)
 
         # D4: construct RetrievalBroker for 4-tier memory context retrieval

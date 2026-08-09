@@ -5,6 +5,7 @@ Generic FAISS implementation of VectorStore protocol for multi-tenant usage.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from pathlib import Path
@@ -71,7 +72,18 @@ class FAISSVectorStore(VectorStore):
         return (v / norms).astype(np.float32)
 
     async def upsert(self, user_id: str, doc_id: str, text: str, metadata: dict[str, Any]) -> None:
-        """Upsert a single document into the tenant's FAISS index."""
+        """Upsert a document — offloaded so the event loop never blocks.
+
+        The body acquires a threading.Lock and then does synchronous work
+        (faiss disk I/O + a BLOCKING Cohere HTTP embed). Run inline on the event
+        loop that froze every user's turn for the duration of the embed, and a
+        second coroutine hitting the same tenant would block-acquire the lock on
+        the sole loop thread — deadlocking until the HTTP call returned. The
+        lock stays INSIDE the worker thread, which is what makes it safe.
+        """
+        await asyncio.to_thread(self._upsert_sync, user_id, doc_id, text, metadata)
+
+    def _upsert_sync(self, user_id: str, doc_id: str, text: str, metadata: dict[str, Any]) -> None:
         with self._get_lock(user_id):
             self._load_tenant(user_id)
             
@@ -97,7 +109,10 @@ class FAISSVectorStore(VectorStore):
             self._save_tenant(user_id)
 
     async def search(self, user_id: str, query: str, k: int) -> list[Hit]:
-        """Search top-k documents in tenant's FAISS index."""
+        """Search top-k documents — offloaded (see upsert for why)."""
+        return await asyncio.to_thread(self._search_sync, user_id, query, k)
+
+    def _search_sync(self, user_id: str, query: str, k: int) -> list[Hit]:
         with self._get_lock(user_id):
             self._load_tenant(user_id)
             if self._indices[user_id].ntotal == 0:

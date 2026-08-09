@@ -32,10 +32,16 @@ class TaskHistoryIndex:
             pass
 
     def _ensure_schema(self) -> None:
+        # MULTI-TENANCY: user_id scopes every row. Without it, search() was an
+        # unfiltered FTS MATCH over one global history.sqlite shared by every
+        # user, so tier 4 of the retrieval broker could splice one user's task
+        # text into another user's memory context. It is UNINDEXED (we filter on
+        # it, never full-text search it).
         self._connection.executescript(
             f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS {_FTS_TABLE}
             USING fts5(
+                user_id UNINDEXED,
                 session_id UNINDEXED,
                 turn_id UNINDEXED,
                 task_type,
@@ -55,6 +61,29 @@ class TaskHistoryIndex:
             """
         )
         self._connection.commit()
+        self._migrate_add_user_id()
+
+    def _migrate_add_user_id(self) -> None:
+        """Rebuild a pre-tenancy index that has no user_id column.
+
+        FTS5 cannot ALTER TABLE ADD COLUMN, and this index is a rebuildable
+        cache (the JSONL is the source of truth), so the safe migration is to
+        drop it and let the store's staleness check refill it. Rows written
+        before tenancy existed carry no owner and MUST NOT be served to anyone.
+        """
+        try:
+            cols = {
+                row[1]
+                for row in self._connection.execute(f"PRAGMA table_info({_FTS_TABLE})")
+            }
+        except sqlite3.OperationalError:
+            return
+        if not cols or "user_id" in cols:
+            return
+        print("LOG: task history index missing user_id — rebuilding for tenancy")
+        self._connection.executescript(f"DROP TABLE IF EXISTS {_FTS_TABLE};")
+        self._connection.commit()
+        self._ensure_schema()
 
     def row_count(self) -> int:
         cursor = self._connection.execute(f"SELECT COUNT(*) AS n FROM {_FTS_TABLE}")
@@ -65,8 +94,8 @@ class TaskHistoryIndex:
         self._connection.execute(
             f"""
             INSERT INTO {_FTS_TABLE}
-            (session_id, turn_id, task_type, status, timestamp, query, tool_used, outcome, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (user_id, session_id, turn_id, task_type, status, timestamp, query, tool_used, outcome, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             _record_columns(record),
         )
@@ -79,15 +108,27 @@ class TaskHistoryIndex:
             self._connection.executemany(
                 f"""
                 INSERT INTO {_FTS_TABLE}
-                (session_id, turn_id, task_type, status, timestamp, query, tool_used, outcome, payload_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (user_id, session_id, turn_id, task_type, status, timestamp, query, tool_used, outcome, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
         self._connection.commit()
         return len(rows)
 
-    def search(self, query: str, *, max_results: int = 5) -> list[dict[str, Any]]:
+    def search(
+        self, query: str, *, max_results: int = 5, user_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Full-text search, ALWAYS scoped to one tenant.
+
+        user_id is required in practice: this index is one global file shared by
+        every user, so an unscoped MATCH leaks one user's task text into
+        another's retrieval context. Passing user_id=None returns nothing rather
+        than silently searching everyone (fail closed, not open).
+        """
+        owner = str(user_id or "").strip()
+        if not owner:
+            return []
         fts_query = _compile_fts_query(query)
         if not fts_query:
             return []
@@ -95,32 +136,37 @@ class TaskHistoryIndex:
         try:
             cursor = self._connection.execute(
                 f"""
-                SELECT session_id, turn_id, task_type, status, timestamp,
+                SELECT user_id, session_id, turn_id, task_type, status, timestamp,
                        query, tool_used, outcome, payload_json,
                        bm25({_FTS_TABLE}) AS score
                 FROM {_FTS_TABLE}
-                WHERE {_FTS_TABLE} MATCH ?
+                WHERE {_FTS_TABLE} MATCH ? AND user_id = ?
                 ORDER BY score ASC, timestamp DESC
                 LIMIT ?
                 """,
-                (fts_query, max_results),
+                (fts_query, owner, max_results),
             )
         except sqlite3.OperationalError:
             return []
 
         return [_row_to_record(row) for row in cursor.fetchall()]
 
-    def list_by_session(self, session_id: str) -> list[dict[str, Any]]:
-        cursor = self._connection.execute(
-            f"""
-            SELECT session_id, turn_id, task_type, status, timestamp,
+    def list_by_session(
+        self, session_id: str, *, user_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        owner = str(user_id or "").strip()
+        sql = f"""
+            SELECT user_id, session_id, turn_id, task_type, status, timestamp,
                    query, tool_used, outcome, payload_json
             FROM {_FTS_TABLE}
             WHERE session_id = ?
-            ORDER BY timestamp ASC
-            """,
-            (str(session_id).strip(),),
-        )
+        """
+        params: list[Any] = [str(session_id).strip()]
+        if owner:
+            sql += " AND user_id = ?"
+            params.append(owner)
+        sql += " ORDER BY timestamp ASC"
+        cursor = self._connection.execute(sql, tuple(params))
         return [_row_to_record(row) for row in cursor.fetchall()]
 
 
@@ -135,6 +181,7 @@ def _record_columns(record: dict[str, Any]) -> tuple[str, ...]:
         payload_json = ""
 
     return (
+        str(record.get("user_id", "")),
         str(record.get("session_id", "")),
         str(record.get("turn_id", "")),
         str(record.get("task_type", "")),
@@ -149,6 +196,7 @@ def _record_columns(record: dict[str, Any]) -> tuple[str, ...]:
 
 def _row_to_record(row: sqlite3.Row) -> dict[str, Any]:
     record: dict[str, Any] = {
+        "user_id": row["user_id"] if "user_id" in row.keys() else "",
         "session_id": row["session_id"],
         "turn_id": row["turn_id"],
         "task_type": row["task_type"],

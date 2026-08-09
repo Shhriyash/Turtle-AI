@@ -90,8 +90,13 @@ class PeriodicReflector:
         if sess.in_flight:
             return
 
-        # Fire-and-forget: never block the user turn.
-        asyncio.create_task(
+        # Fire-and-forget: never block the user turn — but RETAINED. asyncio
+        # keeps only a weak reference to a bare create_task, so this task could
+        # be garbage-collected mid-flight and silently drop the whole reflection
+        # window: Stage B memory extraction AND the rolling summary that carries
+        # in-session context forward. track_task holds a strong ref and logs any
+        # exception instead of swallowing it.
+        task = asyncio.create_task(
             self._reflect(
                 state,
                 session_id=session_id,
@@ -99,6 +104,12 @@ class PeriodicReflector:
             ),
             name=f"reflect_{session_id}",
         )
+        try:
+            from core.worker import track_task
+
+            track_task(task)
+        except Exception:
+            pass
 
     async def _reflect(
         self,
