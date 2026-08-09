@@ -56,7 +56,13 @@ def _verify_twilio_signature(request_url: str, post_params: dict[str, str], sign
     """Validate X-Twilio-Signature per Twilio docs."""
     secret = _get_secret()
     if not secret:
-        return True  # skip verification when no token configured (dev mode)
+        # Dev no-op locally; FAIL CLOSED in cloud. An unsigned-accepting public
+        # webhook lets anyone drive the whole pipeline with a spoofed sender id
+        # — unauthenticated LLM execution plus writes into an arbitrary tenant's
+        # memory. The shipped container sets TURTLE_DEPLOY=cloud (Dockerfile)
+        # and ships no channel secrets, so "no secret configured" is exactly the
+        # production default. Mirrors apps/channels/discord.py.
+        return not settings.is_cloud
 
     # Build validation string: URL + sorted POST params joined
     s = request_url

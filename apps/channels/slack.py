@@ -50,7 +50,10 @@ def _verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool
     """Validate X-Slack-Signature per Slack docs (v0 HMAC-SHA256)."""
     secret = _signing_secret()
     if not secret:
-        return True  # dev mode
+        # Dev no-op locally; FAIL CLOSED in cloud — see apps/channels/discord.py.
+        # Accepting unsigned requests on a public webhook is unauthenticated
+        # pipeline execution against an attacker-chosen tenant.
+        return not settings.is_cloud
 
     # Reject replays older than 5 minutes
     try:

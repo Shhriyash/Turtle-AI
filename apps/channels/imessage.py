@@ -49,7 +49,10 @@ def _verify_sendblue_signature(body: bytes, signature: str) -> bool:
     """Validate X-SendBlue-Signature HMAC-SHA256."""
     _, secret = _get_api_creds()
     if not secret:
-        return True  # dev mode — skip
+        # Dev no-op locally; FAIL CLOSED in cloud — see apps/channels/discord.py.
+        # Accepting unsigned requests on a public webhook is unauthenticated
+        # pipeline execution against an attacker-chosen tenant.
+        return not settings.is_cloud
 
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)

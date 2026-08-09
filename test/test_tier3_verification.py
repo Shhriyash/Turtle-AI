@@ -98,14 +98,45 @@ class TestF1WhatsApp:
         assert result_miss is None
         print("[PASS] Idempotency cache stores and retrieves by MessageSid")
 
-    def test_signature_verify_skips_when_no_token(self):
-        from apps.channels.whatsapp import _verify_twilio_signature
+    def test_signature_verify_no_secret_local_noop_cloud_fail_closed(self):
+        """No secret configured => dev no-op LOCALLY, fail CLOSED in cloud.
+
+        This test previously asserted `result is True` unconditionally, which
+        pinned a fail-OPEN webhook: the shipped container sets
+        TURTLE_DEPLOY=cloud (Dockerfile) and ships no channel secrets, so
+        "no secret" is the production default. Accepting unsigned requests there
+        is unauthenticated pipeline execution against an attacker-chosen tenant.
+        Same shape as the Discord test below.
+        """
         import unittest.mock as mock
+
+        from apps.channels.imessage import _verify_sendblue_signature
+        from apps.channels.slack import _verify_slack_signature
+        from apps.channels.whatsapp import _verify_twilio_signature
+
         with mock.patch("apps.channels.whatsapp.settings") as s:
             s.twilio_auth_token = None
-            result = _verify_twilio_signature("https://example.com", {}, "any_sig")
-        assert result is True
-        print("[PASS] Signature verification skips (returns True) when no token configured")
+            s.is_cloud = False
+            assert _verify_twilio_signature("https://example.com", {}, "sig") is True
+            s.is_cloud = True
+            assert _verify_twilio_signature("https://example.com", {}, "sig") is False
+
+        with mock.patch("apps.channels.imessage.settings") as s:
+            s.sendblue_api_key = None
+            s.sendblue_api_secret = None
+            s.is_cloud = False
+            assert _verify_sendblue_signature(b"{}", "sig") is True
+            s.is_cloud = True
+            assert _verify_sendblue_signature(b"{}", "sig") is False
+
+        with mock.patch("apps.channels.slack.settings") as s:
+            s.slack_signing_secret = None
+            s.is_cloud = False
+            assert _verify_slack_signature(b"{}", "0", "sig") is True
+            s.is_cloud = True
+            assert _verify_slack_signature(b"{}", "0", "sig") is False
+
+        print("[PASS] whatsapp/imessage/slack: local no-op, cloud fail-closed")
 
     def test_signature_verify_fails_on_bad_signature(self):
         from apps.channels.whatsapp import _verify_twilio_signature
@@ -151,14 +182,17 @@ class TestF2iMessage:
         print("[PASS] iMessage router importable")
 
     def test_signature_verify_skips_without_secret(self):
+        """No secret => skip verification in LOCAL dev only (cloud fail-closed
+        is covered by test_signature_verify_no_secret_local_noop_cloud_fail_closed)."""
         from apps.channels.imessage import _verify_sendblue_signature
         import unittest.mock as mock
         with mock.patch("apps.channels.imessage.settings") as s:
             s.sendblue_api_key = None
             s.sendblue_api_secret = None
+            s.is_cloud = False
             result = _verify_sendblue_signature(b"body", "any_sig")
         assert result is True
-        print("[PASS] SendBlue signature verification skips when secret not configured")
+        print("[PASS] SendBlue signature verification skips when secret not configured (local)")
 
     def test_signature_verify_fails_on_bad_signature(self):
         from apps.channels.imessage import _verify_sendblue_signature
