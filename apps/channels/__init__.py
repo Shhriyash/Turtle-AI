@@ -39,6 +39,10 @@ class TurtleEvent:
     # shell (see core/user_provisioning.py). A weak signal — never overrides a
     # name the user states themselves.
     sender_name: str = ""
+    # The sender's PLATFORM-side id (e.g. the Discord snowflake), as opposed to
+    # user_id which is Turtle's internal id. Account linking binds a claim code
+    # to this, because it is what the channel proves control of.
+    channel_user_id: str = ""
 
 
 @dataclass

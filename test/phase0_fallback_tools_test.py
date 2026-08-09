@@ -15,6 +15,7 @@ EXPECTED = {
     "calendar_create",
     "calendar_list",
     "remember",
+    "link_account",
 }
 
 

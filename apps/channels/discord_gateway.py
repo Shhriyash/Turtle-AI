@@ -140,6 +140,7 @@ async def start_discord_gateway() -> None:
                 message_id=str(message.id),
                 thread_id=str(message.channel.id),
                 sender_name=str(sender_name),
+                channel_user_id=str(message.author.id),
             )
             response: TurtleResponse = await dispatch_event(turtle_event)
             await message.channel.send(response.content[:_MAX_REPLY_CHARS])

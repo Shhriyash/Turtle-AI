@@ -144,6 +144,47 @@ class IdentityManager:
             except aiosqlite.IntegrityError:
                 return False
 
+    async def link_channel(
+        self, *, user_id: str, channel: str, channel_user_id: str
+    ) -> str | None:
+        """Re-point a channel identity at an existing user_id. Returns the prior
+        user_id it was bound to (or None if it was unbound).
+
+        This is the write half of account linking — one human, one memory. It is
+        deliberately NOT reachable from resolve_user: re-pointing an identity
+        must only ever happen after BOTH sides are proven (a claim code proving
+        control of the channel identity, redeemed inside an authenticated
+        session proving ownership of the target account). See
+        core/account_linking.py for the flow and why matching on a self-claimed
+        email would be an account-takeover vector.
+        """
+        target = (channel_user_id or "").strip()
+        if not user_id or not channel or not target:
+            return None
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT user_id FROM channel_mappings WHERE channel = ? AND channel_user_id = ?",
+                (channel, target),
+            )
+            row = await cursor.fetchone()
+            previous = row[0] if row else None
+            if previous == user_id:
+                return previous  # already linked; nothing to do
+            await db.execute(
+                "INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,)
+            )
+            await db.execute(
+                "INSERT OR REPLACE INTO channel_mappings (channel, channel_user_id, user_id) "
+                "VALUES (?, ?, ?)",
+                (channel, target, user_id),
+            )
+            await db.commit()
+        print(
+            f"LOG: linked {channel}/{target} -> {user_id}"
+            + (f" (was {previous})" if previous else "")
+        )
+        return previous
+
     async def resolve_user(self, channel: str, channel_user_id: str) -> str:
         """Resolve a channel user ID to a canonical internal UserId. Creates one if missing.
 

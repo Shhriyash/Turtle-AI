@@ -343,6 +343,11 @@ class SharedState:
     search_cache: dict[str, str] = field(default_factory=dict)
     turn_counter: int = 0
     user_id: str = ""
+    # Which surface this state is serving, and the platform-side id there.
+    # Needed by account linking: a claim code is bound to the CHANNEL identity
+    # (e.g. discord/759…), not to the Turtle user_id. Empty on the web path.
+    channel: str = ""
+    channel_user_id: str = ""
     # Phase 1: the memory block for the current turn. Delivered to the model
     # via per-turn instructions (never inside the persisted user prompt).
     memory_context: str = ""
@@ -2147,6 +2152,38 @@ class AgentManager:
                 return ToolResult.empty("No relevant information found.").to_agent_string()
             return ToolResult.ok(recall_text).to_agent_string()
 
+        async def link_account(ctx: RunContext[SharedState]) -> str:
+            """Issue a claim code to link this channel identity to a web account."""
+            deps = ctx.deps
+            channel = str(getattr(deps, "channel", "") or "")
+            channel_uid = str(getattr(deps, "channel_user_id", "") or "")
+            if not channel or not channel_uid:
+                return ToolResult.invalid(
+                    "Account linking is only available from a channel like Discord. "
+                    "On the web you are already signed in."
+                ).to_agent_string()
+            try:
+                from core.account_linking import LINK_CODE_TTL_MINUTES, LinkCodeStore
+
+                store = LinkCodeStore(identity_manager.db_path)
+                issued = await asyncio.to_thread(
+                    store.issue,
+                    channel=channel,
+                    channel_user_id=channel_uid,
+                    source_user_id=deps.user_id,
+                )
+            except Exception as e:
+                return ToolResult.upstream_error(
+                    f"Could not create a link code: {e}"
+                ).to_agent_string()
+            return ToolResult.ok(
+                f"Link code: {issued.code}\n"
+                f"To finish linking, sign in to Turtle on the web and enter this code "
+                f"in Settings -> Link account. It expires in {LINK_CODE_TTL_MINUTES} minutes "
+                f"and can only be used once. Signing in is what proves the web account is "
+                f"yours — I can't link on an email address alone."
+            ).to_agent_string()
+
         async def calendar_create(ctx: RunContext[SharedState], args: CalendarCreateArgs) -> str:
             """Create a Google Calendar event. See tool contract for full spec."""
             from tools.calendar_tool import create_calendar_event
@@ -2212,6 +2249,7 @@ class AgentManager:
             ("calendar_create", calendar_create),
             ("calendar_list", calendar_list),
             ("remember", remember),
+            ("link_account", link_account),
         ]
         for _target_agent in [self.main_assistant, *self.main_assistant_fallbacks]:
             for _contract_name, _tool_fn in _tool_registry:
@@ -2549,6 +2587,11 @@ async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
         if state is None:
             state = await _build_channel_state(event.user_id, event.channel)
         _CHANNEL_STATES[key] = (state, now)
+
+        # Bind the platform-side identity for this turn so the link_account tool
+        # can issue a claim code for the right channel identity.
+        state.channel = str(event.channel or "")
+        state.channel_user_id = str(getattr(event, "channel_user_id", "") or "")
 
         message_history = state.session_store.message_history or None
 
@@ -2896,6 +2939,67 @@ async def confirm_memory(request: Request):
         if result.topic == "workflow":
             _register_user_routines_safe(state)
     return JSONResponse({"status": "ok", "applied": accepted})
+
+
+@app.post("/api/account/link")
+async def link_account_redeem(request: Request):
+    """Redeem a channel claim code against the CALLER's authenticated account.
+
+    This is the second, decisive half of account linking. The claim code proves
+    the requester controls the channel identity (Discord etc.); this endpoint's
+    authentication proves they own the target Turtle account. Neither alone is
+    sufficient, which is why linking is never done from a self-claimed email —
+    that would let anyone inherit another person's memory.
+
+    On success the channel mapping is re-pointed at the caller and the channel
+    account's memory is folded into theirs.
+    """
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Sign in to link an account")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    code = str((body or {}).get("code", "")).strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="code is required")
+
+    from core.account_linking import LinkCodeStore, merge_memory
+
+    store = LinkCodeStore(identity_manager.db_path)
+    claim = await asyncio.to_thread(store.consume, code)
+    if claim is None:
+        # One message for unknown/expired/reused: don't help someone probe codes.
+        raise HTTPException(status_code=400, detail="That code is invalid or has expired")
+
+    if claim.source_user_id == user_id:
+        return JSONResponse({"status": "ok", "already_linked": True, "merged": {}})
+
+    previous = await identity_manager.link_channel(
+        user_id=user_id, channel=claim.channel, channel_user_id=claim.channel_user_id
+    )
+    merged = await asyncio.to_thread(merge_memory, claim.source_user_id, user_id)
+
+    # The channel's cached SharedState still points at the OLD user_id; drop it
+    # so the next message rebuilds against the linked account.
+    _CHANNEL_STATES.pop((claim.source_user_id, claim.channel), None)
+    _CHANNEL_STATE_LOCKS.pop((claim.source_user_id, claim.channel), None)
+
+    print(
+        f"LOG: account linked channel={claim.channel} external={claim.channel_user_id} "
+        f"-> {user_id} (was {previous}) merged={merged}"
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "channel": claim.channel,
+            "linked_to": user_id,
+            "previous_user_id": previous,
+            "merged": merged,
+        }
+    )
 
 
 @app.get("/api/memory/profile")

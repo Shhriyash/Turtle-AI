@@ -237,6 +237,7 @@ async def discord_interactions(request: Request):
                     message_id=interaction_id,
                     thread_id=channel_id,
                     sender_name=sender_name,
+                    channel_user_id=discord_user_id,
                 )
                 response: TurtleResponse = await dispatch_event(turtle_event)
                 await _send_followup(interaction_token, response.content or "…")
