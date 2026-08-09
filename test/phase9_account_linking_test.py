@@ -187,3 +187,42 @@ def test_link_channel_rejects_blank_input(tmp_path):
         assert await mgr.link_channel(user_id="u", channel="discord", channel_user_id=" ") is None
 
     asyncio.run(run())
+
+
+# ── endpoint wiring ──────────────────────────────────────────────────────────
+# The unit tests above exercise LinkCodeStore/link_channel directly, which let a
+# pair of NameErrors (HTTPException and identity_manager were never imported in
+# turtle_server) reach a running server: every POST 500'd. These drive the real
+# ASGI route so the wiring itself is covered.
+
+def test_link_endpoint_rejects_bad_code_without_500(monkeypatch):
+    from fastapi.testclient import TestClient
+    import apps.turtle_server as ts
+
+    monkeypatch.setattr(ts.settings, "deploy_mode", "local", raising=False)
+    with TestClient(ts.app) as client:
+        resp = client.post("/api/account/link", json={"code": "BOGUSCODE"})
+    assert resp.status_code == 400, f"expected a clean 400, got {resp.status_code}"
+    assert "invalid" in resp.text.lower() or "expired" in resp.text.lower()
+
+
+def test_link_endpoint_requires_a_code(monkeypatch):
+    from fastapi.testclient import TestClient
+    import apps.turtle_server as ts
+
+    monkeypatch.setattr(ts.settings, "deploy_mode", "local", raising=False)
+    with TestClient(ts.app) as client:
+        resp = client.post("/api/account/link", json={})
+    assert resp.status_code == 400
+
+
+def test_link_endpoint_requires_authentication(monkeypatch):
+    """In cloud there is no local_dev_user fallback — unauthenticated must 401,
+    never link. Authentication IS the proof of target-account ownership."""
+    from fastapi.testclient import TestClient
+    import apps.turtle_server as ts
+
+    monkeypatch.setattr(ts.settings, "deploy_mode", "cloud", raising=False)
+    with TestClient(ts.app) as client:
+        resp = client.post("/api/account/link", json={"code": "WHATEVER"})
+    assert resp.status_code == 401

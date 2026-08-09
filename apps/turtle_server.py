@@ -2164,6 +2164,7 @@ class AgentManager:
                 ).to_agent_string()
             try:
                 from core.account_linking import LINK_CODE_TTL_MINUTES, LinkCodeStore
+                from core.identity import identity_manager
 
                 store = LinkCodeStore(identity_manager.db_path)
                 issued = await asyncio.to_thread(
@@ -2956,7 +2957,7 @@ async def link_account_redeem(request: Request):
     """
     user_id = _get_user_id_from_request(request)
     if not user_id:
-        raise HTTPException(status_code=401, detail="Sign in to link an account")
+        return JSONResponse({"error": "Sign in to link an account"}, status_code=401)
 
     try:
         body = await request.json()
@@ -2964,15 +2965,18 @@ async def link_account_redeem(request: Request):
         body = {}
     code = str((body or {}).get("code", "")).strip()
     if not code:
-        raise HTTPException(status_code=400, detail="code is required")
+        return JSONResponse({"error": "code is required"}, status_code=400)
 
     from core.account_linking import LinkCodeStore, merge_memory
+    from core.identity import identity_manager
 
     store = LinkCodeStore(identity_manager.db_path)
     claim = await asyncio.to_thread(store.consume, code)
     if claim is None:
         # One message for unknown/expired/reused: don't help someone probe codes.
-        raise HTTPException(status_code=400, detail="That code is invalid or has expired")
+        return JSONResponse(
+            {"error": "That code is invalid or has expired"}, status_code=400
+        )
 
     if claim.source_user_id == user_id:
         return JSONResponse({"status": "ok", "already_linked": True, "merged": {}})
