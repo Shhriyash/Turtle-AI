@@ -42,24 +42,16 @@ router = APIRouter(prefix="/onboarding", tags=["onboarding"])
 # ---------------------------------------------------------------------------
 
 
-_DEV_FALLBACK_SECRET = "dev-fallback-secret-do-not-use-in-production-32b"
-
-
 def _secret() -> str:
-    raw = (
-        settings.auth_secret_key.get_secret_value()
-        if settings.auth_secret_key is not None
-        else ""
-    )
-    if not raw:
-        # Cloud deploys must set AUTH_SECRET_KEY explicitly. Locally, fall back
-        # to a >=32-byte literal so PyJWT doesn't warn about short HMAC keys.
-        if settings.is_cloud:
-            raise RuntimeError(
-                "AUTH_SECRET_KEY is required in cloud mode but is empty or unset."
-            )
-        return _DEV_FALLBACK_SECRET
-    return raw
+    """Delegate to the centralised auth secret (core/auth_secret.py).
+
+    Historically this module minted its own literal fallback secret. Codex
+    review flagged that as a token-forgery hole for any deployment that forgot
+    to set AUTH_SECRET_KEY (including tunneled local deploys), so the fallback
+    is now a per-process random secret shared across every JWT verifier.
+    """
+    from core.auth_secret import auth_secret
+    return auth_secret()
 
 
 def _now() -> datetime:

@@ -43,6 +43,10 @@ from typing import Any
 _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 _CODE_LENGTH = 8
 LINK_CODE_TTL_MINUTES = 15
+# A reservation blocks OTHER targets from redeeming this code. It ages out so a
+# redeemer that crashed mid-merge doesn't lock the code out until expiry — the
+# SAME target can retry immediately; a DIFFERENT target waits this long.
+RESERVATION_TTL_SECONDS = 60
 
 _TABLE = "link_codes"
 
@@ -103,10 +107,24 @@ class LinkCodeStore:
                     channel_user_id TEXT NOT NULL,
                     source_user_id TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
-                    consumed_at TEXT
+                    consumed_at TEXT,
+                    -- Codex finding: peek+merge without reservation lets TWO
+                    -- authenticated redeemers with DIFFERENT targets each pass
+                    -- peek and each copy the source memory into their own
+                    -- account, then last-writer-wins the mapping. Reserving
+                    -- the code atomically to ONE target closes it: the second
+                    -- caller sees a mismatched reserved_for and is rejected.
+                    reserved_for TEXT,
+                    reserved_at TEXT
                 )
                 """
             )
+            # Add columns to a pre-reservation table
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({_TABLE})")}
+            if "reserved_for" not in cols:
+                conn.execute(f"ALTER TABLE {_TABLE} ADD COLUMN reserved_for TEXT")
+            if "reserved_at" not in cols:
+                conn.execute(f"ALTER TABLE {_TABLE} ADD COLUMN reserved_at TEXT")
 
     def issue(self, *, channel: str, channel_user_id: str, source_user_id: str) -> LinkCode:
         """Mint a fresh claim code for a channel identity.
@@ -130,13 +148,8 @@ class LinkCodeStore:
         return LinkCode(code, channel, channel_user_id, source_user_id, expires)
 
     def peek(self, code: str) -> LinkCode | None:
-        """Look up a code WITHOUT marking it consumed.
-
-        Used by the redemption route to validate the code, then do the risky
-        merge work with the code still redeemable — so a merge failure leaves
-        the user with a working code to retry, instead of a burned code and an
-        orphaned source journal. Only expired/unknown/already-consumed return None.
-        """
+        """Read-only lookup used by tests. Endpoint code should call ``reserve``
+        so two concurrent authenticated redeemers can't both pass validation."""
         normalized = _normalize_code(code)
         if not normalized:
             return None
@@ -156,6 +169,88 @@ class LinkCodeStore:
             normalized, row["channel"], row["channel_user_id"],
             row["source_user_id"], row["expires_at"],
         )
+
+    def reserve(self, code: str, target_user_id: str) -> tuple[str, LinkCode | None]:
+        """Atomically claim a code for one target account for the merge window.
+
+        Returns a status string:
+            "ok"        — reservation acquired (or refreshed for same target)
+            "invalid"   — code unknown / expired / already consumed
+            "locked"    — reserved for a DIFFERENT target within TTL — a race,
+                          reject this redeemer
+
+        Guarantees, via ONE conditional UPDATE:
+            * a fresh code with no reservation gets reserved to this target;
+            * an existing reservation for the same target is refreshed
+              (idempotent retry inside TTL);
+            * an existing reservation for another target within TTL blocks —
+              this is the property that closes the two-target race Codex found.
+
+        The reservation itself is not the burn — mark_consumed is still the
+        one-shot commit. If merge fails, the reservation ages out in
+        RESERVATION_TTL_SECONDS and the source account can retry from the SAME
+        channel/DM (which resolves to the same target).
+        """
+        normalized = _normalize_code(code)
+        if not normalized or not target_user_id:
+            return ("invalid", None)
+        now = _iso(_utc_now())
+        cutoff = _iso(_utc_now() - timedelta(seconds=RESERVATION_TTL_SECONDS))
+        with self._connect() as conn:
+            # One statement: reserve iff (unconsumed) AND (not-expired) AND
+            # (unreserved OR expired reservation OR same target).
+            cursor = conn.execute(
+                f"""
+                UPDATE {_TABLE}
+                   SET reserved_for = ?, reserved_at = ?
+                 WHERE code = ?
+                   AND consumed_at IS NULL
+                   AND expires_at > ?
+                   AND (reserved_for IS NULL
+                        OR reserved_for = ?
+                        OR reserved_at IS NULL
+                        OR reserved_at < ?)
+                """,
+                (target_user_id, now, normalized, now, target_user_id, cutoff),
+            )
+            row = conn.execute(
+                f"SELECT * FROM {_TABLE} WHERE code = ?", (normalized,)
+            ).fetchone()
+        if row is None or row["consumed_at"] is not None:
+            return ("invalid", None)
+        try:
+            expires = datetime.fromisoformat(row["expires_at"])
+        except Exception:
+            return ("invalid", None)
+        if expires <= _utc_now():
+            return ("invalid", None)
+        if (cursor.rowcount or 0) == 0:
+            # Update matched nothing → an active reservation for a different
+            # target is holding the code. Do NOT reveal to the loser who is
+            # holding it or that the code exists at all beyond "not for you".
+            return ("locked", None)
+        claim = LinkCode(
+            normalized, row["channel"], row["channel_user_id"],
+            row["source_user_id"], row["expires_at"],
+        )
+        return ("ok", claim)
+
+    def release_reservation(self, code: str, target_user_id: str) -> None:
+        """Drop THIS target's reservation on failure so retry is not blocked.
+
+        Reservations age out on their own, but releasing eagerly means a
+        transient merge failure retries immediately instead of after TTL.
+        Only the target that HOLDS the reservation may release it.
+        """
+        normalized = _normalize_code(code)
+        if not normalized or not target_user_id:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE {_TABLE} SET reserved_for = NULL, reserved_at = NULL "
+                f"WHERE code = ? AND reserved_for = ? AND consumed_at IS NULL",
+                (normalized, target_user_id),
+            )
 
     def consume(self, code: str) -> LinkCode | None:
         """Atomically redeem a code. Returns None if unknown, expired, or reused.
@@ -204,6 +299,14 @@ class LinkCodeStore:
 # asyncio.to_thread against a bound `store` instance without lambdas.
 def peek(store: LinkCodeStore, code: str) -> LinkCode | None:
     return store.peek(code)
+
+
+def reserve(store: LinkCodeStore, code: str, target_user_id: str) -> tuple[str, LinkCode | None]:
+    return store.reserve(code, target_user_id)
+
+
+def release_reservation(store: LinkCodeStore, code: str, target_user_id: str) -> None:
+    store.release_reservation(code, target_user_id)
 
 
 def mark_consumed(store: LinkCodeStore, code: str) -> bool:

@@ -106,8 +106,9 @@ class PeriodicReflector:
         )
         try:
             from core.worker import track_task
-
-            track_task(task)
+            # Tag by user_id so account-link merge can drain THIS user's
+            # in-flight reflection before snapshotting their journal.
+            track_task(task, user_id=getattr(state, "user_id", None) or None)
         except Exception:
             pass
 

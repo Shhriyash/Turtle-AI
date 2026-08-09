@@ -44,9 +44,9 @@ router = APIRouter(tags=["admin"])
 
 
 def _secret() -> str:
-    if settings.auth_secret_key is None:
-        return "dev-fallback-secret"
-    return settings.auth_secret_key.get_secret_value()
+    """Delegate to the centralised auth secret — see apps/onboarding_routes."""
+    from core.auth_secret import auth_secret
+    return auth_secret()
 
 
 def _require_admin(token: str | None) -> None:

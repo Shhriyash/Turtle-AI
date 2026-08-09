@@ -831,8 +831,11 @@ def _queue_confirmation_candidates_from_turn(
     )
     try:
         from core.worker import track_task
-
-        track_task(task)
+        # Tag by user_id so account-link merge can drain THIS user's in-flight
+        # extraction before snapshotting the source journal (Codex flagged that
+        # detached extraction outlives the source lock and can append into a
+        # now-unreachable journal after the mapping is re-pointed).
+        track_task(task, user_id=getattr(state, "user_id", None) or None)
     except Exception:
         pass
     return 0
@@ -2293,6 +2296,35 @@ _APP_LOOP: "asyncio.AbstractEventLoop | None" = None
 
 
 @app.on_event("startup")
+async def _refuse_forgeable_binding() -> None:
+    """Refuse to serve a network-reachable interface without a real AUTH_SECRET_KEY.
+
+    Codex adversarial review found that missing-secret deployments accepted
+    tokens signed with the repo-known dev fallback for any user_id. The fallback
+    is now a per-process random secret (core/auth_secret.py) instead of a
+    literal, which fixes forgery — but a non-loopback bind without a stable
+    AUTH_SECRET_KEY still invalidates every cookie on every restart, which is
+    worse UX than refusing to start. Cloud is already fail-fast in auth_secret().
+    """
+    import os
+    from core.auth_secret import is_using_fallback_secret
+
+    if not is_using_fallback_secret():
+        return  # explicit secret set — safe to bind anywhere
+    # ASGI adapters expose the bound host via env or arg. UVICORN_HOST / HOST
+    # are the common ones; if neither is set, we can't prove it's non-loopback,
+    # so err on the side of allowing (the local dev case).
+    host = (os.environ.get("UVICORN_HOST") or os.environ.get("HOST") or "").strip()
+    if host and host not in ("127.0.0.1", "::1", "localhost"):
+        raise RuntimeError(
+            f"Refusing to bind {host!r} without AUTH_SECRET_KEY set. Any leaked "
+            "session cookie becomes forgeable after restart, and the fallback "
+            "is a process-random dev secret. Set AUTH_SECRET_KEY, or bind "
+            "127.0.0.1."
+        )
+
+
+@app.on_event("startup")
 async def _start_routine_scheduler() -> None:
     global _routine_scheduler, _APP_LOOP
     # Capture the running app loop so the scheduler thread can bridge routine
@@ -3026,68 +3058,87 @@ async def link_account_redeem(request: Request):
     if not code:
         return JSONResponse({"error": "code is required"}, status_code=400)
 
-    from core.account_linking import LinkCodeStore, peek, merge_memory, mark_consumed
+    from core.account_linking import (
+        LinkCodeStore, mark_consumed, merge_memory, release_reservation, reserve,
+    )
     from core.identity import identity_manager
 
     store = LinkCodeStore(identity_manager.db_path)
 
-    # ── ORDERING MATTERS. This route used to consume the code first, then
-    # commit link_channel, then run merge_memory. That gave the WORST failure
-    # mode: a mid-batch append failure left the mapping already re-pointed at
-    # the target with the source journal orphaned, the code already consumed
-    # (so no retry), and the caller still got HTTP 200.
-    #
-    # New order: PEEK the code (no consume yet) → hold the source's channel
-    # lock so no in-flight turn writes into the snapshot we are copying →
-    # MERGE first → only if that succeeds, COMMIT ownership and CONSUME the
-    # code. On merge failure the code stays redeemable so the user can retry,
-    # and the source journal is untouched. Nothing user-visible flips until
-    # everything is safe. ─────────────────────────────────────────────────────
-    claim = await asyncio.to_thread(store.peek, code)
-    if claim is None:
-        # One message for unknown/expired/consumed: don't help someone probe codes.
+    # ── ORDERING (post-Codex-verification-pass):
+    #   1. RESERVE the code atomically for THIS target user_id. Same-target
+    #      retries refresh the reservation; a DIFFERENT target within TTL is
+    #      rejected. This closes the two-target race — two authenticated
+    #      redeemers can no longer both merge and repoint.
+    #   2. Take the source's channel lock so in-flight turns don't write into
+    #      the snapshot we are about to copy.
+    #   3. MERGE the source journal into the target.
+    #   4. On merge failure: release the reservation (so THIS target can retry
+    #      immediately) and return 503. Mapping and code are unchanged.
+    #   5. On merge success: link_channel (idempotent) then mark_consumed
+    #      (single-shot). A crash between them leaves the mapping correct AND
+    #      the code burnable on retry — because link_channel is a no-op when
+    #      already pointing at this user_id. ─────────────────────────────────
+    status, claim = await asyncio.to_thread(reserve, store, code, user_id)
+    if status == "invalid":
         return JSONResponse(
             {"error": "That code is invalid or has expired"}, status_code=400
         )
+    if status == "locked":
+        # Reserved for a different target — most likely an interception attempt.
+        # Do not reveal that the code exists.
+        return JSONResponse(
+            {"error": "That code is invalid or has expired"}, status_code=400
+        )
+    assert claim is not None  # status=="ok" always yields a claim
 
     if claim.source_user_id == user_id:
-        # Best-effort consume so this code can't be replayed later; nothing to merge.
+        # Nothing to merge; burn the reservation so it can't be replayed.
         await asyncio.to_thread(store.consume, code)
         return JSONResponse({"status": "ok", "already_linked": True, "merged": {}})
 
     source_lock = _channel_state_lock((claim.source_user_id, claim.channel))
     async with source_lock:
+        # Drain detached writers (per-turn extraction, reflector Stage-B +
+        # rolling summary) that started under the source user_id — they
+        # outlive _channel_dispatch_handler and would otherwise append into a
+        # journal that is about to become unreachable, silently stranding those
+        # writes. drain_user_tasks is bounded (5s) so a hung task can't stall
+        # linking indefinitely. Evict the cached source SharedState UP FRONT
+        # so anything that resolves the mapping AFTER this line sees the new
+        # target on their next turn.
+        from core.worker import drain_user_tasks
+
+        _CHANNEL_STATES.pop((claim.source_user_id, claim.channel), None)
+        drained = await drain_user_tasks(claim.source_user_id, timeout=5.0)
+        if drained:
+            print(f"LOG: link drained {drained} in-flight source task(s) for {claim.source_user_id}")
+
         merged = await asyncio.to_thread(merge_memory, claim.source_user_id, user_id)
         if not merged.get("ok", False):
-            # Merge failed. Do NOT re-point the mapping and do NOT consume the
-            # code — the code stays redeemable so the user can retry once the
-            # underlying condition (disk full, storage cap, etc.) is cleared.
+            await asyncio.to_thread(release_reservation, store, code, user_id)
             print(
                 f"LOG: link merge FAILED for {claim.source_user_id}->{user_id}: "
-                f"{merged.get('error','?')} — mapping not re-pointed, code not consumed"
+                f"{merged.get('error','?')} — mapping unchanged, reservation released"
             )
             return JSONResponse(
                 {"error": "Could not import your channel memory — please try again in a minute"},
                 status_code=503,
             )
 
-        # Merge succeeded → commit ownership. link_channel is idempotent, so a
-        # retry after a transient error here is safe. mark_consumed is last so
-        # that a crash between link_channel and mark_consumed leaves the mapping
-        # correct AND the code still burnable on retry (link_channel is a no-op
-        # if already pointing at user_id).
         previous = await identity_manager.link_channel(
             user_id=user_id, channel=claim.channel, channel_user_id=claim.channel_user_id
         )
         consumed = await asyncio.to_thread(mark_consumed, store, code)
         if not consumed:
-            # Race — another redemption raced us after peek. Ownership commit
-            # above was idempotent, so the state is still coherent. Log and 200.
+            # Only reachable if someone raced the consume AFTER we reserved —
+            # they'd have needed our target too (reservation blocks others), so
+            # link_channel above already saw the same target and was a no-op.
             print(f"LOG: link code raced during consume: {code[:2]}***")
 
-        # The channel's cached SharedState still points at the OLD user_id.
-        _CHANNEL_STATES.pop((claim.source_user_id, claim.channel), None)
-        _CHANNEL_STATE_LOCKS.pop((claim.source_user_id, claim.channel), None)
+        # Cache was already evicted before the merge — nothing more to drop
+        # here. We keep the LOCK in place so any queued turn for the source
+        # awaits us and then rebuilds against the new mapping.
 
     print(
         f"LOG: account linked channel={claim.channel} external={claim.channel_user_id} "

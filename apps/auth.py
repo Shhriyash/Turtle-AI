@@ -20,14 +20,16 @@ def create_session_token(user_id: str, channel: str = "web") -> str:
     expire = datetime.now(UTC) + timedelta(hours=24)
     to_encode = {"sub": user_id, "channel": channel, "exp": expire}
     
-    secret = settings.auth_secret_key.get_secret_value() if settings.auth_secret_key else "dev-fallback-secret"
+    from core.auth_secret import auth_secret
+    secret = auth_secret()
     encoded_jwt = jwt.encode(to_encode, secret, algorithm=ALGORITHM)
     return encoded_jwt
 
 
 def verify_token(token: str) -> dict:
     """Verify the JWT token and return payload."""
-    secret = settings.auth_secret_key.get_secret_value() if settings.auth_secret_key else "dev-fallback-secret"
+    from core.auth_secret import auth_secret
+    secret = auth_secret()
     try:
         payload = jwt.decode(token, secret, algorithms=[ALGORITHM])
         return payload
