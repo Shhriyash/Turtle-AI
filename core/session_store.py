@@ -24,6 +24,12 @@ from core.storage.local.sqlite_store import SQLiteSessionStore
 # runtime needs, and the tail is enough for reconstruct fidelity.
 COMPLETED_SESSION_MESSAGE_TAIL = 12
 
+# Age cap for pulling summary carryover out of a still-"pending_finalization"
+# session. Channel-only users never finalize (no WS sweep), so those sessions
+# ARE their history — but a crash-orphaned session from weeks ago must not leak
+# stale context into a fresh conversation. 24h covers "same user, next day".
+CARRYOVER_MAX_AGE_S = 24 * 60 * 60
+
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -344,9 +350,17 @@ class SessionStore:
         The current session's own rolling summary always wins when present. But
         a freshly started session has an empty summary, so the [Recent Summary]
         tier never fired for a new conversation. When empty (and the backend
-        supports list_sessions), fall back to the most recent COMPLETED session
+        supports list_sessions), fall back to the most recent prior session
         owned by the same user and return ITS tail — this is what gives a
         brand-new session continuity with the previous one.
+
+        Scans BOTH "completed" and "pending_finalization". Channel-only users
+        (Discord/Slack) never hit the WebSocket connect/disconnect sweep that
+        calls mark_finalized, so their sessions never become "completed" —
+        scanning only that status meant a Discord user got zero carryover and
+        started every conversation cold. pending_finalization sessions are
+        age-capped (CARRYOVER_MAX_AGE_S) so a long-abandoned or crash-orphaned
+        session can't leak stale context into a fresh conversation.
         """
         if max_entries <= 0:
             return []
@@ -355,17 +369,25 @@ class SessionStore:
             return own
         if not hasattr(self.backend, "list_sessions"):
             return []
+        candidates: list[Session] = []
         try:
-            completed = await self._list_sessions_for_user("completed")
+            candidates.extend(await self._list_sessions_for_user("completed"))
         except Exception as exc:
             print(f"LOG: SessionStore carryover list_sessions failed: {exc}")
             return []
-        if not completed:
+        try:
+            for session in await self._list_sessions_for_user("pending_finalization"):
+                age = self._seconds_since(session.data.get("updated_at", ""))
+                if age <= CARRYOVER_MAX_AGE_S:
+                    candidates.append(session)
+        except Exception as exc:
+            print(f"LOG: SessionStore carryover pending scan failed: {exc}")
+        if not candidates:
             return []
-        # Newest completed session first; the current session is never among
+        # Newest prior session first; the current session is never among
         # the completed set, but guard against it anyway.
-        completed.sort(key=lambda s: s.data.get("updated_at", ""), reverse=True)
-        for session in completed:
+        candidates.sort(key=lambda s: s.data.get("updated_at", ""), reverse=True)
+        for session in candidates:
             if self.session_id and session.session_id == self.session_id:
                 continue
             summary = session.data.get("summary", [])

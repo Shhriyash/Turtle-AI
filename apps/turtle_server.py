@@ -480,10 +480,48 @@ def _is_user_turn_request(message: ModelMessage) -> bool:
     )
 
 
+def _estimate_message_tokens(message: ModelMessage) -> int:
+    """Approximate a message's token cost from its CONTENT, not its repr.
+
+    The old estimator was ``len(str(m)) // 4``. ``str()`` on a pydantic-ai
+    message renders the whole dataclass repr — every message dragged in
+    ~130-155 chars of ``datetime.datetime(...)`` / ``RequestUsage()`` /
+    part-class scaffolding, i.e. ~35 PHANTOM tokens each. Across the 40-message
+    window that is ~1,450 tokens — 36% of ACTIVE_HISTORY_MAX_TOKENS spent on
+    timestamps the model never sees, and for short conversational turns the
+    over-count is ~10x. The trim therefore evicted real conversation long before
+    the model was anywhere near its context limit: the mechanism behind
+    "Turtle forgot what I said a few messages ago".
+
+    Count the actual payload instead — text/content, tool args, tool names —
+    plus a small per-part allowance for the role framing a provider adds.
+    """
+    parts = getattr(message, "parts", None) or []
+    chars = 0
+    for part in parts:
+        content = getattr(part, "content", None)
+        if content is not None:
+            chars += len(content) if isinstance(content, str) else len(str(content))
+        args = getattr(part, "args", None)
+        if args is not None:
+            chars += len(args) if isinstance(args, str) else len(str(args))
+        tool_name = getattr(part, "tool_name", None)
+        if tool_name:
+            chars += len(str(tool_name))
+    return (chars // 4) + (2 * len(parts))
+
+
 def _trim_history_for_context(history: list[ModelMessage]) -> list[ModelMessage]:
+    # Cost each message ONCE: the old code re-ran the estimator over the whole
+    # window on every iteration of the shrink loop (O(n^2) re-serialization on
+    # the critical path of every turn).
+    costs: dict[int, int] = {id(m): _estimate_message_tokens(m) for m in history}
+
+    def _window_tokens(msgs: list[ModelMessage]) -> int:
+        return sum(costs.get(id(m)) or _estimate_message_tokens(m) for m in msgs)
+
     if len(history) <= ACTIVE_HISTORY_MAX_MESSAGES:
-        approx_tokens = sum(len(str(m)) // 4 for m in history)
-        if approx_tokens <= ACTIVE_HISTORY_MAX_TOKENS:
+        if _window_tokens(history) <= ACTIVE_HISTORY_MAX_TOKENS:
             return history
 
     user_turns_seen = 0
@@ -499,7 +537,9 @@ def _trim_history_for_context(history: list[ModelMessage]) -> list[ModelMessage]
     if len(trimmed) > ACTIVE_HISTORY_MAX_MESSAGES:
         trimmed = trimmed[-ACTIVE_HISTORY_MAX_MESSAGES:]
 
-    while trimmed and sum(len(str(m)) // 4 for m in trimmed) > ACTIVE_HISTORY_MAX_TOKENS:
+    running = _window_tokens(trimmed)
+    while trimmed and running > ACTIVE_HISTORY_MAX_TOKENS:
+        running -= costs.get(id(trimmed[0])) or _estimate_message_tokens(trimmed[0])
         trimmed = trimmed[1:]
 
     # ── Front normalization (pair-aware) ──────────────────────────────────
@@ -2324,7 +2364,14 @@ app.include_router(_admin_router)
 _CHANNEL_STATES: dict[tuple[str, str], tuple[SharedState, float]] = {}
 _CHANNEL_STATE_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
 _CHANNEL_STATE_CAP = 64
-_CHANNEL_STATE_IDLE_TTL_S = 30 * 60
+# MUST stay comfortably BELOW SessionStore's resume_window_seconds (1800s).
+# These were both 30 min, which made idle-eviction deterministically the one
+# case that CANNOT resume: evict at 1800s -> next message calls start_or_restore
+# -> the session's age is by construction just past the 1800s window -> no
+# resume, brand-new empty session, conversation context gone. Evicting earlier
+# means a returning channel user rebuilds state and STILL lands inside the
+# resume window, so the session (and its history) comes back warm.
+_CHANNEL_STATE_IDLE_TTL_S = 10 * 60
 
 
 def _channel_state_lock(key: tuple[str, str]) -> asyncio.Lock:
