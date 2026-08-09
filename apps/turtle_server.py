@@ -348,6 +348,9 @@ class SharedState:
     # (e.g. discord/759…), not to the Turtle user_id. Empty on the web path.
     channel: str = ""
     channel_user_id: str = ""
+    # True only when this surface is readable solely by the sender (a DM).
+    # Secret-bearing tools (link_account) refuse on anything else.
+    channel_is_private: bool = False
     # Phase 1: the memory block for the current turn. Delivered to the model
     # via per-turn instructions (never inside the persisted user prompt).
     memory_context: str = ""
@@ -2162,6 +2165,19 @@ class AgentManager:
                     "Account linking is only available from a channel like Discord. "
                     "On the web you are already signed in."
                 ).to_agent_string()
+            # NEVER emit a claim code into a shared channel. The code is a
+            # BEARER credential: whoever redeems it first gets THIS sender's
+            # channel identity re-pointed at THEIR account, and merge_memory
+            # copies THIS sender's journal into it. So an observer in a public
+            # channel who races the code steals the sender's memory — it is not
+            # (as the original design note claimed) harmless to leak.
+            if not getattr(deps, "channel_is_private", False):
+                return ToolResult.invalid(
+                    "I can't start account linking in a shared channel — the code "
+                    "would be visible to everyone here, and anyone who used it "
+                    "first would end up with your memory. Send me a direct "
+                    "message and I'll set it up there."
+                ).to_agent_string()
             try:
                 from core.account_linking import LINK_CODE_TTL_MINUTES, LinkCodeStore
                 from core.identity import identity_manager
@@ -2593,6 +2609,7 @@ async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
         # can issue a claim code for the right channel identity.
         state.channel = str(event.channel or "")
         state.channel_user_id = str(getattr(event, "channel_user_id", "") or "")
+        state.channel_is_private = bool(getattr(event, "is_private", False))
 
         message_history = state.session_store.message_history or None
 

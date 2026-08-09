@@ -43,6 +43,13 @@ class TurtleEvent:
     # user_id which is Turtle's internal id. Account linking binds a claim code
     # to this, because it is what the channel proves control of.
     channel_user_id: str = ""
+    # True only when the reply goes somewhere ONLY THIS SENDER can read (a DM).
+    # Secrets — notably account-link claim codes — must never be emitted into a
+    # shared channel: a claim code is a bearer credential, and whoever redeems
+    # it gets the sender's channel identity bound to THEIR account along with a
+    # merge of the sender's memory. Defaults to False so any adapter that has
+    # not opted in is treated as public (fail closed).
+    is_private: bool = False
 
 
 @dataclass

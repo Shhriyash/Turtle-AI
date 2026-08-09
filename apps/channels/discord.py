@@ -238,6 +238,11 @@ async def discord_interactions(request: Request):
                     thread_id=channel_id,
                     sender_name=sender_name,
                     channel_user_id=discord_user_id,
+                    # A guild interaction carries "member"; a DM carries only
+                    # "user". The deferred follow-up here is NOT ephemeral, so
+                    # a guild reply is readable by everyone in the channel —
+                    # treat it as public and let secret-bearing tools refuse.
+                    is_private=not bool(payload.get("member")),
                 )
                 response: TurtleResponse = await dispatch_event(turtle_event)
                 await _send_followup(interaction_token, response.content or "…")

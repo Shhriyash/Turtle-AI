@@ -25,6 +25,8 @@ class FAISSVectorStore(VectorStore):
         self._indices: Dict[str, faiss.Index] = {}
         self._metadata: Dict[str, List[Dict[str, Any]]] = {}
         self._locks: Dict[str, threading.Lock] = {}
+        # Guards creation of entries in _locks (see _get_lock).
+        self._locks_guard = threading.Lock()
         self._embedder = get_embedding_model()
 
     def _get_tenant_dir(self, user_id: str) -> Path:
@@ -33,9 +35,22 @@ class FAISSVectorStore(VectorStore):
         return d
 
     def _get_lock(self, user_id: str) -> threading.Lock:
-        if user_id not in self._locks:
-            self._locks[user_id] = threading.Lock()
-        return self._locks[user_id]
+        """Per-tenant lock, created under a registry guard.
+
+        This was an unsynchronized check-then-insert. That was (barely) safe
+        while every caller ran on the single event-loop thread, but moving
+        search/upsert onto asyncio.to_thread made it genuinely multi-threaded:
+        two first-time operations for the same tenant could each create and take
+        a DIFFERENT lock, then concurrently mutate _indices/_metadata and
+        overwrite index.bin / metadata.json — corrupting vector-to-metadata
+        alignment. Guard the registry itself so the per-tenant lock is unique.
+        """
+        with self._locks_guard:
+            lock = self._locks.get(user_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[user_id] = lock
+            return lock
 
     def _load_tenant(self, user_id: str) -> None:
         if user_id in self._indices:

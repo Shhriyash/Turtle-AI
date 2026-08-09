@@ -141,6 +141,8 @@ async def start_discord_gateway() -> None:
                 thread_id=str(message.channel.id),
                 sender_name=str(sender_name),
                 channel_user_id=str(message.author.id),
+                # DM only: an @mention in a guild is readable by everyone there.
+                is_private=bool(is_dm),
             )
             response: TurtleResponse = await dispatch_event(turtle_event)
             await message.channel.send(response.content[:_MAX_REPLY_CHARS])
