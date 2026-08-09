@@ -125,6 +125,10 @@ class MemoryEndpointContractTests(unittest.TestCase):
         # deploy_mode so the test is robust regardless of the ambient env.
         self._orig_deploy_mode = turtle_server.settings.deploy_mode
         turtle_server.settings.deploy_mode = "local"
+        # _get_user_id_from_request now requires DEV_ANON=1 to resolve an
+        # anonymous local caller to local_dev_user (was implicit off-cloud).
+        self._orig_dev_anon = turtle_server.settings.dev_anon
+        turtle_server.settings.dev_anon = True
 
         # Inject a minimal active state carrying our real gate. The endpoints
         # only touch state.confirmation_gate.
@@ -139,6 +143,7 @@ class MemoryEndpointContractTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         turtle_server.settings.deploy_mode = self._orig_deploy_mode
+        turtle_server.settings.dev_anon = self._orig_dev_anon
         if self._prev_state is None:
             turtle_server._ACTIVE_STATES_BY_USER.pop(self.USER, None)
         else:

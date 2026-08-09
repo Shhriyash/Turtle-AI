@@ -98,7 +98,11 @@ def _verify_discord_signature(body: bytes, signature_hex: str, timestamp: str) -
     """
     pub = _public_key()
     if not pub:
-        return not settings.is_cloud  # dev no-op locally; fail closed in cloud
+        # FAIL CLOSED unless TURTLE_DEV_ANON=1 AND not cloud. A tunneled local
+        # deploy (ngrok, cloudflared) is network-accessible and must not accept
+        # unsigned interactions just because is_cloud is False. Aligned with
+        # whatsapp / imessage / slack.
+        return settings.dev_anon and not settings.is_cloud
     try:
         verify_key = ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub))
         verify_key.verify(bytes.fromhex(signature_hex), timestamp.encode() + body)

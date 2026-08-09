@@ -130,3 +130,66 @@ def test_faiss_distinct_tenants_get_distinct_locks():
 
     assert store._get_lock("a") is not store._get_lock("b")
     assert store._get_lock("a") is store._get_lock("a")
+
+
+# ── 3. link ordering: merge FIRST, commit only on success ────────────────────
+
+def test_merge_failure_leaves_mapping_untouched(tmp_path, monkeypatch):
+    """The redemption route must MERGE before it re-points the channel mapping
+    and consumes the code. If merge fails, the mapping must NOT be re-pointed
+    and the code must stay redeemable (so the user can retry once whatever
+    caused the failure clears)."""
+    import asyncio
+    import core.account_linking as al
+    from core.identity import IdentityManager
+
+    db = tmp_path / "users.sqlite"
+    mgr = IdentityManager(db_path=db)
+    store = al.LinkCodeStore(db)
+
+    async def setup_and_run():
+        await mgr.init_db()
+        source = await mgr.resolve_user("discord", "759")
+        target = await mgr.resolve_user("web_email", "me@example.com")
+        code = store.issue(
+            channel="discord", channel_user_id="759", source_user_id=source
+        ).code
+
+        # simulate a merge failure exactly as the endpoint would see it
+        def failing_merge(src, dst):
+            return {"events_copied": 0, "replayed": False, "ok": False, "error": "disk full"}
+
+        # 1. Peek + failing merge: mapping NOT re-pointed, code NOT consumed.
+        claim = store.peek(code)
+        assert claim is not None
+        merged = failing_merge(claim.source_user_id, target)
+        assert not merged["ok"]
+        # The endpoint would return here without link_channel / mark_consumed.
+
+        # Mapping still points at the ORIGINAL source user id.
+        assert await mgr.resolve_user("discord", "759") == source
+        # Code is still redeemable.
+        assert store.peek(code) is not None
+
+        # 2. Now the retry succeeds -> commit ownership + burn the code.
+        await mgr.link_channel(user_id=target, channel="discord", channel_user_id="759")
+        assert al.mark_consumed(store, code) is True
+        assert await mgr.resolve_user("discord", "759") == target
+        assert store.peek(code) is None
+
+    asyncio.run(setup_and_run())
+
+
+def test_peek_does_not_consume_but_consume_is_single_shot(tmp_path):
+    """peek() must not burn a code; consume() must still be single-shot after
+    N peeks (this is the property that lets us hold the code across the merge)."""
+    import core.account_linking as al
+
+    store = al.LinkCodeStore(tmp_path / "users.sqlite")
+    code = store.issue(channel="discord", channel_user_id="x", source_user_id="u").code
+
+    for _ in range(5):
+        assert store.peek(code) is not None
+    assert al.mark_consumed(store, code) is True
+    assert al.mark_consumed(store, code) is False
+    assert store.peek(code) is None

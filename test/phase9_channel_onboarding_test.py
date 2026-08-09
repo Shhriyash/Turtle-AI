@@ -39,18 +39,34 @@ def _identity_lines(user_id: str) -> list[str]:
     return [str(x) for x in (getattr(doc, "lines", None) or [])]
 
 
-def test_first_contact_seeds_a_name():
+def _pending_name_events(user_id: str):
+    from core.memory_journal import JournalStore
+    return [
+        e for e in JournalStore(user_id=user_id).load_all()
+        if e.key == "identity.name" and not e.applied
+    ]
+
+
+def test_first_contact_seeds_a_pending_name_not_applied():
+    """A platform display name is untrusted input (Codex review): it must land
+    as PENDING, not applied — otherwise it becomes authoritative memory that
+    the replayer renders and the retrieval broker injects."""
     assert seed_channel_profile("usr_new", display_name="Shang Tsung", channel="discord")
-    assert any("Shang Tsung" in line for line in _identity_lines("usr_new"))
-    assert has_identity("usr_new")
+    pending = _pending_name_events("usr_new")
+    assert pending, "no pending identity.name event was journaled"
+    assert pending[0].value.get("name") == "Shang Tsung"
+    assert pending[0].source == "inferred"
+    # No applied event, no identity.md rendered.
+    assert not has_identity("usr_new")
+    assert not any("Shang Tsung" in line for line in _identity_lines("usr_new"))
 
 
 def test_seeding_is_idempotent():
     """Called on every turn — the second call must be a no-op, not a duplicate."""
     assert seed_channel_profile("usr_idem", display_name="Ada", channel="discord") is True
     assert seed_channel_profile("usr_idem", display_name="Ada", channel="discord") is False
-    name_lines = [l for l in _identity_lines("usr_idem") if "name:" in l.lower()]
-    assert len(name_lines) == 1
+    # Only one pending candidate — no duplicates journaled either.
+    assert len(_pending_name_events("usr_idem")) == 1
 
 
 def test_platform_name_never_overwrites_a_user_stated_name():
@@ -68,22 +84,20 @@ def test_junk_display_names_are_rejected():
     for junk in ("", "  ", "user", "Unknown", "Deleted User", "x"):
         assert seed_channel_profile("usr_junk", display_name=junk, channel="discord") is False
     assert not has_identity("usr_junk")
+    assert not _pending_name_events("usr_junk")
 
 
-def test_seed_writes_a_durable_journal_event():
-    """identity.md alone is not durable — the replayer rebuilds topic files from
-    the journal and unlinks a file with no applied events behind it."""
+def test_seed_writes_a_journal_candidate():
+    """The candidate is journaled (single source of truth) even though NOT
+    applied — so a later confirmation can promote it deterministically."""
     from core.memory_journal import JournalStore
 
     seed_channel_profile("usr_journal", display_name="Grace", channel="discord")
     events = JournalStore(user_id="usr_journal").load_all()
-    identity_events = [e for e in events if e.key == "identity.name" and e.applied]
-    assert identity_events, "no applied identity.name event was journaled"
-    ev = identity_events[0]
-    assert ev.value.get("name") == "Grace"
-    # weak signal: must be outrankable by an explicit user statement
-    assert ev.source == "inferred"
-    assert ev.confidence < 0.9
+    assert any(
+        e.key == "identity.name" and e.value.get("name") == "Grace" and not e.applied
+        for e in events
+    ), "expected a pending (unapplied) identity.name candidate"
 
 
 def test_provision_from_turtle_event():
@@ -97,7 +111,10 @@ def test_provision_from_turtle_event():
         sender_name="Linus",
     )
     assert provision_channel_user(event) is True
-    assert any("Linus" in l for l in _identity_lines("usr_evt"))
+    # Candidate journaled but NOT projected — Linus doesn't appear in identity.md.
+    pending = _pending_name_events("usr_evt")
+    assert pending and pending[0].value.get("name") == "Linus"
+    assert not has_identity("usr_evt")
 
 
 def test_turtle_event_carries_sender_name_by_default():

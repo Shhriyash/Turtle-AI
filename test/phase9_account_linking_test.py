@@ -196,10 +196,13 @@ def test_link_channel_rejects_blank_input(tmp_path):
 # ASGI route so the wiring itself is covered.
 
 def test_link_endpoint_rejects_bad_code_without_500(monkeypatch):
+    """With TURTLE_DEV_ANON=1 in local dev, an anon caller reaches the code
+    check and gets a clean 400 for a bad code (never a 500 traceback)."""
     from fastapi.testclient import TestClient
     import apps.turtle_server as ts
 
     monkeypatch.setattr(ts.settings, "deploy_mode", "local", raising=False)
+    monkeypatch.setattr(ts.settings, "dev_anon", True, raising=False)
     with TestClient(ts.app) as client:
         resp = client.post("/api/account/link", json={"code": "BOGUSCODE"})
     assert resp.status_code == 400, f"expected a clean 400, got {resp.status_code}"
@@ -211,18 +214,34 @@ def test_link_endpoint_requires_a_code(monkeypatch):
     import apps.turtle_server as ts
 
     monkeypatch.setattr(ts.settings, "deploy_mode", "local", raising=False)
+    monkeypatch.setattr(ts.settings, "dev_anon", True, raising=False)
     with TestClient(ts.app) as client:
         resp = client.post("/api/account/link", json={})
     assert resp.status_code == 400
 
 
 def test_link_endpoint_requires_authentication(monkeypatch):
-    """In cloud there is no local_dev_user fallback — unauthenticated must 401,
+    """In cloud there is no dev fallback — unauthenticated must 401,
     never link. Authentication IS the proof of target-account ownership."""
     from fastapi.testclient import TestClient
     import apps.turtle_server as ts
 
     monkeypatch.setattr(ts.settings, "deploy_mode", "cloud", raising=False)
+    monkeypatch.setattr(ts.settings, "dev_anon", False, raising=False)
+    with TestClient(ts.app) as client:
+        resp = client.post("/api/account/link", json={"code": "WHATEVER"})
+    assert resp.status_code == 401
+
+
+def test_link_endpoint_401_without_dev_anon_even_locally(monkeypatch):
+    """The regression Codex flagged: off-cloud DID auto-resolve local_dev_user
+    for any anonymous request. Now unauthenticated + dev_anon=False must 401
+    regardless of deploy mode."""
+    from fastapi.testclient import TestClient
+    import apps.turtle_server as ts
+
+    monkeypatch.setattr(ts.settings, "deploy_mode", "local", raising=False)
+    monkeypatch.setattr(ts.settings, "dev_anon", False, raising=False)
     with TestClient(ts.app) as client:
         resp = client.post("/api/account/link", json={"code": "WHATEVER"})
     assert resp.status_code == 401

@@ -2404,7 +2404,17 @@ from apps.channels.discord import router as _discord_router
 app.include_router(_whatsapp_router)
 app.include_router(_imessage_router)
 app.include_router(_slack_router)
-app.include_router(_twilio_voice_router)
+# apps/channels/twilio_voice.py: NOT MOUNTED.
+# The WS at /channels/twilio/voice/stream has no signature verification and
+# takes the tenant straight from client-supplied `start.customParameters.from`,
+# streaming replies back over the caller's own socket. That is an
+# unauthenticated, bidirectional cross-tenant read channel — setting
+# TWILIO_AUTH_TOKEN does not close it because the WS route never checks any
+# signature. Flagged critical by both audits; remounting requires (a) validating
+# the /incoming HTTP hop and (b) issuing a short-lived server-signed stream
+# token that binds the socket to the validated call SID / caller. Until that
+# lands, keep the router unmounted so no code path can reach it.
+# app.include_router(_twilio_voice_router)  # DO NOT UNCOMMENT WITHOUT AUTH.
 app.include_router(_discord_router)
 
 from apps.onboarding_routes import router as _onboarding_router, verify_session_cookie
@@ -2876,18 +2886,50 @@ async def list_agents():
 # ---------------------------------------------------------------------------
 
 def _get_user_id_from_request(request: Request) -> str | None:
-    """Extract user_id from Bearer token, or fall back to local-dev identity."""
-    from apps.auth import verify_token
+    """Resolve the HTTP caller's user_id.
+
+    Mirrors ``authenticate_websocket`` (apps/auth.py:40) so cookies and the
+    dev-anon escape hatch behave identically on WS and HTTP. Order:
+
+      1. ``turtle_uid`` cookie minted by /onboarding/claim — this is what the
+         browser actually sends (`credentials: 'same-origin'`). The previous
+         implementation ignored it entirely, so every real logged-in user got
+         401 from every memory endpoint in cloud, and off-cloud silently
+         resolved to a shared literal ``local_dev_user`` regardless of who was
+         logged in — which link redemption in particular must not do.
+      2. ``Authorization: Bearer …`` header (legacy / API clients).
+      3. Dev-only fallback to ``local_dev_user`` ONLY when
+         ``TURTLE_DEV_ANON=1`` AND not cloud. Never the default off-cloud
+         behaviour.
+    """
+    # 1. cookie
+    cookie_token = request.cookies.get("turtle_uid")
+    if cookie_token:
+        try:
+            from apps.onboarding_routes import verify_session_cookie
+            user_id = verify_session_cookie(cookie_token)
+            if user_id:
+                return user_id
+        except Exception:
+            pass
+
+    # 2. bearer
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header.split(" ", 1)[1]
         try:
+            from apps.auth import verify_token
             payload = verify_token(token)
-            return payload.get("sub")
+            sub = payload.get("sub")
+            if sub:
+                return sub
         except Exception:
-            return None
-    if not settings.is_cloud:
+            pass
+
+    # 3. explicit dev-anon opt-in only (mirrors WS auth)
+    if settings.dev_anon and not settings.is_cloud:
         return "local_dev_user"
+
     return None
 
 
@@ -2984,29 +3026,68 @@ async def link_account_redeem(request: Request):
     if not code:
         return JSONResponse({"error": "code is required"}, status_code=400)
 
-    from core.account_linking import LinkCodeStore, merge_memory
+    from core.account_linking import LinkCodeStore, peek, merge_memory, mark_consumed
     from core.identity import identity_manager
 
     store = LinkCodeStore(identity_manager.db_path)
-    claim = await asyncio.to_thread(store.consume, code)
+
+    # ── ORDERING MATTERS. This route used to consume the code first, then
+    # commit link_channel, then run merge_memory. That gave the WORST failure
+    # mode: a mid-batch append failure left the mapping already re-pointed at
+    # the target with the source journal orphaned, the code already consumed
+    # (so no retry), and the caller still got HTTP 200.
+    #
+    # New order: PEEK the code (no consume yet) → hold the source's channel
+    # lock so no in-flight turn writes into the snapshot we are copying →
+    # MERGE first → only if that succeeds, COMMIT ownership and CONSUME the
+    # code. On merge failure the code stays redeemable so the user can retry,
+    # and the source journal is untouched. Nothing user-visible flips until
+    # everything is safe. ─────────────────────────────────────────────────────
+    claim = await asyncio.to_thread(store.peek, code)
     if claim is None:
-        # One message for unknown/expired/reused: don't help someone probe codes.
+        # One message for unknown/expired/consumed: don't help someone probe codes.
         return JSONResponse(
             {"error": "That code is invalid or has expired"}, status_code=400
         )
 
     if claim.source_user_id == user_id:
+        # Best-effort consume so this code can't be replayed later; nothing to merge.
+        await asyncio.to_thread(store.consume, code)
         return JSONResponse({"status": "ok", "already_linked": True, "merged": {}})
 
-    previous = await identity_manager.link_channel(
-        user_id=user_id, channel=claim.channel, channel_user_id=claim.channel_user_id
-    )
-    merged = await asyncio.to_thread(merge_memory, claim.source_user_id, user_id)
+    source_lock = _channel_state_lock((claim.source_user_id, claim.channel))
+    async with source_lock:
+        merged = await asyncio.to_thread(merge_memory, claim.source_user_id, user_id)
+        if not merged.get("ok", False):
+            # Merge failed. Do NOT re-point the mapping and do NOT consume the
+            # code — the code stays redeemable so the user can retry once the
+            # underlying condition (disk full, storage cap, etc.) is cleared.
+            print(
+                f"LOG: link merge FAILED for {claim.source_user_id}->{user_id}: "
+                f"{merged.get('error','?')} — mapping not re-pointed, code not consumed"
+            )
+            return JSONResponse(
+                {"error": "Could not import your channel memory — please try again in a minute"},
+                status_code=503,
+            )
 
-    # The channel's cached SharedState still points at the OLD user_id; drop it
-    # so the next message rebuilds against the linked account.
-    _CHANNEL_STATES.pop((claim.source_user_id, claim.channel), None)
-    _CHANNEL_STATE_LOCKS.pop((claim.source_user_id, claim.channel), None)
+        # Merge succeeded → commit ownership. link_channel is idempotent, so a
+        # retry after a transient error here is safe. mark_consumed is last so
+        # that a crash between link_channel and mark_consumed leaves the mapping
+        # correct AND the code still burnable on retry (link_channel is a no-op
+        # if already pointing at user_id).
+        previous = await identity_manager.link_channel(
+            user_id=user_id, channel=claim.channel, channel_user_id=claim.channel_user_id
+        )
+        consumed = await asyncio.to_thread(mark_consumed, store, code)
+        if not consumed:
+            # Race — another redemption raced us after peek. Ownership commit
+            # above was idempotent, so the state is still coherent. Log and 200.
+            print(f"LOG: link code raced during consume: {code[:2]}***")
+
+        # The channel's cached SharedState still points at the OLD user_id.
+        _CHANNEL_STATES.pop((claim.source_user_id, claim.channel), None)
+        _CHANNEL_STATE_LOCKS.pop((claim.source_user_id, claim.channel), None)
 
     print(
         f"LOG: account linked channel={claim.channel} external={claim.channel_user_id} "

@@ -56,13 +56,13 @@ def _verify_twilio_signature(request_url: str, post_params: dict[str, str], sign
     """Validate X-Twilio-Signature per Twilio docs."""
     secret = _get_secret()
     if not secret:
-        # Dev no-op locally; FAIL CLOSED in cloud. An unsigned-accepting public
-        # webhook lets anyone drive the whole pipeline with a spoofed sender id
-        # — unauthenticated LLM execution plus writes into an arbitrary tenant's
-        # memory. The shipped container sets TURTLE_DEPLOY=cloud (Dockerfile)
-        # and ships no channel secrets, so "no secret configured" is exactly the
-        # production default. Mirrors apps/channels/discord.py.
-        return not settings.is_cloud
+        # FAIL CLOSED unless the operator explicitly opts into unsafe dev mode
+        # (TURTLE_DEV_ANON=1) AND we are not in cloud. The prior check was
+        # `not settings.is_cloud`, which was itself an upgrade over the
+        # unconditional `return True` — but a local dev exposing this webhook
+        # through a public tunnel (ngrok, cloudflared) is the reason to
+        # require an explicit opt-in, not the deploy-mode flag alone.
+        return settings.dev_anon and not settings.is_cloud
 
     # Build validation string: URL + sorted POST params joined
     s = request_url

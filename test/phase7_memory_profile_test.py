@@ -21,8 +21,12 @@ def pm_root(tmp_path, monkeypatch):
 
 
 def _local(monkeypatch):
-    # Local mode → _get_user_id_from_request resolves to "local_dev_user".
+    # Local mode + DEV_ANON=1: _get_user_id_from_request now REQUIRES the
+    # explicit dev-anon opt-in to resolve to local_dev_user for anon requests
+    # (previously it did so unconditionally off-cloud — the regression Codex
+    # flagged where any anon request off-cloud silently owned a shared user).
     monkeypatch.setattr(turtle_server.settings, "deploy_mode", "local", raising=False)
+    monkeypatch.setattr(turtle_server.settings, "dev_anon", True, raising=False)
 
 
 def test_profile_empty_for_unknown_user(pm_root, monkeypatch):

@@ -47,6 +47,10 @@ LINK_CODE_TTL_MINUTES = 15
 _TABLE = "link_codes"
 
 
+def _normalize_code(code: str) -> str:
+    return (code or "").strip().upper().replace(" ", "").replace("-", "")
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -125,13 +129,41 @@ class LinkCodeStore:
             )
         return LinkCode(code, channel, channel_user_id, source_user_id, expires)
 
+    def peek(self, code: str) -> LinkCode | None:
+        """Look up a code WITHOUT marking it consumed.
+
+        Used by the redemption route to validate the code, then do the risky
+        merge work with the code still redeemable — so a merge failure leaves
+        the user with a working code to retry, instead of a burned code and an
+        orphaned source journal. Only expired/unknown/already-consumed return None.
+        """
+        normalized = _normalize_code(code)
+        if not normalized:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT * FROM {_TABLE} WHERE code = ?", (normalized,)
+            ).fetchone()
+        if row is None or row["consumed_at"] is not None:
+            return None
+        try:
+            expires = datetime.fromisoformat(row["expires_at"])
+        except Exception:
+            return None
+        if expires <= _utc_now():
+            return None
+        return LinkCode(
+            normalized, row["channel"], row["channel_user_id"],
+            row["source_user_id"], row["expires_at"],
+        )
+
     def consume(self, code: str) -> LinkCode | None:
         """Atomically redeem a code. Returns None if unknown, expired, or reused.
 
         The UPDATE ... WHERE consumed_at IS NULL is what makes this single-use
         even if two redemptions race: exactly one gets rowcount 1.
         """
-        normalized = (code or "").strip().upper().replace(" ", "").replace("-", "")
+        normalized = _normalize_code(code)
         if not normalized:
             return None
         with self._connect() as conn:
@@ -168,6 +200,18 @@ class LinkCodeStore:
             return cursor.rowcount or 0
 
 
+# Module-level thin wrappers so the redemption route can call these through
+# asyncio.to_thread against a bound `store` instance without lambdas.
+def peek(store: LinkCodeStore, code: str) -> LinkCode | None:
+    return store.peek(code)
+
+
+def mark_consumed(store: LinkCodeStore, code: str) -> bool:
+    """Atomically mark a code consumed. Returns True on the first consume, False
+    if it was already consumed / doesn't exist (peek+consume race lost)."""
+    return store.consume(code) is not None
+
+
 def merge_memory(source_user_id: str, target_user_id: str) -> dict[str, Any]:
     """Fold the source user's memory into the target's.
 
@@ -180,7 +224,7 @@ def merge_memory(source_user_id: str, target_user_id: str) -> dict[str, Any]:
     irreversible-looking to the user; keeping the original means a bad merge can
     be investigated rather than mourned.
     """
-    result: dict[str, Any] = {"events_copied": 0, "replayed": False}
+    result: dict[str, Any] = {"events_copied": 0, "replayed": False, "ok": True, "error": ""}
     if not source_user_id or not target_user_id or source_user_id == target_user_id:
         return result
 
@@ -194,6 +238,10 @@ def merge_memory(source_user_id: str, target_user_id: str) -> dict[str, Any]:
     try:
         events = source_journal.load_all()
     except Exception as exc:
+        # Was silently returning 200 to the caller. Now the redemption route
+        # inspects `ok` and refuses to commit the link on failure.
+        result["ok"] = False
+        result["error"] = f"read source journal: {exc}"
         print(f"LOG: link merge could not read source journal {source_user_id}: {exc}")
         return result
     if not events:
@@ -211,6 +259,8 @@ def merge_memory(source_user_id: str, target_user_id: str) -> dict[str, Any]:
             target_journal.append_many(fresh)
             result["events_copied"] = len(fresh)
         except Exception as exc:
+            result["ok"] = False
+            result["error"] = f"append: {exc}"
             print(f"LOG: link merge append failed: {exc}")
             return result
 
@@ -218,5 +268,10 @@ def merge_memory(source_user_id: str, target_user_id: str) -> dict[str, Any]:
         replay(target_journal.load_all(), store=PersonalMemoryStore(user_id=target_user_id))
         result["replayed"] = True
     except Exception as exc:
+        # The events landed in the journal — the source of truth — but the
+        # projection did not rebuild. That's recoverable (next replay heals it),
+        # but the caller deserves to know rather than get a false 200.
+        result["ok"] = False
+        result["error"] = f"replay: {exc}"
         print(f"LOG: link merge replay failed for {target_user_id}: {exc}")
     return result

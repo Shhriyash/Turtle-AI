@@ -114,29 +114,45 @@ class TestF1WhatsApp:
         from apps.channels.slack import _verify_slack_signature
         from apps.channels.whatsapp import _verify_twilio_signature
 
+        # No secret: local dev must ONLY no-op when TURTLE_DEV_ANON=1;
+        # otherwise (default), even local deployments fail closed. Cloud always
+        # fails closed regardless of dev_anon. This closes the tunneled-local
+        # attack surface Codex flagged.
         with mock.patch("apps.channels.whatsapp.settings") as s:
             s.twilio_auth_token = None
             s.is_cloud = False
+            s.dev_anon = True
             assert _verify_twilio_signature("https://example.com", {}, "sig") is True
+            s.dev_anon = False
+            assert _verify_twilio_signature("https://example.com", {}, "sig") is False
             s.is_cloud = True
+            s.dev_anon = True   # cloud fails closed regardless of dev_anon
             assert _verify_twilio_signature("https://example.com", {}, "sig") is False
 
         with mock.patch("apps.channels.imessage.settings") as s:
             s.sendblue_api_key = None
             s.sendblue_api_secret = None
             s.is_cloud = False
+            s.dev_anon = True
             assert _verify_sendblue_signature(b"{}", "sig") is True
+            s.dev_anon = False
+            assert _verify_sendblue_signature(b"{}", "sig") is False
             s.is_cloud = True
+            s.dev_anon = True
             assert _verify_sendblue_signature(b"{}", "sig") is False
 
         with mock.patch("apps.channels.slack.settings") as s:
             s.slack_signing_secret = None
             s.is_cloud = False
+            s.dev_anon = True
             assert _verify_slack_signature(b"{}", "0", "sig") is True
+            s.dev_anon = False
+            assert _verify_slack_signature(b"{}", "0", "sig") is False
             s.is_cloud = True
+            s.dev_anon = True
             assert _verify_slack_signature(b"{}", "0", "sig") is False
 
-        print("[PASS] whatsapp/imessage/slack: local no-op, cloud fail-closed")
+        print("[PASS] whatsapp/imessage/slack: local no-op iff DEV_ANON, cloud fail-closed")
 
     def test_signature_verify_fails_on_bad_signature(self):
         from apps.channels.whatsapp import _verify_twilio_signature
@@ -182,17 +198,19 @@ class TestF2iMessage:
         print("[PASS] iMessage router importable")
 
     def test_signature_verify_skips_without_secret(self):
-        """No secret => skip verification in LOCAL dev only (cloud fail-closed
-        is covered by test_signature_verify_no_secret_local_noop_cloud_fail_closed)."""
+        """No secret => skip verification only when TURTLE_DEV_ANON=1 in local
+        dev (cloud fail-closed + non-anon local fail-closed are covered by
+        test_signature_verify_no_secret_local_noop_cloud_fail_closed)."""
         from apps.channels.imessage import _verify_sendblue_signature
         import unittest.mock as mock
         with mock.patch("apps.channels.imessage.settings") as s:
             s.sendblue_api_key = None
             s.sendblue_api_secret = None
             s.is_cloud = False
+            s.dev_anon = True
             result = _verify_sendblue_signature(b"body", "any_sig")
         assert result is True
-        print("[PASS] SendBlue signature verification skips when secret not configured (local)")
+        print("[PASS] SendBlue signature verification skips when secret not configured (local+DEV_ANON)")
 
     def test_signature_verify_fails_on_bad_signature(self):
         from apps.channels.imessage import _verify_sendblue_signature
@@ -236,12 +254,16 @@ class TestF3Slack:
         print("[PASS] Slack router importable")
 
     def test_signature_verify_skips_without_secret(self):
+        """Same fail-closed unless TURTLE_DEV_ANON=1 rule as the other channels."""
         from apps.channels.slack import _verify_slack_signature
         import unittest.mock as mock
-        with mock.patch("apps.channels.slack._signing_secret", return_value=""):
+        with mock.patch("apps.channels.slack._signing_secret", return_value=""), \
+             mock.patch("apps.channels.slack.settings") as s:
+            s.is_cloud = False
+            s.dev_anon = True
             result = _verify_slack_signature(b"body", "12345", "v0=whatever")
         assert result is True
-        print("[PASS] Slack signature verification skips when secret not configured")
+        print("[PASS] Slack signature verification skips when secret not configured (local+DEV_ANON)")
 
     def test_signature_verify_rejects_stale_timestamp(self):
         from apps.channels.slack import _verify_slack_signature
@@ -330,17 +352,25 @@ class TestF6Discord:
         print("[PASS] Discord router importable")
 
     def test_signature_verify_no_key_local_noop_cloud_fail_closed(self):
-        # No public key: no-op (accept) in local/dev, but FAIL CLOSED in cloud so
-        # a public webhook can't be driven with unsigned/spoofed requests.
+        # No public key: no-op (accept) ONLY when TURTLE_DEV_ANON=1 in local dev;
+        # otherwise fail closed. Cloud always fails closed.
         import unittest.mock as mock
         import apps.channels.discord as d
         from core.config import settings
         with mock.patch.object(d, "_public_key", return_value=""):
-            with mock.patch.object(settings, "deploy_mode", "local"):
+            # local + dev_anon: no-op accept
+            with mock.patch.object(settings, "deploy_mode", "local"), \
+                 mock.patch.object(settings, "dev_anon", True):
                 assert d._verify_discord_signature(b"body", "deadbeef", "12345") is True
-            with mock.patch.object(settings, "deploy_mode", "cloud"):
+            # local without dev_anon: FAIL CLOSED (tunneled-local hardening)
+            with mock.patch.object(settings, "deploy_mode", "local"), \
+                 mock.patch.object(settings, "dev_anon", False):
                 assert d._verify_discord_signature(b"body", "deadbeef", "12345") is False
-        print("[PASS] Discord sig: local no-op, cloud fails closed without a public key")
+            # cloud always fails closed
+            with mock.patch.object(settings, "deploy_mode", "cloud"), \
+                 mock.patch.object(settings, "dev_anon", True):
+                assert d._verify_discord_signature(b"body", "deadbeef", "12345") is False
+        print("[PASS] Discord sig: local no-op iff DEV_ANON, cloud fails closed")
 
     def test_signature_verify_real_keypair(self):
         """Prove REAL Ed25519 verification: a valid sig passes, tampering fails."""
