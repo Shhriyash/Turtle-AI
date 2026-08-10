@@ -2804,14 +2804,18 @@ async def update_config(
         if settings.admin_token is not None
         else None
     )
-    if not expected and settings.is_cloud:
-        # Cloud with no admin token: fail CLOSED like /admin/* does — an open
-        # model-hot-swap endpoint on a public deployment is not acceptable
-        # (Codex P6 #1). Local dev (not cloud, no token) stays open.
-        return JSONResponse(
-            {"error": "Config updates are disabled (TURTLE_ADMIN_TOKEN not set)."},
-            status_code=503,
-        )
+    if not expected:
+        # No admin token configured. Cloud has always failed closed here — but
+        # a tunneled LOCAL deploy (ngrok, cloudflared) is equally reachable,
+        # and hot-swapping the model / agent chain from an anon POST would let
+        # an attacker downgrade every user to a chosen provider mid-conversation.
+        # Require TURTLE_DEV_ANON=1 as the explicit "yes, this is unsafe" flag,
+        # matching the auth path and the channel webhook verifiers.
+        if not (settings.dev_anon and not settings.is_cloud):
+            return JSONResponse(
+                {"error": "Config updates are disabled (TURTLE_ADMIN_TOKEN not set)."},
+                status_code=503,
+            )
     if expected and x_admin_token != expected:
         return JSONResponse({"error": "Unauthorized."}, status_code=401)
     if not body:
@@ -3163,10 +3167,19 @@ async def link_account_redeem(request: Request):
                 status_code=503,
             )
 
-        previous = await identity_manager.link_channel(
-            user_id=user_id, channel=claim.channel, channel_user_id=claim.channel_user_id
-        )
-        consumed = await asyncio.to_thread(mark_consumed, store, code)
+        try:
+            previous = await identity_manager.link_channel(
+                user_id=user_id, channel=claim.channel, channel_user_id=claim.channel_user_id
+            )
+            consumed = await asyncio.to_thread(mark_consumed, store, code)
+        except Exception:
+            # link_channel or consume threw AFTER merge already succeeded. The
+            # journal writes are idempotent by event_id and link_channel is a
+            # no-op for a same-target rebind, so a retry from the SAME target
+            # heals it — but only if their reservation stays alive. Release it
+            # eagerly so the retry doesn't wait for the 60s TTL.
+            await asyncio.to_thread(release_reservation, store, code, user_id)
+            raise
         if not consumed:
             # Only reachable if someone raced the consume AFTER we reserved —
             # they'd have needed our target too (reservation blocks others), so
