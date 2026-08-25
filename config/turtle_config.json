@@ -1,7 +1,7 @@
 {
   "OPEN_ROUTER_MODEL": "google/gemini-2.5-flash",
-  "GROQ_PRIMARY_MODEL": "llama-3.3-70b-versatile",
-  "GROQ_FALLBACK_MODEL": "llama-3.1-8b-instant",
+  "GROQ_PRIMARY_MODEL": "openai/gpt-oss-20b",
+  "GROQ_FALLBACK_MODEL": "openai/gpt-oss-20b",
   "GEMINI_MODEL": "gemini-2.5-flash",
   "DEEPGRAM_TTS_MODEL": "aura-orion-en",
   "DEEPGRAM_TTS_ENCODING": "linear16",
@@ -23,7 +23,7 @@
   "STT_MODEL": "whisper-large-v3-turbo",
   "MAIN_AGENT_MODEL": "gemini:gemini-2.5-flash",
   "EMAIL_AGENT_MODEL": "gemini:gemini-2.5-flash",
-  "DREAM_PASS_AGENT_MODEL": "groq:llama-3.3-70b-versatile",
+  "DREAM_PASS_AGENT_MODEL": "groq:openai/gpt-oss-20b",
   "SERVER_HOST": "127.0.0.1",
   "SERVER_PORT": 8765,
   "OPENROUTER_APP_URL": "",
@@ -31,6 +31,6 @@
   "DEEPGRAM_TTS_VOICE": "orion",
   "TURTLE_INTERACTION_MODE": "ask",
   "SESSION_RESTORE_MODE": "resume_if_active",
-  "ROUTER_AGENT_MODEL": "groq:llama-3.3-70b-versatile",
+  "ROUTER_AGENT_MODEL": "groq:openai/gpt-oss-20b",
   "PERSONAL_MEMORY_DREAM_PASS_ENABLED": false
 }

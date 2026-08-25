@@ -158,7 +158,7 @@ class TurtleSettings(BaseSettings):
         default="openai/gpt-oss-120b", alias="TURTLE_PERSONAL_MEMORY_STAGE_B_MODEL"
     )
     episodic_summary_model: str = Field(
-        default="llama-3.1-8b-instant", alias="TURTLE_EPISODIC_SUMMARY_MODEL"
+        default="openai/gpt-oss-20b", alias="TURTLE_EPISODIC_SUMMARY_MODEL"
     )
     personal_memory_stage_b_max_turns: int = Field(
         default=60, alias="TURTLE_PERSONAL_MEMORY_STAGE_B_MAX_TURNS"
@@ -166,10 +166,11 @@ class TurtleSettings(BaseSettings):
     personal_memory_stage_b_max_candidates: int = Field(
         default=8, alias="TURTLE_PERSONAL_MEMORY_STAGE_B_MAX_CANDIDATES"
     )
-    # Per-turn LLM extractor (Stage A2). 8B misclassified roles/names in
-    # production; 70B is the floor for open-vocabulary extraction.
+    # Per-turn LLM extractor (Stage A2). Was llama-3.3-70b-versatile, which Groq
+    # decommissioned (404 every turn — silently swallowed). Repointed to the
+    # roster Groq model, gpt-oss-20b.
     personal_memory_turn_extractor_model: str = Field(
-        default="llama-3.3-70b-versatile", alias="TURTLE_PERSONAL_MEMORY_TURN_EXTRACTOR_MODEL"
+        default="openai/gpt-oss-20b", alias="TURTLE_PERSONAL_MEMORY_TURN_EXTRACTOR_MODEL"
     )
     personal_memory_max_bytes: int = Field(
         default=1024 * 1024, alias="TURTLE_PERSONAL_MEMORY_MAX_BYTES"

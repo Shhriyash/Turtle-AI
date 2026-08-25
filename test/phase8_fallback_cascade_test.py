@@ -20,7 +20,7 @@ import pytest
 
 from core import health_tracker
 from core.llm_client import run_agent_with_fallbacks
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 
 # Gemini's strict tool-turn ordering rejection — a harmony/tool-render 400 that
 # is fallback-eligible AND cools the whole model family (bucket scope).
@@ -55,6 +55,14 @@ class _OpenRouterModel:
 
 class _GroqModel:
     model_name = "llama-3.3-70b-versatile"
+
+
+class _OxAlphaModel:
+    model_name = "stealth/ox-alpha"
+
+
+class _GptOssModel:
+    model_name = "openai/gpt-oss-20b"
 
 
 class _FakeAgent:
@@ -111,3 +119,39 @@ def test_402_first_still_reaches_a_working_rung():
 
     assert out == "done"
     assert groq.calls == 1
+
+
+def test_output_validation_skips_same_family_siblings():
+    """An output-validation (empty-output) failure repeats identically on every
+    API key of the same model, and health_tracker does NOT cool that class. The
+    cascade must still skip the doomed sibling keys and drop to a DIFFERENT model
+    in-budget — otherwise ox-alpha's three keys are replayed (full turn each) and
+    the per-turn timeout fires before a working model is reached (live-observed
+    on the multi-tool orchestration probe, 2026-08-24)."""
+    ox1 = _FakeAgent(_OxAlphaModel(), raises=UnexpectedModelBehavior("empty model response"))
+    ox2 = _FakeAgent(_OxAlphaModel(), raises=UnexpectedModelBehavior("empty model response"))
+    ox3 = _FakeAgent(_OxAlphaModel(), raises=UnexpectedModelBehavior("empty model response"))
+    gpt_oss = _FakeAgent(_GptOssModel(), result="rescued")
+
+    out = asyncio.run(run_agent_with_fallbacks(ox1, [ox2, ox3, gpt_oss]))
+
+    assert out == "rescued"
+    assert ox1.calls == 1     # primary tried once
+    assert ox2.calls == 0     # skipped — same family already failed validation
+    assert ox3.calls == 0     # skipped — same family
+    assert gpt_oss.calls == 1  # distinct family → reached the working rung
+
+
+def test_transient_error_does_not_poison_sibling_keys():
+    """A per-key transient error (network/5xx) is NOT deterministic — a sibling
+    key may succeed, so the next key of the SAME model must still be tried."""
+    ox1 = _FakeAgent(_OxAlphaModel(), raises=ConnectionError("connection reset by peer"))
+    ox2 = _FakeAgent(_OxAlphaModel(), result="second-key-ok")
+    gpt_oss = _FakeAgent(_GptOssModel(), result="unused")
+
+    out = asyncio.run(run_agent_with_fallbacks(ox1, [ox2, gpt_oss]))
+
+    assert out == "second-key-ok"
+    assert ox1.calls == 1
+    assert ox2.calls == 1      # sibling key tried — transient, not poisoned
+    assert gpt_oss.calls == 0  # never needed

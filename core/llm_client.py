@@ -24,10 +24,20 @@ try:
 except Exception:
     _logfire = None  # type: ignore
 
+# Roster (2026-08-25): Gemini 2.5 Flash is the primary main/email model and Groq
+# gpt-oss-20b is the second rung, each fanned across every available API key for
+# that provider; Gemini via OpenRouter is the last-resort rung, so this default
+# names the Gemini slug (ox-alpha was discarded for intermittently returning
+# empty output on multi-tool turns). The previous Groq defaults
+# (llama-3.3-70b-versatile / llama-3.1-8b-instant) were decommissioned by Groq.
 OPENROUTER_DEFAULT_MODEL = "google/gemini-2.5-flash"
-GROQ_DEFAULT_PRIMARY_MODEL = "llama-3.3-70b-versatile"
-GROQ_DEFAULT_FALLBACK_MODEL = "llama-3.1-8b-instant"
+GROQ_DEFAULT_PRIMARY_MODEL = "openai/gpt-oss-20b"
+GROQ_DEFAULT_FALLBACK_MODEL = "openai/gpt-oss-20b"
 GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+GROQ_KEY_ENV_VARS = [
+    "GROQ_API_KEY",
+    "GROQ_API_KEY2",
+]
 OPENROUTER_KEY_ENV_VARS = [
     "OPEN_ROUTER_API_KEY_1",
     "OPEN_ROUTER_API_KEY_2",
@@ -147,6 +157,36 @@ def get_google_models(
         provider = GoogleProvider(api_key=api_key)
         models.append(GoogleModel(model, provider=provider, settings=google_settings))
     return models
+
+
+def get_groq_keys() -> list[str]:
+    """All distinct, non-empty Groq API keys, in env-var order.
+
+    Mirrors get_openrouter_keys(): one entry per key so a caller can build one
+    model per key and fan a single model family across every available quota
+    bucket (the "on all of their api keys available" roster directive).
+    """
+    keys: list[str] = []
+    for name in GROQ_KEY_ENV_VARS:
+        value = os.getenv(name)
+        if value and value not in keys:
+            keys.append(value)
+    return keys
+
+
+def get_groq_models(model_name: str | None = None, settings: ModelSettings | None = None) -> list[GroqModel]:
+    """One GroqModel per available Groq API key, in env-var order.
+
+    Lets the agent cascade retry the SAME model on a second key before it
+    changes models — a rate-limited key fails over to the next key's quota
+    rather than immediately dropping to a different (slower / less-capable)
+    provider.
+    """
+    model = model_name or os.getenv("GROQ_PRIMARY_MODEL", GROQ_DEFAULT_PRIMARY_MODEL)
+    return [
+        GroqModel(model, provider=GroqProvider(api_key=api_key), settings=settings)
+        for api_key in get_groq_keys()
+    ]
 
 
 def get_groq_model(model_name: str | None = None, settings: ModelSettings | None = None) -> GroqModel | None:
@@ -291,6 +331,21 @@ def _is_output_validation_error(exc: Exception) -> bool:
     )
 
 
+def _model_family(agent: Any) -> str:
+    """Stable ``ModelClass:model_name`` identifier for an agent's model.
+
+    Two cascade rungs that differ ONLY by API key share a family (e.g.
+    ``stealth/ox-alpha`` on three OpenRouter keys). Used to skip the sibling
+    rungs of a family that already failed DETERMINISTICALLY this call — an
+    output-validation / empty-output failure repeats identically on every key,
+    so replaying it per key just burns the turn's time budget before the
+    cascade reaches a different, possibly-working model.
+    """
+    model = getattr(agent, "model", agent)
+    name = getattr(model, "model_name", None) or getattr(model, "name", None) or ""
+    return f"{model.__class__.__name__}:{name}"
+
+
 def _sanitize_message_history(messages: list[ModelMessage] | None) -> list[ModelMessage] | None:
     """Phase 5 / A5: drop ToolCallPart entries with empty tool_name.
 
@@ -397,6 +452,14 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
         eligible = agents
 
     last_exc: Exception | None = None
+    # Families that failed DETERMINISTICALLY this call (output-validation /
+    # empty-output). health_tracker deliberately does NOT cool these (they're not
+    # a provider/quota signal), so without this set the cascade would replay the
+    # same doomed model on each of its API keys — three ox-alpha rungs ahead of
+    # the first different model — and the per-turn timeout can fire before a
+    # working model is ever reached. Per-call only: an intermittent failure never
+    # benches the family for later turns.
+    poisoned_families: set[str] = set()
     for idx, agent in enumerate(eligible):
         # An earlier failure THIS call may have cooled a model family that
         # recurs later in the chain (the same model appears once per API key —
@@ -406,6 +469,15 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
         # `raise last_exc` still fires.
         if idx > 0 and last_exc is not None and health_tracker.is_cooling(agent):
             continue
+        # Same idea for a deterministic output-validation failure (see
+        # poisoned_families above): skip sibling keys of a family that already
+        # failed that way so the cascade drops to a different model in-budget.
+        if idx > 0 and _model_family(agent) in poisoned_families:
+            print(
+                f"LOG: skipping {_model_family(agent)} rung — "
+                f"same model already failed output-validation this call"
+            )
+            continue
         try:
             result = await agent.run(*args, **kwargs)
             health_tracker.mark_success(agent)
@@ -414,6 +486,8 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
             last_exc = exc
             _log_harmony_error(agent, exc)
             health_tracker.mark_failure(agent, exc)
+            if _is_output_validation_error(exc):
+                poisoned_families.add(_model_family(agent))
             should_fallback = (
                 is_key_failure_error(exc)
                 or _is_retryable_upstream_error(exc)
@@ -442,10 +516,19 @@ def run_agent_sync_with_fallbacks(primary_agent: Any, fallback_agents: list[Any]
         eligible = agents
 
     last_exc: Exception | None = None
+    poisoned_families: set[str] = set()
     for idx, agent in enumerate(eligible):
         # Skip a rung whose model family was cooled by an earlier failure this
         # call (see run_agent_with_fallbacks for the rationale).
         if idx > 0 and last_exc is not None and health_tracker.is_cooling(agent):
+            continue
+        # Skip sibling keys of a family that already failed output-validation
+        # this call (health_tracker doesn't cool that class — see the async twin).
+        if idx > 0 and _model_family(agent) in poisoned_families:
+            print(
+                f"LOG: skipping {_model_family(agent)} rung — "
+                f"same model already failed output-validation this call"
+            )
             continue
         try:
             result = agent.run_sync(*args, **kwargs)
@@ -455,6 +538,8 @@ def run_agent_sync_with_fallbacks(primary_agent: Any, fallback_agents: list[Any]
             last_exc = exc
             _log_harmony_error(agent, exc)
             health_tracker.mark_failure(agent, exc)
+            if _is_output_validation_error(exc):
+                poisoned_families.add(_model_family(agent))
             should_fallback = (
                 is_key_failure_error(exc)
                 or _is_retryable_upstream_error(exc)

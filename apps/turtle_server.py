@@ -48,6 +48,12 @@ from fastapi.staticfiles import StaticFiles
 
 from core.env import load_env
 
+# Populate os.environ from .env so os.getenv() sees the same values pydantic-
+# settings already reads directly. Without this, only fields on `settings` are
+# populated — anything read via os.getenv (OPEN_ROUTER_API_KEY_*, MAIN_AGENT_MODEL
+# env override, etc.) silently sees None on a freshly-launched uvicorn process.
+load_env()
+
 load_env(override=True)
 
 # Core imports — identical to turtle_voice.py
@@ -67,6 +73,7 @@ from pydantic_ai.usage import UsageLimits, RunUsage
 
 from core.llm_client import (
     get_groq_model,
+    get_groq_models,
     get_google_models,
     get_openrouter_models,
     get_groq_fallback_model,
@@ -1723,25 +1730,32 @@ class AgentManager:
         stt_model = cfg.get("STT_MODEL", "whisper-large-v3-turbo")
         self.stt = FastRTCSTT(groq_client=groq_client, model=stt_model)
 
-        # Model pools — one per provider/key. Each pool is ordered so the first
-        # element is the preferred entry-point for that provider.
+        # Model pools — one model object per provider API key. Each pool is
+        # ordered so the first element is the preferred entry-point, and a pool
+        # with N keys lets the cascade retry the SAME model on the next key
+        # before it drops to a different provider.
+        #
+        # Roster (2026-08-25 directive): ox-alpha discarded (it intermittently
+        # returned empty output on multi-tool synthesis, timing out the turn).
+        # Gemini 2.5 Flash on every Google key is the primary; gpt-oss-20b on
+        # every Groq key is the second rung; Gemini via OpenRouter (every OR key)
+        # is the last-resort safety net. GEMINI_MODEL / GROQ_PRIMARY_MODEL /
+        # OPEN_ROUTER_MODEL in turtle_config.json name gemini-2.5-flash /
+        # gpt-oss-20b / gemini-2.5-flash so these pools carry the whole roster.
         openrouter_models = get_openrouter_models(
             model_name=cfg.get("OPEN_ROUTER_MODEL"), settings=settings,
         )
         gemini_models = get_google_models(
             model_name=cfg.get("GEMINI_MODEL"), settings=settings,
         )
-        gpt_oss = get_groq_model(
-            model_name="openai/gpt-oss-120b", settings=settings,
-        )
-        groq_llama = get_groq_model(
+        # gpt-oss-20b across ALL Groq keys — replaces the decommissioned llama
+        # slugs (Groq 404'd every llama-3.x call). GROQ_FALLBACK_MODEL now points
+        # at the same slug, so both keys of gpt-oss-20b are covered by one pool.
+        groq_gpt_oss = get_groq_models(
             model_name=cfg.get("GROQ_PRIMARY_MODEL"), settings=settings,
         )
-        groq_llama_small = get_groq_fallback_model(
-            model_name=cfg.get("GROQ_FALLBACK_MODEL"), settings=settings,
-        )
 
-        if not (openrouter_models or gemini_models or gpt_oss or groq_llama):
+        if not (openrouter_models or gemini_models or groq_gpt_oss):
             raise RuntimeError(
                 "No model providers available. Set GEMINI_API_KEY, "
                 "OPEN_ROUTER_API_KEY_*, or GROQ_API_KEY."
@@ -1773,47 +1787,50 @@ class AgentManager:
                 and getattr(override, "model_name", None) == getattr(head, "model_name", None)
             )
 
-        # main_assistant fallback cascade — order is TOOL-TURN-AWARE:
-        #   Gemini direct → Groq llama → Groq llama (2nd key) → Gemini via
-        #   OpenRouter → gpt-oss (last resort).
-        #
-        # Why llama sits right behind direct Gemini, AHEAD of OpenRouter + gpt-oss
-        # (the previous order tried openrouter → gpt-oss → llama, burning two
-        # guaranteed-dead hops on every tool turn — observed live on Discord):
-        #   - Gemini leads: big free-tier context, strong tool-caller when it has
-        #     quota, and fine for non-tool turns.
-        #   - When a TOOL turn fails on direct Gemini (its function-call adjacency
-        #     400, or a 429), the NEXT rung must be able to actually finish a tool
-        #     turn. OpenRouter's "gemini-2.5-flash" proxies the SAME Google backend
-        #     and reproduces the SAME adjacency 400; gpt-oss-120b deterministically
-        #     rejects Turtle's tool surface ("Tools should have a name" / 413 TPM).
-        #     Both were pure wasted round-trips in front of the real rescue.
-        #   - llama-3.3-70b on Groq is lenient about message order — it's the rung
-        #     that actually LANDS the tool turn, so it goes first after Gemini.
-        #   - OpenRouter (a Gemini variant) stays as a mid fallback for NON-tool
-        #     turns when direct Gemini is down; gpt-oss is the true last resort.
-        # The override goes through get_google_models, so it inherits
-        # thinking-disabled settings; _override_redundant collapses it onto
-        # gemini_models[0].
-        main_override = _build_model_from_str(cfg.get("MAIN_AGENT_MODEL", ""), settings)
+        # main_assistant cascade (2026-08-25 roster, ox-alpha discarded):
+        #   Gemini 2.5 Flash (all Google keys) → gpt-oss-20b (all Groq keys) →
+        #   Gemini via OpenRouter (all OR keys, last-resort safety net).
+        #   - Gemini direct leads: proven tool-caller with a large free tier. Its
+        #     occasional function-call-adjacency 400 is a harmony-class 400 that
+        #     run_agent_with_fallbacks + health_tracker treat as fallback-eligible
+        #     and cool at family scope, so a rejected tool turn drops to gpt-oss.
+        #   - gpt-oss-20b is the second rung across every Groq key.
+        #   - Gemini via OpenRouter reuses the OpenRouter keys as a different route
+        #     to the same capable model, so a total Google+Groq outage still
+        #     answers. (OPEN_ROUTER_MODEL now names gemini-2.5-flash, not ox-alpha.)
+        # An explicit MAIN_AGENT_MODEL override (env or config) still leads if set;
+        # when it names the Gemini pool head it collapses onto the pool instead of
+        # prepending a duplicate model on the same key.
+        main_override = _build_model_from_str(
+            os.getenv("MAIN_AGENT_MODEL") or cfg.get("MAIN_AGENT_MODEL", ""),
+            settings,
+        )
         if _override_redundant(main_override, gemini_models):
             main_override = None
-        main_head: Any = main_override or (gemini_models[0] if gemini_models else groq_llama or gpt_oss)
+        main_head: Any = main_override or (
+            gemini_models[0] if gemini_models
+            else (groq_gpt_oss[0] if groq_gpt_oss else (openrouter_models[0] if openrouter_models else None))
+        )
         main_chain = build_chain(
-            main_head, gemini_models, groq_llama, groq_llama_small, openrouter_models, gpt_oss,
+            main_head, gemini_models, groq_gpt_oss, openrouter_models,
         )
 
-        # email_agent: Gemini direct → Gemini via OpenRouter → Llama (Groq).
-        # Email composition is structure-heavy, so leading with Gemini's
-        # stronger instruction-following pays off. Llama is the final rung in
-        # case Google + OpenRouter are both unavailable.
-        email_override = _build_model_from_str(cfg.get("EMAIL_AGENT_MODEL", ""), settings)
+        # email_agent: same roster as main — Gemini → gpt-oss-20b → Gemini(OR).
+        # Email composition is structure-heavy; Gemini's instruction-following
+        # handles it and the OpenRouter route is the final rung when Google + Groq
+        # are both unavailable.
+        email_override = _build_model_from_str(
+            os.getenv("EMAIL_AGENT_MODEL") or cfg.get("EMAIL_AGENT_MODEL", ""),
+            settings,
+        )
         if _override_redundant(email_override, gemini_models):
             email_override = None
-        email_head: Any = email_override or (gemini_models[0] if gemini_models else None)
+        email_head: Any = email_override or (
+            gemini_models[0] if gemini_models
+            else (groq_gpt_oss[0] if groq_gpt_oss else (openrouter_models[0] if openrouter_models else None))
+        )
         email_chain = build_chain(
-            email_head,
-            gemini_models, openrouter_models, groq_llama, groq_llama_small,
+            email_head, gemini_models, groq_gpt_oss, openrouter_models,
         )
 
         if not main_chain or not email_chain:
@@ -1860,8 +1877,8 @@ class AgentManager:
         self._register_tools()
         print(
             f"LOG: Agent chain rebuilt — "
-            f"main={cfg.get('MAIN_AGENT_MODEL') or cfg.get('GROQ_PRIMARY_MODEL', 'default')}, "
-            f"email={cfg.get('EMAIL_AGENT_MODEL') or 'same'}, "
+            f"main={os.getenv('MAIN_AGENT_MODEL') or cfg.get('MAIN_AGENT_MODEL') or cfg.get('GROQ_PRIMARY_MODEL', 'default')}, "
+            f"email={os.getenv('EMAIL_AGENT_MODEL') or cfg.get('EMAIL_AGENT_MODEL') or 'same'}, "
             f"stt={stt_model}, "
             f"temp={settings.get('temperature')}, max_tokens={settings.get('max_tokens')}"
         )
