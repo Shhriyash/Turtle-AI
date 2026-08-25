@@ -93,24 +93,54 @@ export function refreshVoiceButtonUi() {
 }
 
 
-function stopTtsPlayback({ resetUi = false } = {}) {
-    const source = AppState.ttsSourceNode;
-    const ctx = AppState.ttsAudioContext;
+/**
+ * Get (or lazily create) the single persistent playback AudioContext.
+ * Reused across chunks and turns so we pay context-creation cost once, not per
+ * blob, and so chunks can be scheduled back-to-back on one clock.
+ */
+function getPlaybackContext() {
+    let ctx = AppState.ttsAudioContext;
+    if (!ctx || ctx.state === 'closed') {
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        AppState.ttsAudioContext = ctx;
+        AppState.ttsNextStartTime = 0;
+    }
+    // Browsers may suspend contexts created outside a user gesture; resume is a
+    // no-op when already running.
+    if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+    }
+    return ctx;
+}
 
-    AppState.ttsSourceNode = null;
-    AppState.ttsAudioContext = null;
-    AppState.isTtsPlaying = false;
+/**
+ * Stop all TTS playback: cancel every scheduled/playing source and flush the
+ * decode queue. Used for barge-in (mic press / new recording) and errors.
+ *
+ * The persistent context is kept alive (just reset) so the next reply starts
+ * without re-creating it — unless closeContext is requested.
+ */
+function stopTtsPlayback({ resetUi = false, closeContext = false } = {}) {
+    // Invalidate any in-flight decodes so their .then() schedulers no-op.
+    AppState.ttsPlaybackGen++;
+    AppState.ttsDecodeChain = Promise.resolve();
 
-    if (source) {
+    const sources = AppState.ttsSources || [];
+    AppState.ttsSources = [];
+    for (const source of sources) {
         try {
             source.onended = null;
             source.stop(0);
+            source.disconnect();
         } catch (_) {}
     }
-    if (ctx) {
-        try {
-            ctx.close();
-        } catch (_) {}
+
+    AppState.isTtsPlaying = false;
+    AppState.ttsNextStartTime = 0;
+
+    if (closeContext && AppState.ttsAudioContext) {
+        try { AppState.ttsAudioContext.close(); } catch (_) {}
+        AppState.ttsAudioContext = null;
     }
 
     if (resetUi && !AppState.isRecording) {
@@ -129,8 +159,9 @@ export async function startRecording() {
         return;
     }
 
-    // Bararge-in behavior: pressing mic while TTS is speaking should interrupt playback.
-    if (AppState.isTtsPlaying || AppState.ttsSourceNode || AppState.ttsAudioContext) {
+    // Barge-in behavior: pressing mic while TTS is speaking should interrupt
+    // playback — cancel every queued/playing chunk and flush pending decodes.
+    if (AppState.isTtsPlaying || (AppState.ttsSources && AppState.ttsSources.length)) {
         stopTtsPlayback();
     }
 
@@ -237,55 +268,75 @@ export function stopRecording(options = {}) {
 }
 
 /**
- * Play a WAV audio blob from the server.
+ * Enqueue one WAV audio chunk from the server for gapless playback.
+ *
+ * The server streams one complete, self-describing WAV per sentence. Chunks are
+ * decoded and scheduled back-to-back on a single persistent AudioContext so a
+ * multi-sentence reply plays as one continuous utterance. Previously each new
+ * blob stopped the one before it, truncating every sentence but the last — this
+ * queue fixes that.
+ *
+ * Ordering: decode is async, so blobs are threaded through a promise chain
+ * (ttsDecodeChain) to guarantee they schedule in arrival order regardless of how
+ * long any single decode takes.
  */
 export async function playAudioBlob(blob) {
-    // Ignore late TTS blobs while user is already recording.
+    // Ignore late TTS blobs while the user is already recording (barge-in).
     if (AppState.isRecording) {
         return;
     }
 
-    // Prevent overlap when back-to-back TTS blobs arrive.
-    if (AppState.isTtsPlaying || AppState.ttsSourceNode || AppState.ttsAudioContext) {
-        stopTtsPlayback();
-    }
+    // Capture the playback generation this chunk belongs to. A barge-in bumps
+    // the generation; any decode that finishes after that is discarded.
+    const gen = AppState.ttsPlaybackGen;
 
-    try {
-        const arrayBuffer = await blob.arrayBuffer();
-        if (AppState.isRecording) return;
+    AppState.ttsDecodeChain = AppState.ttsDecodeChain
+        .catch(() => {})
+        .then(async () => {
+            if (AppState.isRecording || gen !== AppState.ttsPlaybackGen) return;
 
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-        if (AppState.isRecording) {
-            await ctx.close();
-            return;
-        }
+            const arrayBuffer = await blob.arrayBuffer();
+            if (AppState.isRecording || gen !== AppState.ttsPlaybackGen) return;
 
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(ctx.destination);
+            const ctx = getPlaybackContext();
+            // decodeAudioData detaches the ArrayBuffer; slice() keeps callers safe.
+            const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+            if (AppState.isRecording || gen !== AppState.ttsPlaybackGen) return;
 
-        AppState.ttsAudioContext = ctx;
-        AppState.ttsSourceNode = source;
-        AppState.isTtsPlaying = true;
+            const source = ctx.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(ctx.destination);
 
-        source.start(0);
-        source.onended = () => {
-            if (AppState.ttsSourceNode === source) {
-                AppState.ttsSourceNode = null;
-                AppState.ttsAudioContext = null;
-                AppState.isTtsPlaying = false;
-                try {
-                    ctx.close();
-                } catch (_) {}
-                if (!AppState.isRecording) {
+            // Schedule immediately after whatever is already queued. A small lead
+            // (0.04s) absorbs decode jitter so the first chunk never starts in the
+            // past. Subsequent chunks chain from ttsNextStartTime for zero gap.
+            const now = ctx.currentTime;
+            const startAt = Math.max(now + 0.04, AppState.ttsNextStartTime || 0);
+            source.start(startAt);
+            AppState.ttsNextStartTime = startAt + audioBuffer.duration;
+
+            AppState.ttsSources.push(source);
+            AppState.isTtsPlaying = true;
+            setBubbleState('speaking');
+
+            source.onended = () => {
+                const idx = AppState.ttsSources.indexOf(source);
+                if (idx !== -1) AppState.ttsSources.splice(idx, 1);
+                try { source.disconnect(); } catch (_) {}
+                // When the queue drains and nothing new is scheduled, go idle.
+                if (
+                    gen === AppState.ttsPlaybackGen &&
+                    AppState.ttsSources.length === 0 &&
+                    !AppState.isRecording
+                ) {
+                    AppState.isTtsPlaying = false;
+                    AppState.ttsNextStartTime = 0;
                     setBubbleState('idle');
                     setStatus('ready', 'Ready');
                 }
-            }
-        };
-    } catch (e) {
-        console.error('Audio playback error:', e);
-        stopTtsPlayback({ resetUi: true });
-    }
+            };
+        })
+        .catch((e) => {
+            console.error('Audio playback error:', e);
+        });
 }

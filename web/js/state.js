@@ -23,11 +23,17 @@ const AppState = {
     /** @type {Int16Array[]} */
     recordedChunks: [],
 
-    /** TTS playback state */
+    /** TTS playback state — a gapless scheduled queue over one persistent context */
     /** @type {AudioContext|null} */
     ttsAudioContext: null,
-    /** @type {AudioBufferSourceNode|null} */
-    ttsSourceNode: null,
+    /** @type {AudioBufferSourceNode[]} currently scheduled/playing sources */
+    ttsSources: [],
+    /** next absolute context time to schedule the following chunk at */
+    ttsNextStartTime: 0,
+    /** promise chain that decodes + schedules blobs strictly in arrival order */
+    ttsDecodeChain: Promise.resolve(),
+    /** generation counter — bumped on barge-in to invalidate in-flight decodes */
+    ttsPlaybackGen: 0,
     isTtsPlaying: false,
 
     /** UI state */
