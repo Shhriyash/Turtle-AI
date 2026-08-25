@@ -4111,7 +4111,15 @@ async def _handle_audio_message(
         stt_start = time.time()
         print(f"LOG: STT transcribing {len(audio_array)} samples @ {sample_rate}Hz")
         try:
-            transcription = agents_mgr.stt.transcribe_from_audio((sample_rate, audio_array))
+            # STT is a blocking network+CPU call; running it inline would freeze
+            # the whole event loop (every other session's pings/turns stall) for
+            # its full duration. Offload to a thread so the loop stays responsive.
+            loop = asyncio.get_event_loop()
+            transcription = await loop.run_in_executor(
+                None,
+                agents_mgr.stt.transcribe_from_audio,
+                (sample_rate, audio_array),
+            )
             timings["stt_ms"] = round((time.time() - stt_start) * 1000)
             print(f"LOG: STT completed in {timings['stt_ms']}ms -> {repr(transcription[:80]) if transcription else 'empty'}")
         except Exception as stt_exc:
