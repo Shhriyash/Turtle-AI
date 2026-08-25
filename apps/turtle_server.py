@@ -78,6 +78,8 @@ from core.llm_client import (
     get_openrouter_models,
     get_groq_fallback_model,
     run_agent_with_fallbacks,
+    stream_agent_text_with_fallbacks,
+    StreamCollector,
 )
 from core.email_flow import (
     build_compose_email_prompt,
@@ -4081,6 +4083,178 @@ async def _handle_text_message(
     return outcome.new_history
 
 
+def _voice_stream_llm_enabled() -> bool:
+    """Whether the voice turn streams LLM tokens into TTS (opt-in).
+
+    Off by default: the streamed path overlaps generation with synthesis to start
+    speaking sooner, but it needs live validation against the full tool/memory
+    turn before it can be the default. Enable via VOICE_STREAM_LLM=1 (env) or the
+    same key in turtle_config.json.
+    """
+    raw = os.getenv("VOICE_STREAM_LLM")
+    if raw is None:
+        raw = str(config.get("VOICE_STREAM_LLM", "0"))
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+class _StreamPreAudioError(Exception):
+    """Streaming failed before any audio was sent — safe to retry via batch path.
+
+    Once a sentence has been spoken we can't un-say it, so only failures raised
+    before the first audio frame carry this type; the caller then falls back to
+    the canonical batch turn for this same turn.
+    """
+
+
+async def _execute_turn_streaming(
+    ws: WebSocket,
+    state: SharedState,
+    user_text: str,
+    message_history: list[ModelMessage] | None,
+    *,
+    channel: str,
+    timings: dict[str, float],
+    overall_start: float,
+) -> TurnOutcome:
+    """Voice turn that streams LLM tokens into sentence-chunked TTS.
+
+    Mirrors the pre-run (memory context, confirmation sidecar, turn id) and
+    post-run (persistence, explicit facts, candidate queuing, reflector) stages
+    of ``_execute_turn`` — reusing the same helpers so behaviour can't silently
+    diverge — but replaces the single blocking agent call + separate TTS with a
+    streamed run whose text is synthesised and sent as each sentence completes.
+
+    Raises ``_StreamPreAudioError`` if it fails before the first audio frame, so
+    the caller can transparently fall back to the batch path for this turn.
+    """
+    # --- pre-run: identical inputs to the batch path -----------------------
+    if state.user_id:
+        emit_event_once(state.user_id, "first_message_sent", channel=channel)
+
+    pending_prompt = state.confirmation_gate.next_prompt()
+    if pending_prompt is not None:
+        await _ws_send_json(ws, {
+            "type": "confirmation_prompt",
+            "event_ids": list(pending_prompt.all_event_ids),
+            "topic": pending_prompt.topic,
+            "key": pending_prompt.key,
+            "message": pending_prompt.question,
+        })
+
+    task_type = _detect_task_type(user_text)
+    if task_type == "general":
+        _pending_email = state.session_store.get_pending_email() or {}
+        if _pending_email.get("recipients") or _pending_email.get("subject") or _pending_email.get("content"):
+            task_type = "email"
+
+    state.memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=user_text)
+    turn_id = _new_turn_id(state)
+
+    # --- streamed run + TTS ------------------------------------------------
+    collector = StreamCollector()
+    first_audio_sent = False
+    chunks_sent = 0
+    llm_start = time.time()
+
+    async def _token_source():
+        # Yields raw model text deltas; StreamCollector captures the finished run.
+        async for delta in stream_agent_text_with_fallbacks(
+            agents_mgr.main_assistant,
+            agents_mgr.main_assistant_fallbacks,
+            user_text,
+            deps=state,
+            message_history=message_history,
+            usage_limits=agents_mgr.usage_limits,
+            collector=collector,
+        ):
+            yield delta
+
+    from core.latency_budgets import budgets, check_sla
+    from core.streaming_tts import stream_tts_from_token_stream
+
+    await _ws_send_json(ws, {"type": "status", "status": "speaking"})
+    tts_start = time.time()
+    try:
+        # One per-turn trace span, same record the batch path writes to disk, so
+        # "why did Turtle answer X" stays answerable for streamed turns too.
+        with trace_sink.span(
+            "turtle.turn",
+            user_id=state.user_id,
+            session_id=state.session_store.session_id or "",
+            turn_id=turn_id,
+            intent=task_type,
+            memory_context_chars=len(state.memory_context or ""),
+            channel=channel,
+            streamed=True,
+        ):
+            async for _sentence, audio_bytes in stream_tts_from_token_stream(
+                _token_source(),
+                speed=float(config.get("TURTLE_TTS_SPEED", 1.2)),
+                tts_timeout_s=budgets.TOOL_S,
+                clean_fn=clean_text_for_tts,
+            ):
+                if not first_audio_sent:
+                    timings["tts_first_byte_ms"] = round((time.time() - tts_start) * 1000)
+                    check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
+                    first_audio_sent = True
+                await ws.send_bytes(audio_bytes)
+                chunks_sent += 1
+    except Exception as exc:
+        # Nothing spoken yet → the batch path can still serve this turn cleanly.
+        if not first_audio_sent:
+            print(f"LOG: voice stream failed pre-audio ({channel}): {exc}")
+            raise _StreamPreAudioError(str(exc)) from exc
+        # Audio already went out; log and continue to persist what we have.
+        print(f"LOG: voice stream error after first audio ({channel}): {exc}")
+        traceback.print_exc()
+
+    timings["llm_ms"] = round((time.time() - llm_start) * 1000)
+
+    final_output = clean_text_for_model(collector.output or "")
+    if not final_output:
+        # No usable text produced and nothing spoken → fall back to batch.
+        if not first_audio_sent:
+            raise _StreamPreAudioError("stream produced no output")
+        return TurnOutcome(message_history, None, "")
+
+    # Send the full reply text for the transcript UI once synthesis is underway.
+    await _ws_send_json(ws, {"type": "done", "content": final_output})
+
+    # --- post-run: identical bookkeeping to the batch path -----------------
+    message_history = _persist_history(message_history, collector)
+    await state.session_store.replace_messages(message_history)
+    state.rag_system.add_conversation(user_text, final_output)
+    _apply_explicit_facts_from_turn(
+        state,
+        session_id=state.session_store.session_id or "unknown_session",
+        turn_id=turn_id,
+        user_text=user_text,
+        task_type=task_type,
+    )
+    _queue_confirmation_candidates_from_turn(
+        state,
+        session_id=state.session_store.session_id or "unknown_session",
+        user_text=user_text,
+    )
+    cap_notice = pop_pending_storage_cap_notice(_storage_cap_key(state))
+    if cap_notice:
+        await _ws_send_json(ws, cap_notice)
+    if state.reflector is not None:
+        await state.reflector.on_turn(
+            state,
+            session_id=state.session_store.session_id or "",
+            message_history=message_history or [],
+        )
+
+    timings["tts_ms"] = round((time.time() - tts_start) * 1000)
+    timings["total_ms"] = round((time.time() - overall_start) * 1000)
+    await _ws_send_json(ws, {"type": "timing", **timings})
+    print(f"LOG: voice stream done — {chunks_sent} chunks, "
+          f"first_audio={timings.get('tts_first_byte_ms')}ms, total={timings['total_ms']}ms")
+
+    return TurnOutcome(message_history, final_output, final_output)
+
+
 async def _handle_audio_message(
     ws: WebSocket,
     state: SharedState,
@@ -4138,6 +4312,20 @@ async def _handle_audio_message(
 
         # Send transcription to client
         await _ws_send_json(ws, {"type": "transcription", "text": transcription})
+
+        # Opt-in fast path: stream LLM tokens straight into sentence-chunked TTS
+        # so speech starts at the first sentence boundary instead of after the
+        # whole reply is generated. Falls back to the canonical batch turn below
+        # if streaming fails before any audio is spoken.
+        if _voice_stream_llm_enabled():
+            try:
+                outcome = await _execute_turn_streaming(
+                    ws, state, transcription, message_history,
+                    channel="web_voice", timings=timings, overall_start=overall_start,
+                )
+                return outcome.new_history
+            except _StreamPreAudioError as stream_exc:
+                print(f"LOG: falling back to batch turn: {stream_exc}")
 
         # The full turn — routing, memory, graph, persistence, extraction,
         # trace span, confirmation sidecar, classified errors — is owned by the

@@ -28,7 +28,7 @@ import os
 import re
 import threading
 import time
-from typing import AsyncIterator, Iterator
+from typing import AsyncIterator, Callable, Iterator
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +196,7 @@ async def stream_tts_from_token_stream(
     model: str | None = None,
     speed: float | None = None,
     tts_timeout_s: float = 8.0,
+    clean_fn: "Callable[[str], str] | None" = None,
 ) -> AsyncIterator[tuple[str, bytes]]:
     """E3: Sentence-boundary chunked TTS from a streaming token iterator.
 
@@ -210,9 +211,11 @@ async def stream_tts_from_token_stream(
         model: Deepgram model override.
         speed: TTS speed.
         tts_timeout_s: Per-sentence synthesis timeout.
+        clean_fn: optional per-sentence normaliser (e.g. strip markdown for TTS)
+            applied before synthesis; a sentence that cleans to empty is skipped.
 
     Yields:
-        (sentence_text, wav_bytes) tuples as they complete.
+        (spoken_sentence_text, wav_bytes) tuples as they complete, in order.
     """
     accumulator = SentenceAccumulator()
     # Ordered queue: sentences synthesise concurrently (tasks fire the moment a
@@ -220,12 +223,18 @@ async def stream_tts_from_token_stream(
     # playback plays them scrambled. We only ever release from the front.
     pending_tasks: list[tuple[str, asyncio.Task]] = []
 
+    def _spawn(raw_sentence: str) -> None:
+        spoken = clean_fn(raw_sentence) if clean_fn else raw_sentence
+        if not spoken or not spoken.strip():
+            return
+        task = asyncio.create_task(
+            _synthesize_sentence_async(spoken, model=model, speed=speed)
+        )
+        pending_tasks.append((spoken, task))
+
     async for token in token_iterator:
         for sentence in accumulator.feed(token):
-            task = asyncio.create_task(
-                _synthesize_sentence_async(sentence, model=model, speed=speed)
-            )
-            pending_tasks.append((sentence, task))
+            _spawn(sentence)
 
         # Non-blocking release of any FRONT tasks already finished — never skip
         # ahead to a later sentence that happens to finish first.
@@ -238,10 +247,7 @@ async def stream_tts_from_token_stream(
 
     # Flush the final partial sentence after the token stream ends.
     for sentence in accumulator.flush():
-        task = asyncio.create_task(
-            _synthesize_sentence_async(sentence, model=model, speed=speed)
-        )
-        pending_tasks.append((sentence, task))
+        _spawn(sentence)
 
     # Drain the rest in strict order, awaiting each front task in turn.
     for sentence, task in pending_tasks:
