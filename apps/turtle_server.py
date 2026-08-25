@@ -4178,6 +4178,10 @@ async def _handle_audio_message(
             ):
                 if not first_chunk_sent:
                     first_byte_ms = round((time.time() - tts_start) * 1000)
+                    # Surface TTS first-byte in the timing frame, not just the log:
+                    # it's the single number that tells us how fast the reply began
+                    # speaking, and the key metric to watch as Phase 1 streams the LLM.
+                    timings["tts_first_byte_ms"] = first_byte_ms
                     check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
                     print(f"LOG: TTS first chunk in {first_byte_ms}ms ({len(audio_bytes)} bytes)")
                     first_chunk_sent = True

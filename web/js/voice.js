@@ -12,7 +12,10 @@ import { setBubbleState } from './chat.js';
 const PROCESSOR_PATH = '/static/audio/pcm-processor.js';
 const AUTO_VAD_RMS_THRESHOLD = 350;
 const AUTO_VAD_MIN_SPEECH_MS = 180;
-const AUTO_VAD_SILENCE_STOP_MS = 850;
+// Silence window before auto-stop. This is a fixed tail appended to every AUTO
+// turn, so it is pure latency; 500ms is a snappier interim value pending Phase 1,
+// which replaces this RMS timer with model-based end-of-turn (~260ms median).
+const AUTO_VAD_SILENCE_STOP_MS = 500;
 const AUTO_VAD_NO_SPEECH_TIMEOUT_MS = 4500;
 const AUTO_VAD_MAX_RECORD_MS = 15000;
 

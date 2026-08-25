@@ -226,6 +226,10 @@ export function updateTimings(data) {
         const el = document.getElementById('timing-tts');
         if (el) el.textContent = data.tts_ms + 'ms';
     }
+    if (data.tts_first_byte_ms !== undefined) {
+        const el = document.getElementById('timing-ttfb');
+        if (el) el.textContent = data.tts_first_byte_ms + 'ms';
+    }
     if (data.total_ms !== undefined) {
         const el = document.getElementById('timing-total');
         if (el) el.textContent = data.total_ms > 1000
