@@ -59,6 +59,11 @@ function handleServerMessage(msg) {
         case 'status':
             handleStatusMessage(msg);
             break;
+        case 'transcription_partial':
+            // Live interim transcript from streaming STT — show it as the
+            // thinking caption while the user is still speaking.
+            if (msg.text) showThinking(msg.text);
+            break;
         case 'transcription':
             addMessage('user', msg.text);
             break;
@@ -104,12 +109,19 @@ function handleStatusMessage(msg) {
         ready:        'Ready',
         thinking:     'Thinking',
         transcribing: 'Transcribing',
+        listening:    'Listening',
         speaking:     'Speaking',
         restored:     'Session restored',
     };
 
+    // The ready frame advertises whether the server has streaming STT enabled.
+    if (msg.status === 'ready') {
+        AppState.streamSttEnabled = !!msg.stream_stt;
+    }
+
+    // 'listening' is a streaming-STT state; map its bubble to the recording look.
     setStatus(msg.status, labelMap[msg.status] || msg.status);
-    setBubbleState(msg.status);
+    setBubbleState(msg.status === 'listening' ? 'listening' : msg.status);
 
     if (msg.status === 'thinking') {
         showThinking('Thinking');

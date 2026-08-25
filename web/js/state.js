@@ -15,6 +15,11 @@ const AppState = {
     voiceMode: 'ptt',
     pttSpaceHeld: false,
 
+    /** Streaming STT (Deepgram Flux) — advertised by the server's ready frame */
+    streamSttEnabled: false,
+    /** True while this recording is streaming frames to an open server mic session */
+    micStreaming: false,
+
     /** Audio recording state */
     /** @type {AudioContext|null} */
     audioContext: null,

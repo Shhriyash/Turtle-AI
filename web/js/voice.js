@@ -24,6 +24,31 @@ let autoVadSilenceMs = 0;
 let autoVadTotalMs = 0;
 let autoVadSpeechStarted = false;
 
+// Streaming-STT frame batching: the worklet emits ~8ms (128-sample) frames;
+// coalesce them to ~50ms before sending so we aren't firing ~125 WS messages/sec.
+const STREAM_SEND_SAMPLES = 800; // 50ms @ 16kHz
+let streamSendBuffer = [];
+let streamSendSamples = 0;
+
+function resetStreamSendBuffer() {
+    streamSendBuffer = [];
+    streamSendSamples = 0;
+}
+
+function flushStreamSendBuffer() {
+    if (streamSendSamples === 0) return;
+    const merged = new Int16Array(streamSendSamples);
+    let offset = 0;
+    for (const c of streamSendBuffer) {
+        merged.set(c, offset);
+        offset += c.length;
+    }
+    resetStreamSendBuffer();
+    if (AppState.ws && AppState.ws.readyState === WebSocket.OPEN) {
+        AppState.ws.send(merged.buffer);
+    }
+}
+
 function resetAutoVadState() {
     autoVadSpeechMs = 0;
     autoVadSilenceMs = 0;
@@ -171,6 +196,16 @@ export async function startRecording() {
     AppState.isRecording = true;
     AppState.recordedChunks = [];
     resetAutoVadState();
+
+    // Streaming STT: open a server-side Flux session and stream frames live, so
+    // transcription overlaps speech and Flux decides end-of-turn. Falls back to
+    // batch capture (accumulate + send on stop) when the server hasn't enabled it.
+    AppState.micStreaming = !!AppState.streamSttEnabled;
+    resetStreamSendBuffer();
+    if (AppState.micStreaming && AppState.ws && AppState.ws.readyState === WebSocket.OPEN) {
+        AppState.ws.send(JSON.stringify({ type: 'mic_open', sample_rate: 16000 }));
+    }
+
     setBubbleState('listening');
     setStatus('recording', AppState.voiceMode === 'vad' ? 'Listening (Auto VAD)' : 'Recording');
     setVoiceButtonRecordingUi(true);
@@ -196,8 +231,17 @@ export async function startRecording() {
 
         AppState.audioWorkletNode.port.onmessage = (event) => {
             const chunk = new Int16Array(event.data);
-            AppState.recordedChunks.push(chunk);
             handleAutoVadChunk(chunk);
+            if (AppState.micStreaming) {
+                // Stream frames live (batched to ~50ms) instead of accumulating.
+                streamSendBuffer.push(chunk);
+                streamSendSamples += chunk.length;
+                if (streamSendSamples >= STREAM_SEND_SAMPLES) {
+                    flushStreamSendBuffer();
+                }
+            } else {
+                AppState.recordedChunks.push(chunk);
+            }
         };
 
         source.connect(AppState.audioWorkletNode);
@@ -207,6 +251,11 @@ export async function startRecording() {
     } catch (err) {
         console.error('Recording failed:', err);
         showToast('Microphone access denied', true);
+        // Abort any streaming session we opened before the mic failed.
+        if (AppState.micStreaming && AppState.ws && AppState.ws.readyState === WebSocket.OPEN) {
+            AppState.ws.send(JSON.stringify({ type: 'mic_close' }));
+        }
+        AppState.micStreaming = false;
         AppState.isRecording = false;
         setBubbleState('idle');
         setStatus('ready', 'Ready');
@@ -238,7 +287,23 @@ export function stopRecording(options = {}) {
             AppState.audioContext = null;
         }
 
-        if (!discard && AppState.recordedChunks.length > 0) {
+        if (AppState.micStreaming) {
+            // Streaming mode: flush any buffered frames and tell the server to
+            // finalise the turn (Flux emits its last EndOfTurn, then closes).
+            AppState.micStreaming = false;
+            if (AppState.ws && AppState.ws.readyState === WebSocket.OPEN) {
+                if (!discard) flushStreamSendBuffer();
+                AppState.ws.send(JSON.stringify({ type: 'mic_close' }));
+            }
+            resetStreamSendBuffer();
+            if (!discard) {
+                setBubbleState('transcribing');
+                setStatus('transcribing', 'Transcribing');
+            } else {
+                setBubbleState('idle');
+                setStatus('ready', 'Ready');
+            }
+        } else if (!discard && AppState.recordedChunks.length > 0) {
             const totalLength = AppState.recordedChunks.reduce((sum, c) => sum + c.length, 0);
             const merged = new Int16Array(totalLength);
             let offset = 0;

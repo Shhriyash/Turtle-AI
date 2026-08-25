@@ -3384,6 +3384,9 @@ async def websocket_endpoint(ws: WebSocket):
 
         await rag_system.start_session(session_id=restore_result.session_id)
         message_history: list[ModelMessage] | None = session_store.message_history or None
+        # Live Deepgram Flux streaming-STT session for this connection, when the
+        # client opts in with a mic_open frame (only if the server enables it).
+        mic_session: "_MicStreamSession | None" = None
 
         if restore_result.restored:
             await _ws_send_json(ws, {
@@ -3393,7 +3396,13 @@ async def websocket_endpoint(ws: WebSocket):
                 "message_count": restore_result.message_count,
             })
 
-        await _ws_send_json(ws, {"type": "status", "status": "ready"})
+        await _ws_send_json(ws, {
+            "type": "status",
+            "status": "ready",
+            # Capability advertisement: the client only streams mic frames when the
+            # server actually has streaming STT enabled.
+            "stream_stt": _voice_stream_stt_enabled(),
+        })
 
         # Phase 5 (W2): drain any routine fires that arrived while this user had
         # no live socket (queued by deliver_routine_notice). Verified sends: a
@@ -3441,9 +3450,16 @@ async def websocket_endpoint(ws: WebSocket):
 
                 # Binary frame = audio data
                 if "bytes" in raw and raw["bytes"]:
+                    audio_bytes = raw["bytes"]
+                    # Streaming mode: an open Flux session consumes incremental
+                    # PCM frames. Turns are driven by Flux EndOfTurn events in the
+                    # consumer, and rate-limited once at mic_open — not per frame.
+                    if mic_session is not None:
+                        await mic_session.stt.send_audio(audio_bytes)
+                        continue
+                    # Legacy one-shot mode: the whole utterance in a single frame.
                     if not await _check_user_message_rate():
                         break
-                    audio_bytes = raw["bytes"]
                     message_history = await _handle_audio_message(
                         ws, state, audio_bytes, message_history
                     )
@@ -3481,6 +3497,35 @@ async def websocket_endpoint(ws: WebSocket):
                                 sample_rate=sample_rate,
                             )
 
+                    elif msg_type == "mic_open":
+                        # Begin streaming STT for this utterance/conversation.
+                        if not _voice_stream_stt_enabled():
+                            await _ws_send_json(ws, {
+                                "type": "error",
+                                "message": "Streaming STT is not enabled on the server.",
+                            })
+                        elif mic_session is None:
+                            if not await _check_user_message_rate():
+                                break
+                            sample_rate = int(msg.get("sample_rate", 16000))
+                            try:
+                                mic_session = await _open_mic_stream(
+                                    ws, state, message_history, sample_rate=sample_rate,
+                                )
+                            except Exception as mic_exc:
+                                print(f"LOG: mic_open failed: {mic_exc}")
+                                traceback.print_exc()
+                                await _ws_send_json(ws, {
+                                    "type": "error",
+                                    "message": f"Could not start streaming STT: {mic_exc}",
+                                })
+                                mic_session = None
+
+                    elif msg_type == "mic_close":
+                        if mic_session is not None:
+                            message_history = await _close_mic_stream(mic_session)
+                            mic_session = None
+
                     elif msg_type == "ping":
                         await _ws_send_json(ws, {"type": "pong"})
 
@@ -3497,6 +3542,16 @@ async def websocket_endpoint(ws: WebSocket):
             print(f"LOG: WebSocket error: {e}")
             traceback.print_exc()
         finally:
+            # Tear down any live streaming-STT session so its worker threads and
+            # websocket don't leak when the client drops mid-utterance.
+            if mic_session is not None:
+                try:
+                    await mic_session.stt.aclose()
+                    mic_session.consumer_task.cancel()
+                except Exception:
+                    pass
+                mic_session = None
+
             # Session cleanup. The legacy single-tenant MemoryStore checkpoint
             # was dropped here — personal memory is journaled per-turn and needs
             # no session-end flush.
@@ -4313,93 +4368,232 @@ async def _handle_audio_message(
         # Send transcription to client
         await _ws_send_json(ws, {"type": "transcription", "text": transcription})
 
-        # Opt-in fast path: stream LLM tokens straight into sentence-chunked TTS
-        # so speech starts at the first sentence boundary instead of after the
-        # whole reply is generated. Falls back to the canonical batch turn below
-        # if streaming fails before any audio is spoken.
-        if _voice_stream_llm_enabled():
-            try:
-                outcome = await _execute_turn_streaming(
-                    ws, state, transcription, message_history,
-                    channel="web_voice", timings=timings, overall_start=overall_start,
-                )
-                return outcome.new_history
-            except _StreamPreAudioError as stream_exc:
-                print(f"LOG: falling back to batch turn: {stream_exc}")
-
-        # The full turn — routing, memory, graph, persistence, extraction,
-        # trace span, confirmation sidecar, classified errors — is owned by the
-        # one canonical pipeline. Voice thereby gains everything the text path
-        # had that this handler used to omit.
-        outcome = await _execute_turn(
-            ws, state, transcription, message_history, channel="web_voice",
+        return await _reply_and_speak(
+            ws, state, transcription, message_history,
+            timings=timings, overall_start=overall_start,
         )
-        message_history = outcome.new_history
-        final_output = outcome.output_text
-
-        # A pipeline error returns no speakable text (and has already emitted its
-        # own error frame): stop here.
-        if not final_output:
-            return message_history
-
-        # E3: Streaming TTS with sentence-boundary chunking.
-        # Each sentence is synthesised as soon as its boundary is detected and
-        # sent to the client immediately — no waiting for the full audio file.
-        await _ws_send_json(ws, {"type": "status", "status": "speaking"})
-        tts_start = time.time()
-        tts_text = clean_text_for_tts(final_output)
-        tts_debug = settings.tts_debug
-
-        # E4: latency budget
-        from core.latency_budgets import budgets, check_sla
-        from core.streaming_tts import stream_tts_from_text
-
-        first_chunk_sent = False
-        chunks_sent = 0
-        tts_errors = 0
-
-        try:
-            async for sentence_text, audio_bytes in stream_tts_from_text(
-                tts_text,
-                speed=float(config.get("TURTLE_TTS_SPEED", 1.2)),
-                tts_timeout_s=budgets.TOOL_S,
-            ):
-                if not first_chunk_sent:
-                    first_byte_ms = round((time.time() - tts_start) * 1000)
-                    # Surface TTS first-byte in the timing frame, not just the log:
-                    # it's the single number that tells us how fast the reply began
-                    # speaking, and the key metric to watch as Phase 1 streams the LLM.
-                    timings["tts_first_byte_ms"] = first_byte_ms
-                    check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
-                    print(f"LOG: TTS first chunk in {first_byte_ms}ms ({len(audio_bytes)} bytes)")
-                    first_chunk_sent = True
-                await ws.send_bytes(audio_bytes)
-                chunks_sent += 1
-
-            timings["tts_ms"] = round((time.time() - tts_start) * 1000)
-            if chunks_sent:
-                print(f"LOG: TTS streaming done in {timings['tts_ms']}ms ({chunks_sent} chunks)")
-            else:
-                print("LOG: TTS produced no audio chunks (empty text?)")
-
-        except Exception as e:
-            timings["tts_ms"] = round((time.time() - tts_start) * 1000)
-            print(f"LOG: TTS streaming error after {timings['tts_ms']}ms: {type(e).__name__}: {e}")
-            if tts_debug:
-                traceback.print_exc()
-            await _ws_send_json(ws, {"type": "error", "message": f"TTS error: {e}"})
-
-
-        timings["total_ms"] = round((time.time() - overall_start) * 1000)
-        await _ws_send_json(ws, {"type": "timing", **timings})
-
-        return message_history
 
     except Exception as e:
         print(f"LOG: Audio handler error: {e}")
         traceback.print_exc()
         await _ws_send_json(ws, {"type": "error", "message": str(e)})
         return message_history
+
+
+async def _reply_and_speak(
+    ws: WebSocket,
+    state: SharedState,
+    transcript: str,
+    message_history: list[ModelMessage] | None,
+    *,
+    timings: dict[str, float],
+    overall_start: float,
+) -> list[ModelMessage] | None:
+    """Run one voice turn for ``transcript`` and speak the reply.
+
+    Shared by the batch audio handler (one utterance per WS binary frame) and the
+    streaming-STT consumer (one call per Flux EndOfTurn), so both routes get the
+    identical turn pipeline + TTS behaviour.
+    """
+    # Opt-in fast path: stream LLM tokens straight into sentence-chunked TTS so
+    # speech starts at the first sentence boundary. Falls back to the canonical
+    # batch turn below if streaming fails before any audio is spoken.
+    if _voice_stream_llm_enabled():
+        try:
+            outcome = await _execute_turn_streaming(
+                ws, state, transcript, message_history,
+                channel="web_voice", timings=timings, overall_start=overall_start,
+            )
+            return outcome.new_history
+        except _StreamPreAudioError as stream_exc:
+            print(f"LOG: falling back to batch turn: {stream_exc}")
+
+    # The full turn — routing, memory, persistence, extraction, trace span,
+    # confirmation sidecar, classified errors — is owned by the one canonical
+    # pipeline. Voice gains everything the text path has.
+    outcome = await _execute_turn(
+        ws, state, transcript, message_history, channel="web_voice",
+    )
+    message_history = outcome.new_history
+    final_output = outcome.output_text
+
+    # A pipeline error returns no speakable text (and has already emitted its own
+    # error frame): stop here.
+    if not final_output:
+        return message_history
+
+    # Streaming TTS with sentence-boundary chunking: each sentence is synthesised
+    # as its boundary is detected and sent immediately — no waiting for the whole
+    # audio file.
+    await _ws_send_json(ws, {"type": "status", "status": "speaking"})
+    tts_start = time.time()
+    tts_text = clean_text_for_tts(final_output)
+    tts_debug = settings.tts_debug
+
+    from core.latency_budgets import budgets, check_sla
+    from core.streaming_tts import stream_tts_from_text
+
+    first_chunk_sent = False
+    chunks_sent = 0
+
+    try:
+        async for sentence_text, audio_bytes in stream_tts_from_text(
+            tts_text,
+            speed=float(config.get("TURTLE_TTS_SPEED", 1.2)),
+            tts_timeout_s=budgets.TOOL_S,
+        ):
+            if not first_chunk_sent:
+                first_byte_ms = round((time.time() - tts_start) * 1000)
+                timings["tts_first_byte_ms"] = first_byte_ms
+                check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
+                print(f"LOG: TTS first chunk in {first_byte_ms}ms ({len(audio_bytes)} bytes)")
+                first_chunk_sent = True
+            await ws.send_bytes(audio_bytes)
+            chunks_sent += 1
+
+        timings["tts_ms"] = round((time.time() - tts_start) * 1000)
+        if chunks_sent:
+            print(f"LOG: TTS streaming done in {timings['tts_ms']}ms ({chunks_sent} chunks)")
+        else:
+            print("LOG: TTS produced no audio chunks (empty text?)")
+
+    except Exception as e:
+        timings["tts_ms"] = round((time.time() - tts_start) * 1000)
+        print(f"LOG: TTS streaming error after {timings['tts_ms']}ms: {type(e).__name__}: {e}")
+        if tts_debug:
+            traceback.print_exc()
+        await _ws_send_json(ws, {"type": "error", "message": f"TTS error: {e}"})
+
+    timings["total_ms"] = round((time.time() - overall_start) * 1000)
+    await _ws_send_json(ws, {"type": "timing", **timings})
+
+    return message_history
+
+
+# ---------------------------------------------------------------------------
+# Streaming STT (Deepgram Flux) — continuous-frame voice input
+# ---------------------------------------------------------------------------
+
+def _voice_stream_stt_enabled() -> bool:
+    """Whether the server accepts continuous mic frames into Deepgram Flux (opt-in).
+
+    Off by default: streaming STT overlaps transcription with the user's speech
+    and replaces the fixed client silence timer with model end-of-turn, but the
+    continuous-frame protocol needs live validation. Enable via VOICE_STREAM_STT=1
+    (env) or the same key in turtle_config.json.
+    """
+    raw = os.getenv("VOICE_STREAM_STT")
+    if raw is None:
+        raw = str(config.get("VOICE_STREAM_STT", "0"))
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+class _MicStreamSession:
+    """A live Flux streaming-STT session bound to one websocket connection.
+
+    ``history`` is a one-key holder so the consumer task and the receive loop
+    share the same conversation of record: the consumer writes each turn's new
+    history into it, and the receive loop reads it back on mic_close.
+    """
+
+    __slots__ = ("stt", "consumer_task", "history")
+
+    def __init__(self, stt: Any, consumer_task: "asyncio.Task", history: dict) -> None:
+        self.stt = stt
+        self.consumer_task = consumer_task
+        self.history = history
+
+
+async def _flux_mic_consumer(
+    ws: WebSocket,
+    state: SharedState,
+    stt: Any,
+    history: dict,
+) -> None:
+    """Consume Flux turn events: stream interim captions, run a turn on EndOfTurn.
+
+    Runs as its own task alongside the receive loop. It is the SOLE writer of
+    ``history["messages"]`` while streaming is active, and it processes events
+    strictly one at a time, so turns never overlap and there is no history race.
+    """
+    try:
+        async for ev in stt.events():
+            if ev.kind == "update":
+                if ev.transcript:
+                    await _ws_send_json(ws, {
+                        "type": "transcription_partial", "text": ev.transcript,
+                    })
+            elif ev.kind == "end_of_turn":
+                text = (ev.transcript or "").strip()
+                if not text:
+                    continue
+                await _ws_send_json(ws, {"type": "transcription", "text": text})
+                timings: dict[str, float] = {}
+                overall_start = time.time()
+                try:
+                    history["messages"] = await _reply_and_speak(
+                        ws, state, text, history["messages"],
+                        timings=timings, overall_start=overall_start,
+                    )
+                except Exception as turn_exc:
+                    print(f"LOG: mic-stream turn error: {turn_exc}")
+                    traceback.print_exc()
+                    await _ws_send_json(ws, {
+                        "type": "error", "message": f"Turn error: {turn_exc}",
+                    })
+            elif ev.kind == "error":
+                await _ws_send_json(ws, {
+                    "type": "error", "message": "Streaming STT error.",
+                })
+                break
+            elif ev.kind == "closed":
+                break
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"LOG: mic consumer crashed: {exc}")
+        traceback.print_exc()
+
+
+async def _open_mic_stream(
+    ws: WebSocket,
+    state: SharedState,
+    message_history: list[ModelMessage] | None,
+    *,
+    sample_rate: int = 16000,
+) -> "_MicStreamSession":
+    """Open a Flux session + consumer task for a client that started streaming."""
+    from core.stt_streaming import FluxStreamingSTT
+
+    stt = FluxStreamingSTT(sample_rate=sample_rate)
+    await stt.start()
+    history = {"messages": message_history}
+    consumer_task = asyncio.create_task(_flux_mic_consumer(ws, state, stt, history))
+    await _ws_send_json(ws, {"type": "status", "status": "listening"})
+    print("LOG: streaming STT session opened")
+    return _MicStreamSession(stt, consumer_task, history)
+
+
+async def _close_mic_stream(
+    session: "_MicStreamSession",
+) -> list[ModelMessage] | None:
+    """Finalise a streaming session and return the up-to-date conversation.
+
+    finish() flushes the current turn (Flux emits its final EndOfTurn, then
+    closes); we wait for the consumer to drain that — including running the last
+    turn — before reading history back and tearing the session down.
+    """
+    try:
+        await session.stt.finish()
+        try:
+            await asyncio.wait_for(session.consumer_task, timeout=90)
+        except asyncio.TimeoutError:
+            print("LOG: streaming STT consumer drain timed out")
+            session.consumer_task.cancel()
+    finally:
+        await session.stt.aclose()
+    print("LOG: streaming STT session closed")
+    return session.history["messages"]
 
 
 # ---------------------------------------------------------------------------
