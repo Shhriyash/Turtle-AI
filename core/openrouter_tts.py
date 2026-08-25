@@ -196,23 +196,40 @@ def _synthesize_deepgram_ws(
         raise
 
 
-def _synthesize_deepgram_rest(
+def _deepgram_rest_model_name(model: str | None) -> str:
+    """Resolve the Deepgram REST model, guarding against the legacy typo.
+
+    ``aura-orion-en`` (no ``-2``) was shipped in config and is rejected by the
+    API with a 400; the current line is ``aura-2-*``. Silently upgrade it so a
+    stale config value can't take voice output down.
+    """
+    name = model or os.getenv("DEEPGRAM_TTS_MODEL", DEEPGRAM_TTS_DEFAULT_MODEL)
+    if name.startswith("aura-") and not name.startswith("aura-2-"):
+        return "aura-2-" + name[len("aura-"):]
+    return name
+
+
+def _synthesize_deepgram_rest_bytes(
     text: str,
-    output_path: Path,
     *,
     model: str | None = None,
     speed: float | None = None,
-) -> Path:
-    """Fallback Deepgram REST synthesis path."""
+) -> bytes:
+    """Deepgram REST synthesis returning WAV bytes (no temp file).
+
+    This is the reliable low-latency path for streamed, per-sentence synthesis:
+    a single request/response that yields a complete, self-describing RIFF/WAV
+    the browser can hand straight to ``decodeAudioData`` — no disk round trip and
+    none of the WebSocket idle-drain wait.
+    """
+    if not text or not text.strip():
+        raise RuntimeError("TTS text is empty.")
     client = get_deepgram_client()
-    model_name = model or os.getenv("DEEPGRAM_TTS_MODEL", DEEPGRAM_TTS_DEFAULT_MODEL)
+    model_name = _deepgram_rest_model_name(model)
     encoding = os.getenv("DEEPGRAM_TTS_ENCODING", DEEPGRAM_TTS_DEFAULT_ENCODING)
     container = os.getenv("DEEPGRAM_TTS_CONTAINER", DEEPGRAM_TTS_DEFAULT_CONTAINER)
     sample_rate = int(os.getenv("DEEPGRAM_TTS_SAMPLE_RATE", DEEPGRAM_TTS_DEFAULT_SAMPLE_RATE))
     speed_value = _coerce_speed(speed)
-
-    if output_path.suffix.lower() != f".{container}":
-        output_path = output_path.with_suffix(f".{container}")
 
     request_kwargs = {
         "text": text,
@@ -230,21 +247,30 @@ def _synthesize_deepgram_rest(
     except Exception:
         pass
 
-    response = client.speak.v1.audio.generate(
-        **request_kwargs,
-    )
+    response = client.speak.v1.audio.generate(**request_kwargs)
     if hasattr(response, "stream"):
-        output_path.write_bytes(response.stream.getvalue())
-        return output_path
-
+        return response.stream.getvalue()
+    if hasattr(response, "read"):
+        return response.read()
     if hasattr(response, "__iter__"):
-        with open(output_path, "wb") as audio_file:
-            for chunk in response:
-                if chunk:
-                    audio_file.write(chunk)
-        return output_path
-
+        return b"".join(chunk for chunk in response if chunk)
     raise RuntimeError("Deepgram TTS returned unsupported response type.")
+
+
+def _synthesize_deepgram_rest(
+    text: str,
+    output_path: Path,
+    *,
+    model: str | None = None,
+    speed: float | None = None,
+) -> Path:
+    """File-writing wrapper over the REST bytes path (legacy callers)."""
+    container = os.getenv("DEEPGRAM_TTS_CONTAINER", DEEPGRAM_TTS_DEFAULT_CONTAINER)
+    if output_path.suffix.lower() != f".{container}":
+        output_path = output_path.with_suffix(f".{container}")
+    output_path.write_bytes(
+        _synthesize_deepgram_rest_bytes(text, model=model, speed=speed)
+    )
     return output_path
 
 
@@ -274,6 +300,105 @@ def _synthesize_groq(
     return output_path
 
 
+def _synthesize_groq_bytes(
+    text: str,
+    *,
+    model: str | None = None,
+    voice: str | None = None,
+    audio_format: str | None = None,
+) -> bytes:
+    """Groq synthesis returning audio bytes.
+
+    The Groq SDK writes to a path, so we route through a temp file. Groq TTS is a
+    last-resort fallback (its default model currently requires org-level terms
+    acceptance), so the extra disk hop here is off the hot path.
+    """
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+        tmp_path = Path(handle.name)
+    out_path: Path | None = None
+    try:
+        out_path = _synthesize_groq(
+            text, tmp_path, model=model, voice=voice, audio_format=audio_format
+        )
+        return out_path.read_bytes()
+    finally:
+        for candidate in {tmp_path, out_path}:
+            if candidate is not None:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+def synthesize_speech_bytes(
+    text: str,
+    *,
+    model: str | None = None,
+    voice: str | None = None,
+    audio_format: str | None = None,
+    speed: float | None = None,
+) -> bytes:
+    """Synthesize speech and return audio bytes, with provider fallback.
+
+    Provider order (streamed voice path):
+      1. Deepgram REST  — reliable, complete WAV per call, no idle-drain wait.
+      2. Groq speech    — last-resort fallback.
+
+    Deepgram's WebSocket path is intentionally NOT in this chain by default: it
+    can block indefinitely in some environments, and a blocking executor thread
+    cannot be cancelled, so a hang would leak threads and stall turns. Set
+    ``TTS_STREAM_USE_WS=1`` to opt into a WS-first attempt where it's known good.
+    """
+    if not text or not text.strip():
+        raise RuntimeError("TTS text is empty.")
+
+    tts_debug = os.getenv("TTS_DEBUG") == "1"
+    errors: list[tuple[str, Exception]] = []
+
+    if os.getenv("TTS_STREAM_USE_WS", "0") == "1":
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+            tmp_path = Path(handle.name)
+        try:
+            out = _synthesize_deepgram_ws(text, tmp_path, model=model, speed=speed)
+            data = out.read_bytes()
+            if data:
+                return data
+        except Exception as exc:
+            errors.append(("deepgram_ws", exc))
+            if tts_debug:
+                print(f"TTS debug: Deepgram WS bytes error: {exc!r}")
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    try:
+        return _synthesize_deepgram_rest_bytes(text, model=model, speed=speed)
+    except Exception as exc:
+        errors.append(("deepgram_rest", exc))
+        if tts_debug:
+            print(f"TTS debug: Deepgram REST bytes error: {exc!r}")
+
+    try:
+        return _synthesize_groq_bytes(
+            text, model=model, voice=voice, audio_format=audio_format
+        )
+    except Exception as exc:
+        errors.append(("groq", exc))
+        if tts_debug:
+            print(f"TTS debug: Groq bytes error: {exc!r}")
+
+    last_exc = errors[-1][1] if errors else RuntimeError("no TTS provider ran")
+    if any(_is_rate_limit_error(exc) for _, exc in errors):
+        raise RuntimeError("All TTS providers rate-limited or unavailable.") from last_exc
+    raise RuntimeError(
+        f"All TTS providers failed: {[name for name, _ in errors]}"
+    ) from last_exc
+
+
 def synthesize_speech(
     text: str,
     output_path: str | Path,
@@ -287,20 +412,23 @@ def synthesize_speech(
 
     deepgram_exc: Exception | None = None
     tts_debug = os.getenv("TTS_DEBUG") == "1"
-    try:
-        return _synthesize_deepgram_ws(text, output_path, model=model, speed=speed)
-    except Exception as exc:
-        deepgram_exc = exc
-        if tts_debug:
-            print(f"TTS debug: Deepgram WS error: {exc!r}")
 
-    # Safety fallback for environments without WS support.
+    # WS is opt-in: it can block indefinitely in some environments. REST is the
+    # reliable primary (see synthesize_speech_bytes for the full rationale).
+    if os.getenv("TTS_STREAM_USE_WS", "0") == "1":
+        try:
+            return _synthesize_deepgram_ws(text, output_path, model=model, speed=speed)
+        except Exception as exc:
+            deepgram_exc = exc
+            if tts_debug:
+                print(f"TTS debug: Deepgram WS error: {exc!r}")
+
     try:
         return _synthesize_deepgram_rest(text, output_path, model=model, speed=speed)
     except Exception as exc:
         deepgram_exc = exc
         if tts_debug:
-            print(f"TTS debug: Deepgram REST fallback error: {exc!r}")
+            print(f"TTS debug: Deepgram REST error: {exc!r}")
 
     try:
         return _synthesize_groq(

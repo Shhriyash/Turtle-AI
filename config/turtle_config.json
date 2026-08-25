@@ -3,7 +3,7 @@
   "GROQ_PRIMARY_MODEL": "openai/gpt-oss-20b",
   "GROQ_FALLBACK_MODEL": "openai/gpt-oss-20b",
   "GEMINI_MODEL": "gemini-2.5-flash",
-  "DEEPGRAM_TTS_MODEL": "aura-orion-en",
+  "DEEPGRAM_TTS_MODEL": "aura-2-orion-en",
   "DEEPGRAM_TTS_ENCODING": "linear16",
   "DEEPGRAM_TTS_CONTAINER": "wav",
   "DEEPGRAM_TTS_SAMPLE_RATE": 24000,

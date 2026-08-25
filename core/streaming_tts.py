@@ -117,32 +117,23 @@ async def _synthesize_sentence_async(
     model: str | None = None,
     speed: float | None = None,
 ) -> bytes:
-    """Synthesise one sentence via Deepgram WS TTS and return raw audio bytes.
+    """Synthesise one sentence and return a complete WAV as bytes.
 
-    Runs the blocking Deepgram WS call in a thread executor to avoid blocking
-    the event loop.  E4: TTS_FIRST_BYTE_MAX_MS applies at the caller level.
+    Delegates to ``synthesize_speech_bytes`` (Deepgram REST primary, Groq
+    fallback, WS opt-in), run in a thread executor so the blocking provider call
+    never stalls the event loop. Each returned blob is a self-describing RIFF/WAV
+    the browser can hand straight to ``decodeAudioData`` — no temp file, and none
+    of the WebSocket idle-drain wait that used to gate first audio.
     """
-    from core.openrouter_tts import _synthesize_deepgram_ws
+    from functools import partial
 
-    # Write to an in-memory path using a tempfile-style approach
-    import tempfile, pathlib
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        tmp_path = pathlib.Path(f.name)
+    from core.openrouter_tts import synthesize_speech_bytes
 
     loop = asyncio.get_event_loop()
-
-    def _synth() -> bytes:
-        try:
-            out = _synthesize_deepgram_ws(text, tmp_path, model=model, speed=speed)
-            return out.read_bytes()
-        finally:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    audio_bytes = await loop.run_in_executor(None, _synth)
-    return audio_bytes
+    return await loop.run_in_executor(
+        None,
+        partial(synthesize_speech_bytes, text, model=model, speed=speed),
+    )
 
 
 # ---------------------------------------------------------------------------
