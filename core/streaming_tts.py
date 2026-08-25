@@ -215,37 +215,35 @@ async def stream_tts_from_token_stream(
         (sentence_text, wav_bytes) tuples as they complete.
     """
     accumulator = SentenceAccumulator()
+    # Ordered queue: sentences synthesise concurrently (tasks fire the moment a
+    # boundary is detected) but MUST be yielded strictly in sentence order, or
+    # playback plays them scrambled. We only ever release from the front.
     pending_tasks: list[tuple[str, asyncio.Task]] = []
 
     async for token in token_iterator:
-        completed = accumulator.feed(token)
-        for sentence in completed:
+        for sentence in accumulator.feed(token):
             task = asyncio.create_task(
                 _synthesize_sentence_async(sentence, model=model, speed=speed)
             )
             pending_tasks.append((sentence, task))
 
-        # Yield any tasks that are already done (non-blocking drain)
-        still_pending = []
-        for sentence, task in pending_tasks:
-            if task.done():
-                try:
-                    audio_bytes = task.result()
-                    yield sentence, audio_bytes
-                except Exception as exc:
-                    print(f"LOG: TTS error: {exc}")
-            else:
-                still_pending.append((sentence, task))
-        pending_tasks = still_pending
+        # Non-blocking release of any FRONT tasks already finished — never skip
+        # ahead to a later sentence that happens to finish first.
+        while pending_tasks and pending_tasks[0][1].done():
+            sentence, task = pending_tasks.pop(0)
+            try:
+                yield sentence, task.result()
+            except Exception as exc:
+                print(f"LOG: TTS sentence error: {exc}")
 
-    # Flush accumulator after token stream ends
+    # Flush the final partial sentence after the token stream ends.
     for sentence in accumulator.flush():
         task = asyncio.create_task(
             _synthesize_sentence_async(sentence, model=model, speed=speed)
         )
         pending_tasks.append((sentence, task))
 
-    # Drain remaining tasks in order
+    # Drain the rest in strict order, awaiting each front task in turn.
     for sentence, task in pending_tasks:
         try:
             audio_bytes = await asyncio.wait_for(asyncio.shield(task), timeout=tts_timeout_s)

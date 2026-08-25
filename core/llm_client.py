@@ -502,6 +502,105 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
     raise RuntimeError("No agent available for execution")
 
 
+class StreamCollector:
+    """Carries a streamed run's final result out of the async generator.
+
+    An async generator can't ``return`` a value, so ``stream_agent_text_with_fallbacks``
+    stashes the completed run here. ``new_messages()`` mirrors a RunResult so the
+    caller can hand it straight to the existing history-persistence helper.
+    """
+
+    def __init__(self) -> None:
+        self.output: str = ""
+        self.agent: Any = None
+        self._new_messages: list[Any] = []
+
+    def new_messages(self) -> list[Any]:
+        return list(self._new_messages)
+
+
+async def stream_agent_text_with_fallbacks(
+    primary_agent: Any,
+    fallback_agents: list[Any],
+    *args: Any,
+    collector: "StreamCollector",
+    **kwargs: Any,
+):
+    """Stream the final text of an agent turn, yielding text deltas as they arrive.
+
+    Same eligibility/cooldown rules as ``run_agent_with_fallbacks``, but fallback
+    is only possible BEFORE the first token: once any text has been streamed to
+    the user (and, for voice, already synthesised and spoken), a mid-stream
+    failure cannot be un-said, so it propagates. Callers that need a hard
+    guarantee should catch that and fall back to the batch runner for the *next*
+    turn, not retro-actively for this one.
+
+    On success the completed run is written into ``collector`` (output text,
+    winning agent, and new messages for persistence).
+    """
+    from core import health_tracker
+
+    if "message_history" in kwargs:
+        kwargs["message_history"] = _sanitize_message_history(kwargs["message_history"])
+
+    agents = [primary_agent] + (fallback_agents or [])
+    eligible = [a for a in agents if not health_tracker.is_cooling(a)]
+    if not eligible:
+        print("LOG: all agents in cooldown; bypassing health tracker for this stream")
+        eligible = agents
+
+    last_exc: Exception | None = None
+    poisoned_families: set[str] = set()
+    for idx, agent in enumerate(eligible):
+        if idx > 0 and last_exc is not None and health_tracker.is_cooling(agent):
+            continue
+        if idx > 0 and _model_family(agent) in poisoned_families:
+            print(
+                f"LOG: skipping {_model_family(agent)} stream rung — "
+                f"same model already failed this call"
+            )
+            continue
+
+        emitted_any = False
+        try:
+            async with agent.run_stream(*args, **kwargs) as result:
+                async for delta in result.stream_text(delta=True):
+                    if delta:
+                        emitted_any = True
+                        yield delta
+                # Stream fully drained: the run is complete and its messages final.
+                try:
+                    collector.output = await result.get_output()
+                except Exception:
+                    collector.output = ""
+                collector.agent = agent
+                try:
+                    collector._new_messages = list(result.new_messages())
+                except Exception:
+                    collector._new_messages = list(result.all_messages())
+            health_tracker.mark_success(agent)
+            return
+        except Exception as exc:
+            last_exc = exc
+            _log_harmony_error(agent, exc)
+            health_tracker.mark_failure(agent, exc)
+            if _is_output_validation_error(exc):
+                poisoned_families.add(_model_family(agent))
+            # Nothing spoken yet → we may still fall back to another model.
+            should_fallback = (
+                is_key_failure_error(exc)
+                or _is_retryable_upstream_error(exc)
+                or _is_output_validation_error(exc)
+            )
+            if not emitted_any and idx < len(eligible) - 1 and should_fallback:
+                _fallback_log(exc)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("No agent available for streaming")
+
+
 def run_agent_sync_with_fallbacks(primary_agent: Any, fallback_agents: list[Any], *args: Any, **kwargs: Any):
     """Sync variant — same fallback strategy as run_agent_with_fallbacks."""
     from core import health_tracker
