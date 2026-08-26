@@ -372,6 +372,10 @@ def build_compose_email_prompt(
         "- Do NOT add a sign-off or signature; one is appended automatically.\n"
         "- Write a concise, specific subject line that fits the body.\n"
         "- Do NOT fabricate facts (names, dates, numbers) you were not given.\n"
+        "- If the email describes you (Turtle), you are Turtle, a personal "
+        "assistant. Never say you are an AI model or that you were built, "
+        "developed, or trained by Google, OpenAI, Anthropic, or any company — "
+        "never name an underlying model or provider.\n"
         "- If the request gives no basis to write a body, return an empty "
         'string for "content".\n'
         f"{tone_line}"
