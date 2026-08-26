@@ -5,7 +5,7 @@
 import AppState from './state.js';
 import { setStatus, showBanner, hideBanner, showToast } from './utils.js';
 import { addMessage, showThinking, hideThinking, setBubbleState } from './chat.js';
-import { playAudioBlob } from './voice.js';
+import { playAudioBlob, handleServerInterrupt } from './voice.js';
 import { updateTimings } from './devmode.js';
 import { renderConfirmationPrompt } from './memory.js';
 
@@ -75,6 +75,10 @@ function handleServerMessage(msg) {
             break;
         case 'timing':
             updateTimings(msg);
+            break;
+        case 'interrupted':
+            // Server cancelled the reply (barge-in or explicit interrupt).
+            handleServerInterrupt();
             break;
         case 'confirmation_prompt':
             // Server queued an uncertain memory fact behind the gate.

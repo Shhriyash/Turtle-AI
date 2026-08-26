@@ -3480,6 +3480,11 @@ async def websocket_endpoint(ws: WebSocket):
                         if content:
                             if not await _check_user_message_rate():
                                 break
+                            # Reclaim a finishing voice session so the text turn
+                            # builds on the up-to-date conversation, not a stale copy.
+                            if mic_session is not None:
+                                message_history = await _reclaim_mic_session(mic_session)
+                                mic_session = None
                             message_history = await _handle_text_message(
                                 ws, state, content, message_history
                             )
@@ -3504,7 +3509,12 @@ async def websocket_endpoint(ws: WebSocket):
                                 "type": "error",
                                 "message": "Streaming STT is not enabled on the server.",
                             })
-                        elif mic_session is None:
+                        else:
+                            # Reclaim any prior (still-finishing) session first so
+                            # we carry its history into the new one.
+                            if mic_session is not None:
+                                message_history = await _reclaim_mic_session(mic_session)
+                                mic_session = None
                             if not await _check_user_message_rate():
                                 break
                             sample_rate = int(msg.get("sample_rate", 16000))
@@ -3522,9 +3532,16 @@ async def websocket_endpoint(ws: WebSocket):
                                 mic_session = None
 
                     elif msg_type == "mic_close":
+                        # Non-blocking: flush + finalise in the background so the
+                        # receive loop stays free (an interrupt can still arrive).
+                        # The session is reclaimed on the next mic_open / disconnect.
                         if mic_session is not None:
-                            message_history = await _close_mic_stream(mic_session)
-                            mic_session = None
+                            await _begin_mic_close(mic_session)
+
+                    elif msg_type == "interrupt":
+                        # Stop the agent mid-reply (barge-in / explicit stop).
+                        if mic_session is not None and mic_session.interrupt():
+                            print("LOG: interrupt — reply cancelled by user")
 
                     elif msg_type == "ping":
                         await _ws_send_json(ws, {"type": "pong"})
@@ -3542,12 +3559,14 @@ async def websocket_endpoint(ws: WebSocket):
             print(f"LOG: WebSocket error: {e}")
             traceback.print_exc()
         finally:
-            # Tear down any live streaming-STT session so its worker threads and
-            # websocket don't leak when the client drops mid-utterance.
+            # Tear down any live/finishing streaming-STT session so its worker
+            # threads and websocket don't leak when the client drops.
             if mic_session is not None:
                 try:
+                    mic_session.interrupt()
                     await mic_session.stt.aclose()
-                    mic_session.consumer_task.cancel()
+                    if mic_session.consumer_task is not None:
+                        mic_session.consumer_task.cancel()
                 except Exception:
                     pass
                 mic_session = None
@@ -4496,57 +4515,144 @@ class _MicStreamSession:
     history into it, and the receive loop reads it back on mic_close.
     """
 
-    __slots__ = ("stt", "consumer_task", "history")
+    __slots__ = ("stt", "consumer_task", "history", "sample_rate",
+                 "finishing", "turn_started", "current_turn")
 
-    def __init__(self, stt: Any, consumer_task: "asyncio.Task", history: dict) -> None:
+    def __init__(
+        self,
+        stt: Any,
+        history: dict,
+        *,
+        sample_rate: int,
+        finishing: "asyncio.Event",
+        turn_started: "asyncio.Event",
+    ) -> None:
         self.stt = stt
-        self.consumer_task = consumer_task
         self.history = history
+        self.sample_rate = sample_rate
+        # Set on mic_close; tells the consumer to stop after the final turn.
+        self.finishing = finishing
+        # Set by the consumer when it processes an EndOfTurn (a real turn began).
+        self.turn_started = turn_started
+        # The consumer task; assigned right after construction in _open_mic_stream.
+        self.consumer_task: "asyncio.Task | None" = None
+        # The in-flight reply task (LLM + TTS) for the current turn, or None.
+        # The receive loop cancels this to interrupt the agent mid-reply.
+        self.current_turn: "asyncio.Task | None" = None
+
+    def interrupt(self) -> bool:
+        """Cancel the in-flight reply, if any. Returns True if something was cancelled."""
+        turn = self.current_turn
+        if turn is not None and not turn.done():
+            turn.cancel()
+            return True
+        return False
+
+
+async def _run_streamed_turn(
+    ws: WebSocket,
+    state: SharedState,
+    text: str,
+    session: "_MicStreamSession",
+) -> None:
+    """Run one reply (LLM + TTS) for a streamed utterance, into the shared history.
+
+    Executed as a cancellable task so the receive loop can interrupt it (or a
+    barge-in can) mid-reply. On cancellation, playback stops on the client, we
+    tell the client the reply was interrupted, and the holder keeps whatever the
+    turn managed to persist.
+    """
+    timings: dict[str, float] = {}
+    overall_start = time.time()
+    try:
+        session.history["messages"] = await _reply_and_speak(
+            ws, state, text, session.history["messages"],
+            timings=timings, overall_start=overall_start,
+        )
+    except asyncio.CancelledError:
+        print("LOG: streamed reply interrupted")
+        try:
+            await _ws_send_json(ws, {"type": "interrupted"})
+            await _ws_send_json(ws, {"type": "status", "status": "ready"})
+        except Exception:
+            pass
+        raise
+    except Exception as turn_exc:
+        print(f"LOG: mic-stream turn error: {turn_exc}")
+        traceback.print_exc()
+        await _ws_send_json(ws, {"type": "error", "message": f"Turn error: {turn_exc}"})
 
 
 async def _flux_mic_consumer(
     ws: WebSocket,
     state: SharedState,
-    stt: Any,
-    history: dict,
+    session: "_MicStreamSession",
 ) -> None:
     """Consume Flux turn events: stream interim captions, run a turn on EndOfTurn.
 
     Runs as its own task alongside the receive loop. It is the SOLE writer of
-    ``history["messages"]`` while streaming is active, and it processes events
-    strictly one at a time, so turns never overlap and there is no history race.
+    ``session.history["messages"]`` while streaming is active, and it processes
+    events one at a time, so turns never overlap and there is no history race.
+
+    Each reply runs as ``session.current_turn`` — a cancellable task — so the
+    receive loop (on an ``interrupt`` frame) or a barge-in (Flux ``StartOfTurn``
+    while a reply is playing) can stop it mid-reply. ``finishing`` (set on
+    mic_close) makes the consumer exit after the final utterance's turn.
     """
+    stt = session.stt
+    partials = 0
+    turns = 0
+    started = time.time()
     try:
         async for ev in stt.events():
-            if ev.kind == "update":
+            if ev.kind == "connected":
+                print(f"LOG: Flux STT connected in {round((time.time()-started)*1000)}ms")
+            elif ev.kind == "start_of_turn":
+                # Barge-in: the user started speaking. If a reply is playing,
+                # cancel it so the agent stops and listens.
+                if session.interrupt():
+                    print("LOG: barge-in — user spoke over the reply")
+            elif ev.kind == "update":
                 if ev.transcript:
+                    partials += 1
+                    if partials == 1:
+                        print(f"LOG: Flux first partial in {round((time.time()-started)*1000)}ms")
                     await _ws_send_json(ws, {
                         "type": "transcription_partial", "text": ev.transcript,
                     })
             elif ev.kind == "end_of_turn":
                 text = (ev.transcript or "").strip()
+                print(f"LOG: Flux EndOfTurn ({partials} partials) -> "
+                      f"{repr(text[:80]) if text else 'EMPTY (skipped)'}")
                 if not text:
+                    if session.finishing.is_set():
+                        break
                     continue
+                turns += 1
+                session.turn_started.set()
                 await _ws_send_json(ws, {"type": "transcription", "text": text})
-                timings: dict[str, float] = {}
-                overall_start = time.time()
+                # Run the reply as a cancellable task and wait via asyncio.wait so
+                # an interrupt (which cancels the turn task) does NOT look like a
+                # cancellation of this consumer — the two must stay distinct.
+                turn = asyncio.create_task(_run_streamed_turn(ws, state, text, session))
+                session.current_turn = turn
                 try:
-                    history["messages"] = await _reply_and_speak(
-                        ws, state, text, history["messages"],
-                        timings=timings, overall_start=overall_start,
-                    )
-                except Exception as turn_exc:
-                    print(f"LOG: mic-stream turn error: {turn_exc}")
-                    traceback.print_exc()
-                    await _ws_send_json(ws, {
-                        "type": "error", "message": f"Turn error: {turn_exc}",
-                    })
+                    await asyncio.wait({turn})
+                finally:
+                    if not turn.done():
+                        turn.cancel()
+                    session.current_turn = None
+                if session.finishing.is_set():
+                    break
+                session.turn_started.clear()
             elif ev.kind == "error":
+                print(f"LOG: Flux STT error event: {ev.raw!r}")
                 await _ws_send_json(ws, {
                     "type": "error", "message": "Streaming STT error.",
                 })
                 break
             elif ev.kind == "closed":
+                print(f"LOG: Flux stream closed ({partials} partials, {turns} turns this session)")
                 break
     except asyncio.CancelledError:
         raise
@@ -4568,31 +4674,75 @@ async def _open_mic_stream(
     stt = FluxStreamingSTT(sample_rate=sample_rate)
     await stt.start()
     history = {"messages": message_history}
-    consumer_task = asyncio.create_task(_flux_mic_consumer(ws, state, stt, history))
+    session = _MicStreamSession(
+        stt, history,
+        sample_rate=sample_rate,
+        finishing=asyncio.Event(),
+        turn_started=asyncio.Event(),
+    )
+    session.consumer_task = asyncio.create_task(_flux_mic_consumer(ws, state, session))
     await _ws_send_json(ws, {"type": "status", "status": "listening"})
     print("LOG: streaming STT session opened")
-    return _MicStreamSession(stt, consumer_task, history)
+    return session
 
 
-async def _close_mic_stream(
-    session: "_MicStreamSession",
-) -> list[ModelMessage] | None:
-    """Finalise a streaming session and return the up-to-date conversation.
+async def _begin_mic_close(session: "_MicStreamSession") -> None:
+    """Start finalising a streaming session WITHOUT blocking the receive loop.
 
-    finish() flushes the current turn (Flux emits its final EndOfTurn, then
-    closes); we wait for the consumer to drain that — including running the last
-    turn — before reading history back and tearing the session down.
+    Feeds a tail of silence so Flux fires EndOfTurn for the final utterance
+    (PTT/VAD stop provides no silence gap of its own), then hands off to a
+    background task to run that last turn and tear down. Keeping the receive loop
+    free is what lets an ``interrupt`` frame reach the server mid-reply.
     """
+    session.finishing.set()
+    silence = b"\x00\x00" * int(0.7 * session.sample_rate)
     try:
+        await session.stt.send_audio(silence)
         await session.stt.finish()
+    except Exception:
+        pass
+    asyncio.create_task(_finalize_mic_session(session))
+
+
+async def _finalize_mic_session(session: "_MicStreamSession") -> None:
+    """Background teardown: let the final turn drain, then shut the Flux socket."""
+    try:
+        # The consumer exits after the final turn (finishing is set). Cap it so a
+        # stuck turn can't leak the session.
         try:
-            await asyncio.wait_for(session.consumer_task, timeout=90)
+            await asyncio.wait_for(asyncio.shield(session.consumer_task), timeout=60)
         except asyncio.TimeoutError:
-            print("LOG: streaming STT consumer drain timed out")
-            session.consumer_task.cancel()
+            pass
     finally:
         await session.stt.aclose()
-    print("LOG: streaming STT session closed")
+        if session.consumer_task is not None and not session.consumer_task.done():
+            session.consumer_task.cancel()
+            try:
+                await session.consumer_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        print("LOG: streaming STT session closed")
+
+
+async def _reclaim_mic_session(session: "_MicStreamSession") -> list[ModelMessage] | None:
+    """Force a session fully down and return its up-to-date conversation.
+
+    Used when the receive loop needs the current history back (new mic_open, a
+    text turn, or disconnect) — it guarantees teardown even if the background
+    finaliser hasn't finished.
+    """
+    session.interrupt()
+    session.finishing.set()
+    await session.stt.aclose()
+    if session.consumer_task is not None and not session.consumer_task.done():
+        try:
+            await asyncio.wait_for(session.consumer_task, timeout=10)
+        except (asyncio.TimeoutError, Exception):
+            session.consumer_task.cancel()
+            try:
+                await session.consumer_task
+            except (asyncio.CancelledError, Exception):
+                pass
     return session.history["messages"]
 
 

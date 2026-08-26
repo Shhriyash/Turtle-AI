@@ -178,6 +178,29 @@ function stopTtsPlayback({ resetUi = false, closeContext = false } = {}) {
 }
 
 /**
+ * Interrupt the agent mid-reply: stop playback immediately and tell the server
+ * to cancel the in-flight turn (so it stops generating/speaking too). Safe to
+ * call any time — a no-op when nothing is playing.
+ */
+export function interruptReply() {
+    const wasSpeaking = AppState.isTtsPlaying
+        || (AppState.ttsSources && AppState.ttsSources.length > 0);
+    stopTtsPlayback({ resetUi: true });
+    if (AppState.ws && AppState.ws.readyState === WebSocket.OPEN) {
+        AppState.ws.send(JSON.stringify({ type: 'interrupt' }));
+    }
+    if (wasSpeaking) showToast('Interrupted');
+}
+
+/**
+ * The server cancelled the reply on its own (e.g. barge-in: the user spoke over
+ * it). Stop local playback so audio doesn't keep playing from buffered chunks.
+ */
+export function handleServerInterrupt() {
+    stopTtsPlayback({ resetUi: true });
+}
+
+/**
  * Start recording from the microphone.
  */
 export async function startRecording() {
@@ -187,10 +210,14 @@ export async function startRecording() {
         return;
     }
 
-    // Barge-in behavior: pressing mic while TTS is speaking should interrupt
-    // playback — cancel every queued/playing chunk and flush pending decodes.
+    // Barge-in behavior: starting a new utterance while TTS is speaking should
+    // interrupt it — stop local playback AND tell the server to cancel the
+    // in-flight reply so it doesn't keep generating/speaking.
     if (AppState.isTtsPlaying || (AppState.ttsSources && AppState.ttsSources.length)) {
         stopTtsPlayback();
+        if (AppState.ws && AppState.ws.readyState === WebSocket.OPEN) {
+            AppState.ws.send(JSON.stringify({ type: 'interrupt' }));
+        }
     }
 
     AppState.isRecording = true;

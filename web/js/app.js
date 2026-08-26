@@ -8,7 +8,7 @@
 import AppState from './state.js';
 import { connectWebSocket, startConnectionWatchdog } from './websocket.js';
 import { sendMessage, handleInputKey, setupInputAutosize, closeResponsePanel } from './chat.js';
-import { startRecording, stopRecording, refreshVoiceButtonUi } from './voice.js';
+import { startRecording, stopRecording, refreshVoiceButtonUi, interruptReply } from './voice.js';
 import { toggleDevPanel, applyDevConfig, resetDevDefaults } from './devmode.js';
 import { initMemoryUI } from './memory.js';
 
@@ -113,6 +113,16 @@ function initEvents() {
     });
 
     // Hold SPACE to record in PTT mode (like CLI option 1)
+    // Escape interrupts the agent mid-reply (works in any voice mode).
+    window.addEventListener('keydown', (e) => {
+        if (e.code !== 'Escape') return;
+        if (isTypingTarget(e.target)) return;
+        if (AppState.isTtsPlaying || (AppState.ttsSources && AppState.ttsSources.length)) {
+            e.preventDefault();
+            interruptReply();
+        }
+    });
+
     window.addEventListener('keydown', async (e) => {
         if (AppState.voiceMode !== 'ptt') return;
         if (e.code !== 'Space' || e.repeat) return;

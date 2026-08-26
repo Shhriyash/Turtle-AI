@@ -233,7 +233,10 @@ class FluxStreamingSTT:
 
                 if debug:
                     print(f"STT debug: send loop ended after {sent} frames")
-                recv_thread.join(timeout=2.0)
+                # recv() stays blocked until this `with` exits and closes the
+                # socket, so a long join only delays that close. Keep it short:
+                # the recv thread is a daemon and ends the moment the socket shuts.
+                recv_thread.join(timeout=0.2)
         except Exception as exc:
             self._conn_error = exc
             self._conn_ready.set()  # unblock start() even on failure
