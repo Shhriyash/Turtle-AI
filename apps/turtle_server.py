@@ -4661,6 +4661,59 @@ async def _flux_mic_consumer(
         traceback.print_exc()
 
 
+def _build_stt_keyterms(user_id: str) -> list[str]:
+    """Harvest the user's name, emails, and frequent contacts as Flux keyterms.
+
+    Flux biases recognition toward keyterms, so feeding it the proper nouns it
+    can't guess (a name, an email's local-part) stops the mangling we saw —
+    "Shriyash Beohar" heard as "Shriish sharai", emails spelled out letter by
+    letter. Names + email local-parts are the useful spoken forms.
+    """
+    if not user_id:
+        return []
+    import re
+    try:
+        profile = PersonalMemoryStore(user_id=user_id).load_profile_snapshot()
+    except Exception:
+        return []
+    if not isinstance(profile, dict):
+        return []
+
+    terms: list[str] = []
+    identity = profile.get("identity", {}) or {}
+    name = identity.get("name")
+    if name:
+        terms.append(name)
+        terms.extend(tok for tok in str(name).split() if len(tok) >= 2)
+    for email in identity.get("emails", []) or []:
+        if not email:
+            continue
+        terms.append(email)
+        local = str(email).split("@", 1)[0]
+        if local:
+            terms.append(local)
+            terms.extend(p for p in re.split(r"[._+\-]", local) if len(p) >= 2)
+    workflow = profile.get("workflow", {}) or {}
+    for rcpt in (workflow.get("common_recipients") or [])[:10]:
+        if rcpt and "@" in str(rcpt):
+            local = str(rcpt).split("@", 1)[0]
+            if local:
+                terms.append(local)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for term in terms:
+        cleaned = str(term).strip()
+        key = cleaned.lower()
+        if len(cleaned) < 2 or key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+        if len(out) >= 30:  # keep the biasing list bounded
+            break
+    return out
+
+
 async def _open_mic_stream(
     ws: WebSocket,
     state: SharedState,
@@ -4671,7 +4724,8 @@ async def _open_mic_stream(
     """Open a Flux session + consumer task for a client that started streaming."""
     from core.stt_streaming import FluxStreamingSTT
 
-    stt = FluxStreamingSTT(sample_rate=sample_rate)
+    keyterms = _build_stt_keyterms(state.user_id)
+    stt = FluxStreamingSTT(sample_rate=sample_rate, keyterms=keyterms)
     await stt.start()
     history = {"messages": message_history}
     session = _MicStreamSession(
@@ -4682,7 +4736,7 @@ async def _open_mic_stream(
     )
     session.consumer_task = asyncio.create_task(_flux_mic_consumer(ws, state, session))
     await _ws_send_json(ws, {"type": "status", "status": "listening"})
-    print("LOG: streaming STT session opened")
+    print(f"LOG: streaming STT session opened (keyterms={len(keyterms)})")
     return session
 
 

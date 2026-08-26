@@ -88,6 +88,7 @@ class FluxStreamingSTT:
         eot_threshold: Optional[float] = None,
         eager_eot_threshold: Optional[float] = None,
         eot_timeout_ms: Optional[int] = None,
+        keyterms: Optional[list] = None,
     ) -> None:
         self.model = model or os.getenv("DEEPGRAM_STT_STREAM_MODEL", "flux-general-en")
         self.sample_rate = int(sample_rate)
@@ -95,6 +96,9 @@ class FluxStreamingSTT:
         self.eot_threshold = eot_threshold
         self.eager_eot_threshold = eager_eot_threshold
         self.eot_timeout_ms = eot_timeout_ms
+        # Bias recognition toward these terms (the user's name, emails, contacts)
+        # so Flux stops mangling proper nouns it hasn't heard before.
+        self.keyterms = [k for k in (keyterms or []) if k and str(k).strip()]
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._event_q: "asyncio.Queue[TurnEvent]" = asyncio.Queue()
@@ -178,6 +182,9 @@ class FluxStreamingSTT:
             kwargs["eager_eot_threshold"] = f"{self.eager_eot_threshold:.2f}"
         if self.eot_timeout_ms is not None:
             kwargs["eot_timeout_ms"] = str(int(self.eot_timeout_ms))
+        if self.keyterms:
+            # Flux accepts a repeatable keyterm parameter (str or sequence).
+            kwargs["keyterm"] = list(self.keyterms)
         return kwargs
 
     def _emit(self, ev: TurnEvent) -> None:
