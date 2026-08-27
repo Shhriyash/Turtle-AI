@@ -1,0 +1,76 @@
+filters:
+  and:
+    - file.inFolder("Issues")
+properties:
+  note.severity:
+    displayName: Severity
+  note.status:
+    displayName: Status
+  note.layer:
+    displayName: Layer
+  note.verified:
+    displayName: Verified
+views:
+  - type: table
+    name: Open
+    filters:
+      and:
+        - note.status != "resolved"
+    order:
+      - file.name
+      - note.severity
+      - note.status
+      - note.layer
+    sort:
+      - property: note.severity
+        direction: ASC
+      - property: file.name
+        direction: ASC
+  - type: table
+    name: Critical and high
+    filters:
+      and:
+        - note.status != "resolved"
+        - or:
+            - note.severity == "critical"
+            - note.severity == "high"
+    order:
+      - file.name
+      - note.severity
+      - note.status
+      - note.layer
+  - type: table
+    name: By layer
+    order:
+      - file.name
+      - note.layer
+      - note.severity
+      - note.status
+    sort:
+      - property: note.layer
+        direction: ASC
+      - property: note.severity
+        direction: ASC
+  - type: table
+    name: Resolved and accepted
+    filters:
+      or:
+        - note.status == "resolved"
+        - note.status == "accepted"
+    order:
+      - file.name
+      - note.status
+      - note.severity
+      - note.layer
+  - type: table
+    name: All
+    order:
+      - file.name
+      - note.id
+      - note.severity
+      - note.status
+      - note.layer
+      - note.verified
+    sort:
+      - property: note.id
+        direction: ASC
