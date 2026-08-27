@@ -350,6 +350,7 @@ def build_compose_email_prompt(
     merged: dict[str, Any],
     email_tone: str = "",
     sender_identity: str = "",
+    conversation_context: str = "",
 ) -> str:
     """Prompt the email agent to AUTHOR the subject/body the user delegated.
 
@@ -358,14 +359,35 @@ def build_compose_email_prompt(
     rather than dictating it verbatim. The model owns the wording; we never
     derive it from brittle templates. The model returns the same JSON shape as
     extraction so ``parse_email_extraction_response`` can read it back.
+
+    ``conversation_context`` carries the recent conversation (assistant replies
+    and fetched tool results) so a request like "email me the fetched news" or
+    "send that summary" is written from the actual content — the email agent runs
+    without the main conversation's history, so without this it would author an
+    empty placeholder body.
     """
     existing_subject = merged.get("subject", "")
     existing_content = merged.get("content", "")
     tone_line = f"- Match this tone if natural: {email_tone}.\n" if email_tone else ""
     identity_block = f"{sender_identity}\n\n" if sender_identity else ""
+    context_block = (
+        "Recent conversation and fetched content, for reference.\n"
+        "- If the request refers to earlier content (e.g. 'the fetched news', "
+        "'that summary', 'the results above', 'send it'), write the body FROM the "
+        "relevant part below — quote the real facts, headlines, numbers, or text.\n"
+        "- If the request does not refer to earlier content, ignore this block and "
+        "write from the request alone.\n"
+        "Never invent facts beyond what is given.\n"
+        "--- context ---\n"
+        f"{conversation_context}\n"
+        "--- end context ---\n\n"
+        if conversation_context and conversation_context.strip()
+        else ""
+    )
     return (
         "Compose an email on the user's behalf from their request below.\n"
         f"{identity_block}"
+        f"{context_block}"
         'Return ONLY a JSON object with string keys "subject" and "content".\n'
         "Rules:\n"
         "- Write a complete, ready-to-send body that fulfils the request.\n"

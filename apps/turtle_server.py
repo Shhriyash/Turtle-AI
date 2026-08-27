@@ -65,6 +65,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     RetryPromptPart,
+    TextPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -248,6 +249,53 @@ def _extract_user_name(identity_doc) -> str | None:
     except Exception:
         return None
     return None
+
+
+def _recent_conversation_context(state: "SharedState", *, max_chars: int = 4000, max_messages: int = 10) -> str:
+    """Recent conversation text + this session's fetched content, for the email composer.
+
+    The email sub-agent runs without the main conversation history, so a delegated
+    email that references earlier content ("email me the fetched news", "send that
+    summary") would be authored blind. Gather the tail of the conversation (user
+    turns, assistant replies, tool results) plus cached search/URL results so the
+    composer writes from the real content instead of an empty placeholder.
+    """
+    chunks: list[str] = []
+    seen: set[str] = set()
+
+    def _add(role: str, text: Any) -> None:
+        s = str(text).strip() if text else ""
+        if not s or s in seen:
+            return
+        seen.add(s)
+        chunks.append(f"[{role}] {s}")
+
+    try:
+        history = list(getattr(state.session_store, "message_history", None) or [])
+    except Exception:
+        history = []
+    for msg in history[-max_messages:]:
+        for part in getattr(msg, "parts", None) or []:
+            if isinstance(part, TextPart):
+                _add("assistant", part.content)
+            elif isinstance(part, ToolReturnPart):
+                _add("fetched", part.content if isinstance(part.content, str) else part.content)
+            elif isinstance(part, UserPromptPart):
+                if isinstance(part.content, str):
+                    _add("user", part.content)
+    # Same-turn fetched content may not be persisted into history yet.
+    try:
+        for val in list((state.search_cache or {}).values())[-3:]:
+            _add("fetched", val)
+    except Exception:
+        pass
+
+    if not chunks:
+        return ""
+    context = "\n\n".join(chunks)
+    if len(context) > max_chars:
+        context = context[-max_chars:]  # keep the most recent
+    return context
 
 
 def _build_user_greeting_block(user_id: str) -> str:
@@ -1969,6 +2017,11 @@ class AgentManager:
             print(f"\nEMAIL: Delegating to email specialist")
             pending_email = ctx.deps.session_store.get_pending_email()
             deterministic = extract_deterministic_email_details(query)
+            # The email sub-agent runs WITHOUT the main conversation, so a request
+            # like "email me the fetched news" would otherwise lose the content it
+            # names. Capture the recent conversation + fetched results to hand to
+            # the composer (see _recent_conversation_context).
+            conversation_context = _recent_conversation_context(ctx.deps)
 
             known_contacts: dict[str, Any] = {}
             try:
@@ -2044,6 +2097,7 @@ class AgentManager:
                     merged=merged,
                     email_tone=email_tone,
                     sender_identity=EMAIL_SENDER_IDENTITY,
+                    conversation_context=conversation_context,
                 )
                 compose_result = await run_agent_with_fallbacks(
                     agents_mgr.email_agent,
