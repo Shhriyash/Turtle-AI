@@ -2033,6 +2033,20 @@ class AgentManager:
             except Exception:
                 known_contacts = {}
 
+            context_section = (
+                "Recent conversation and fetched content (for resolving references "
+                "only). Use it to understand what the user points at ('the news', "
+                "'that summary', 'it', 'send it') and to fill recipients/subject when "
+                "they are clear from it. Do NOT dump this content into 'content': if "
+                "the user DELEGATED the writing (e.g. 'email me the news', 'write it "
+                "for me'), leave 'content' EMPTY so it can be authored properly; only "
+                "fill 'content' with wording the user DICTATED verbatim.\n"
+                "--- context ---\n"
+                f"{conversation_context}\n"
+                "--- end context ---\n\n"
+                if conversation_context and conversation_context.strip()
+                else ""
+            )
             extraction_prompt = (
                 "Extract only email send fields from the latest user request.\n"
                 "Rules:\n"
@@ -2043,6 +2057,7 @@ class AgentManager:
                 "- Return empty strings for missing subject/content.\n"
                 "- send_intent should be true only when user asks to send now.\n"
                 "- If the user names a person (e.g. 'my manager', 'Keshav') and Known contacts below contains a matching address, use it; never invent addresses.\n\n"
+                f"{context_section}"
                 f"Known contacts:\n{json.dumps(known_contacts, ensure_ascii=False)}\n\n"
                 f"Current pending email state:\n{json.dumps(pending_email, ensure_ascii=False)}\n\n"
                 f"Deterministic extraction hints:\n{json.dumps(deterministic, ensure_ascii=False)}\n\n"
