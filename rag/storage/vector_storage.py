@@ -7,8 +7,10 @@ Provides efficient similarity search for conversation chunks.
 
 import os
 import json
+import threading
 import numpy as np
 import faiss
+from collections import OrderedDict
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
@@ -420,20 +422,44 @@ class VectorStorage:
         return total_size / (1024 * 1024)  # Convert to MB
 
 
-# Per-tenant vector storage cache (one VectorStorage per user_id). Naive
-# unbounded dict for now — swap for an LRU when we have many active users.
-_vector_storage_by_user: Dict[str, VectorStorage] = {}
+# Per-tenant vector storage cache (one VectorStorage per user_id), bounded LRU.
+#
+# This was an unbounded dict with a "swap for an LRU when we have many active
+# users" TODO. Each entry holds a FAISS index in RAM, and nothing ever removed
+# one, so process memory grew with the number of DISTINCT users ever seen and
+# never came back down — a slow leak that only shows up once Turtle serves more
+# than its author.
+#
+# Eviction is safe because every mutating path (add_chunks, delete, the
+# transaction helpers) calls _save_index()/_save_metadata() eagerly: an evicted
+# tenant holds no dirty state, and the next access simply reloads it from disk.
+_VECTOR_STORAGE_CACHE_MAX = int(os.getenv("TURTLE_VECTOR_STORAGE_CACHE_MAX", "128"))
+_vector_storage_by_user: "OrderedDict[str, VectorStorage]" = OrderedDict()
+_vector_storage_lock = threading.Lock()
 
 
 def get_vector_storage(user_id: str) -> VectorStorage:
-    """Return the cached VectorStorage for ``user_id`` (constructed on first use)."""
+    """Return the cached VectorStorage for ``user_id`` (constructed on first use).
+
+    Locked: FAISS search/upsert run on ``asyncio.to_thread`` worker threads, so
+    an unsynchronised check-then-insert here could hand two threads two
+    different VectorStorage objects for the same tenant — which then write the
+    same index.bin from two in-memory copies. Same class of bug that
+    ``FAISSVectorStore._get_lock`` guards against one layer down.
+    """
     if not user_id:
         raise ValueError("get_vector_storage requires a user_id")
-    store = _vector_storage_by_user.get(user_id)
-    if store is None:
+    with _vector_storage_lock:
+        store = _vector_storage_by_user.get(user_id)
+        if store is not None:
+            _vector_storage_by_user.move_to_end(user_id)
+            return store
         store = VectorStorage(user_id=user_id)
         _vector_storage_by_user[user_id] = store
-    return store
+        while len(_vector_storage_by_user) > _VECTOR_STORAGE_CACHE_MAX:
+            evicted_id, _ = _vector_storage_by_user.popitem(last=False)
+            print(f"LOG: evicting vector storage cache entry for {evicted_id}")
+        return store
 
 
 def add_to_vector_db(user_id: str, chunks: List[Dict[str, Any]], embeddings: np.ndarray):

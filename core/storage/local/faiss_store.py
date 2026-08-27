@@ -18,6 +18,36 @@ from core.paths import personal_memory_dir
 from core.storage import Hit, VectorStore
 from rag.embedder.embedding_model import get_embedding_model
 
+# Singleton registry for get_faiss_vector_store(); see its docstring.
+_SINGLETONS: Dict[int, "FAISSVectorStore"] = {}
+_SINGLETON_LOCK = threading.Lock()
+
+
+def get_faiss_vector_store(embedding_dimension: int = 1024) -> "FAISSVectorStore":
+    """Process-wide singleton FAISSVectorStore.
+
+    Constructing one per WebSocket connection was a real leak, not a style
+    problem. This class is ALREADY multi-tenant: ``_indices``/``_metadata`` are
+    keyed by ``user_id`` and guarded by per-tenant locks. A fresh instance per
+    socket therefore bought nothing and cost:
+
+      * a duplicate in-RAM copy of each tenant's FAISS index, per connection;
+      * a cold ``_load_tenant`` disk read on every connect;
+      * per-tenant locks that no longer serialise anything, because two
+        instances hold two different lock registries for the same tenant — the
+        exact index.bin / metadata.json corruption ``_get_lock`` was written to
+        prevent, reintroduced one level up.
+
+    Reconnects are frequent (every page reload), so this was on the hot path.
+    Keyed by dimension so a differently-sized embedder still gets its own store.
+    """
+    with _SINGLETON_LOCK:
+        store = _SINGLETONS.get(embedding_dimension)
+        if store is None:
+            store = FAISSVectorStore(embedding_dimension)
+            _SINGLETONS[embedding_dimension] = store
+        return store
+
 
 class FAISSVectorStore(VectorStore):
     def __init__(self, embedding_dimension: int = 1024):

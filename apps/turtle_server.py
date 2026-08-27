@@ -2681,9 +2681,13 @@ async def _build_channel_state(user_id: str, channel: str) -> SharedState:
     task_history_store = TaskHistoryStore(TASK_HISTORY_FILE, user_id=user_id)
     rag_system = TurtleRAGSystem(user_id=user_id)
 
-    from core.storage.local.faiss_store import FAISSVectorStore
+    from core.storage.local.faiss_store import get_faiss_vector_store
     from core.retrieval_broker import RetrievalBroker
-    vector_store = FAISSVectorStore()
+    # Process singleton, not per-connection: the store is already keyed by
+    # user_id internally, so a fresh instance per socket duplicated every
+    # tenant's index in RAM and split the per-tenant locks. See
+    # core/storage/local/faiss_store.get_faiss_vector_store.
+    vector_store = get_faiss_vector_store()
     retrieval_broker = RetrievalBroker(
         store=personal_memory_store,
         task_store=task_history_store,
@@ -3419,9 +3423,10 @@ async def websocket_endpoint(ws: WebSocket):
         rag_system = TurtleRAGSystem(user_id=user_id)
 
         # D4: construct RetrievalBroker for 4-tier memory context retrieval
-        from core.storage.local.faiss_store import FAISSVectorStore
+        from core.storage.local.faiss_store import get_faiss_vector_store
         from core.retrieval_broker import RetrievalBroker
-        vector_store = FAISSVectorStore()
+        # Process singleton — see the channel-state twin above.
+        vector_store = get_faiss_vector_store()
         retrieval_broker = RetrievalBroker(
             store=personal_memory_store,
             task_store=task_history_store,
@@ -3700,9 +3705,19 @@ async def websocket_endpoint(ws: WebSocket):
                     print(f"LOG: mark_finalized failed for {session_id}: {_e}")
             if state.sqlite_index is not None:
                 try:
-                    state.sqlite_index.checkpoint()
+                    # CLOSE, not just checkpoint (close() checkpoints first).
+                    # MemorySQLiteIndex opens a sqlite3 connection in __init__
+                    # and one is built per WebSocket connect; this path used to
+                    # call checkpoint() only, so the fd leaked on every
+                    # connect/disconnect cycle and only _shutdown_state (process
+                    # exit) ever reclaimed it. Page reloads are frequent, so it
+                    # accumulated for the life of the process.
+                    state.sqlite_index.close()
                 except Exception:
                     pass
+                # _shutdown_state guards on `is not None`, so clearing the ref
+                # keeps the shutdown path from touching a closed connection.
+                state.sqlite_index = None
             print("LOG: Session archived and cleaned up")
             _unregister_shutdown_state(state)
             # Phase 5 (W2): stop advertising this socket to the scheduler.
