@@ -7,7 +7,7 @@
 
 import AppState from './state.js';
 import { setStatus, showToast } from './utils.js';
-import { setBubbleState } from './chat.js';
+import { setBubbleState, hideThinking } from './chat.js';
 
 const PROCESSOR_PATH = '/static/audio/pcm-processor.js';
 const AUTO_VAD_RMS_THRESHOLD = 350;
@@ -172,6 +172,7 @@ function stopTtsPlayback({ resetUi = false, closeContext = false } = {}) {
     }
 
     if (resetUi && !AppState.isRecording) {
+        hideThinking();
         setBubbleState('idle');
         setStatus('ready', 'Ready');
     }
@@ -426,6 +427,10 @@ export async function playAudioBlob(blob) {
                 ) {
                     AppState.isTtsPlaying = false;
                     AppState.ttsNextStartTime = 0;
+                    // Playback finished — clear the "…speaking" thinking indicator
+                    // (the server sends no ready frame after TTS, so the client owns
+                    // this reset).
+                    hideThinking();
                     setBubbleState('idle');
                     setStatus('ready', 'Ready');
                 }

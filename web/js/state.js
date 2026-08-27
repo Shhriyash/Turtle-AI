@@ -64,6 +64,7 @@ const AppState = {
         // Response panel
         responsePanel: null,
         responseMessages: null,
+        btnChatToggle: null,
         panelThinking: null,
         panelThinkingLabel: null,
         panelTiming: null,

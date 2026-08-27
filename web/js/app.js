@@ -7,7 +7,7 @@
 
 import AppState from './state.js';
 import { connectWebSocket, startConnectionWatchdog } from './websocket.js';
-import { sendMessage, handleInputKey, setupInputAutosize, closeResponsePanel } from './chat.js';
+import { sendMessage, handleInputKey, setupInputAutosize, closeResponsePanel, toggleResponsePanel, updateChatToggleUi } from './chat.js';
 import { startRecording, stopRecording, refreshVoiceButtonUi, interruptReply } from './voice.js';
 import { toggleDevPanel, applyDevConfig, resetDevDefaults } from './devmode.js';
 import { initMemoryUI } from './memory.js';
@@ -57,6 +57,7 @@ function initDOM() {
     AppState.dom.panelThinking    = document.getElementById('panel-thinking');
     AppState.dom.panelThinkingLabel = document.getElementById('panel-thinking-label');
     AppState.dom.panelTiming      = document.getElementById('panel-timing');
+    AppState.dom.btnChatToggle    = document.getElementById('btn-chat-toggle');
 }
 
 /** Wire up all event listeners */
@@ -199,6 +200,8 @@ function initEvents() {
 
     // Response panel close button
     document.getElementById('btn-panel-close')?.addEventListener('click', closeResponsePanel);
+    AppState.dom.btnChatToggle?.addEventListener('click', toggleResponsePanel);
+    updateChatToggleUi();
 
     // Input autosize
     setupInputAutosize();

@@ -73,6 +73,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.usage import UsageLimits, RunUsage
 
 from core.llm_client import (
+    CascadeStats,
     get_groq_model,
     get_groq_models,
     get_google_models,
@@ -96,7 +97,7 @@ from core.email_flow import (
     validate_recipients,
     validate_send_email_args,
 )
-from core.output_clean import clean_text_for_model, clean_text_for_tts
+from core.output_clean import clean_text_for_model, clean_text_for_tts, clean_text_for_display
 from core.confirmation_gate import ConfirmationGate
 from core.guardrails import (
     StorageCapExceededError,
@@ -108,7 +109,7 @@ from core.memory_journal import JournalStore, make_event
 from core.memory_schema import decide_write_policy, statement_for
 from core.memory_extractor import extract_memory_event_specs
 from core.memory_replayer import replay
-from core.observability import trace_sink
+from core.observability import ATTR_TOKENS_IN, ATTR_TOKENS_OUT, trace_sink
 from core.personal_memory_extract import (
     PersonalMemoryCandidate,
     extract_memory_candidates_from_messages,
@@ -758,6 +759,31 @@ def _sanitize_tool_pairs(history: list[ModelMessage]) -> list[ModelMessage]:
     if not cleaned:
         return history
     return cleaned
+
+
+# Modality-aware turn deadlines (ISSUE-022).
+#
+# The old code used a flat 60 s for every surface — a value inherited from the
+# deleted graph layer. That is roughly FIFTY TIMES the voice-to-voice target: a
+# user speaking to Turtle could sit in silence for a minute. Meanwhile a text
+# turn that spends 40 s working through a cascade and returns a good answer is a
+# perfectly good outcome. One number cannot serve both.
+#
+# Measured before this change (data/traces/traces.jsonl, 80 turns):
+# median 5.7 s, mean 10.5 s, max 43.6 s, with 26/80 turns over 10 s.
+_TURN_DEADLINE_VOICE_S = float(os.getenv("TURTLE_TURN_DEADLINE_VOICE_S", "15"))
+_TURN_DEADLINE_TEXT_S = float(os.getenv("TURTLE_TURN_DEADLINE_TEXT_S", "60"))
+_VOICE_CHANNELS = frozenset({"web_voice", "twilio_voice"})
+
+
+def _turn_deadline_for(channel: str) -> float:
+    """Total cascade budget for a turn on *channel*.
+
+    Voice gets a tight budget because the user is listening to silence; text and
+    chat channels keep the historical ceiling because a slow-but-correct answer
+    still lands well there.
+    """
+    return _TURN_DEADLINE_VOICE_S if channel in _VOICE_CHANNELS else _TURN_DEADLINE_TEXT_S
 
 
 def _detect_task_type(user_text: str) -> str:
@@ -4100,6 +4126,8 @@ async def _execute_turn(
         llm_start = time.time()
         # Phase 1: one local span per turn — the record that makes "why did
         # Turtle answer X" answerable from disk (data/traces/traces.jsonl).
+        cascade_stats = CascadeStats()
+        turn_deadline_s = _turn_deadline_for(channel)
         with trace_sink.span(
             "turtle.turn",
             user_id=state.user_id,
@@ -4108,7 +4136,7 @@ async def _execute_turn(
             intent=task_type,
             memory_context_chars=len(state.memory_context or ""),
             channel=channel,
-        ):
+        ) as _turn_span:
             # Preserve the rich Logfire span the deleted graph layer used to
             # emit, so a turn's model spans still nest under one logical unit.
             if _logfire_loaded:
@@ -4117,27 +4145,48 @@ async def _execute_turn(
             else:
                 from contextlib import nullcontext
                 _turn_span_cm = nullcontext()
-            with _turn_span_cm:
-                # ONE agent call with fallbacks. The 60s timeout is the one the
-                # deleted graph layer used to own.
-                response = await asyncio.wait_for(
-                    run_agent_with_fallbacks(
-                        agents_mgr.main_assistant,
-                        agents_mgr.main_assistant_fallbacks,
-                        prompt_input,
-                        deps=state,
-                        message_history=message_history,
-                        usage=RunUsage(),
-                        usage_limits=agents_mgr.usage_limits,
-                    ),
-                    timeout=60.0,
-                )
+            try:
+                with _turn_span_cm:
+                    # ONE agent call with fallbacks. The cascade now owns its own
+                    # total + per-rung budget (see core/llm_client._Budget), so
+                    # the deadline here is modality-aware rather than the flat 60s
+                    # the deleted graph layer left behind. The outer wait_for is
+                    # belt-and-braces for a hang in the cascade machinery itself,
+                    # hence the small margin over the cascade's own budget.
+                    response = await asyncio.wait_for(
+                        run_agent_with_fallbacks(
+                            agents_mgr.main_assistant,
+                            agents_mgr.main_assistant_fallbacks,
+                            prompt_input,
+                            deps=state,
+                            message_history=message_history,
+                            usage=RunUsage(),
+                            usage_limits=agents_mgr.usage_limits,
+                            deadline_s=turn_deadline_s,
+                            stats=cascade_stats,
+                        ),
+                        timeout=turn_deadline_s + 5.0,
+                    )
+            finally:
+                # Record spend even when the turn FAILED — a turn that burned
+                # eight rungs and returned nothing is the most expensive kind
+                # there is, and it was previously invisible. Attribute-setting
+                # must never mask the real exception, so it is best-effort.
+                try:
+                    for _k, _v in cascade_stats.as_span_attrs().items():
+                        _turn_span.set_attribute(_k, _v)
+                    _turn_span.set_attribute(ATTR_TOKENS_IN, cascade_stats.total_input_tokens)
+                    _turn_span.set_attribute(ATTR_TOKENS_OUT, cascade_stats.total_output_tokens)
+                except Exception:
+                    pass
         timings["llm_ms"] = round((time.time() - llm_start) * 1000)
 
         final_output = clean_text_for_model(response.output)
 
-        # Send complete response
-        await _emit(ws, {"type": "done", "content": final_output})
+        # Send complete response. The chat gets the display-cleaned text (markdown
+        # links preserved → clickable), while final_output (links flattened) feeds
+        # TTS/RAG.
+        await _emit(ws, {"type": "done", "content": clean_text_for_display(response.output)})
 
         # Update session
         message_history = _persist_history(message_history, response)
@@ -4361,7 +4410,8 @@ async def _execute_turn_streaming(
         return TurnOutcome(message_history, None, "")
 
     # Send the full reply text for the transcript UI once synthesis is underway.
-    await _ws_send_json(ws, {"type": "done", "content": final_output})
+    # Display-cleaned (markdown links preserved) so the chat renders clickable links.
+    await _ws_send_json(ws, {"type": "done", "content": clean_text_for_display(collector.output or "")})
 
     # --- post-run: identical bookkeeping to the batch path -----------------
     message_history = _persist_history(message_history, collector)

@@ -67,11 +67,32 @@ export function openResponsePanel() {
     if (AppState.responsePanelOpen) return;
     AppState.responsePanelOpen = true;
     AppState.dom.responsePanel.classList.add('open');
+    updateChatToggleUi();
 }
 
 export function closeResponsePanel() {
     AppState.responsePanelOpen = false;
     AppState.dom.responsePanel.classList.remove('open');
+    updateChatToggleUi();
+}
+
+/** Toggle the response panel — lets the user reopen a closed chat to review it. */
+export function toggleResponsePanel() {
+    if (AppState.responsePanelOpen) {
+        closeResponsePanel();
+    } else {
+        openResponsePanel();
+        scrollPanelToBottom();
+    }
+    updateChatToggleUi();
+}
+
+/** Reflect panel state on the floating toggle (hide it while the panel is open). */
+export function updateChatToggleUi() {
+    const btn = AppState.dom.btnChatToggle;
+    if (!btn) return;
+    btn.classList.toggle('hidden', AppState.responsePanelOpen);
+    btn.setAttribute('aria-pressed', AppState.responsePanelOpen ? 'true' : 'false');
 }
 
 function scrollPanelToBottom() {
