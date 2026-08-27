@@ -38,6 +38,25 @@ from core.worker import LocalWorkerQueue, task, track_task
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _patch_vector_store(monkeypatch, fake_cls) -> None:
+    """Swap the process-wide FAISSVectorStore singleton for *fake_cls*.
+
+    The singleton used to live in core.background_tasks as ``_vs_singleton``.
+    It moved to core.storage.local.faiss_store so the background-job path and
+    the WebSocket request path share ONE registry — two singletons meant two
+    lock registries for the same tenant, which is the index.bin interleaving
+    both were written to prevent.
+
+    Clearing ``_SINGLETONS`` is what makes this test-safe: the registry is
+    process-global, so without a reset a real store constructed by an earlier
+    test would be handed back here.
+    """
+    from core.storage.local import faiss_store
+
+    monkeypatch.setattr(faiss_store, "FAISSVectorStore", fake_cls)
+    monkeypatch.setattr(faiss_store, "_SINGLETONS", {})
+
+
 def _make_store(base, user_id: str = "default") -> PersonalMemoryStore:
     return PersonalMemoryStore(
         user_id=user_id,
@@ -66,8 +85,7 @@ class _BoomStore:
 def test_embed_skips_unscoped_tenant_without_constructing_store(monkeypatch, uid):
     # Kill-switch ON (embedding enabled) so ONLY the tenant guard can stop it.
     monkeypatch.setenv("TURTLE_PERSONAL_EMBED_ENABLED", "1")
-    monkeypatch.setattr(bg, "FAISSVectorStore", _BoomStore)
-    monkeypatch.setattr(bg, "_vs_singleton", None)
+    _patch_vector_store(monkeypatch, _BoomStore)
 
     # If the guard fails, _BoomStore raises and the test errors.
     asyncio.run(
@@ -82,8 +100,7 @@ def test_embed_skips_unscoped_tenant_without_constructing_store(monkeypatch, uid
 @pytest.mark.parametrize("value", ["0", "false", "False", "no", "off"])
 def test_kill_switch_skips_embed(monkeypatch, value):
     monkeypatch.setenv("TURTLE_PERSONAL_EMBED_ENABLED", value)
-    monkeypatch.setattr(bg, "FAISSVectorStore", _BoomStore)
-    monkeypatch.setattr(bg, "_vs_singleton", None)
+    _patch_vector_store(monkeypatch, _BoomStore)
 
     # Even a real tenant is skipped when disabled — store never constructed.
     asyncio.run(
@@ -109,8 +126,7 @@ def test_kill_switch_enabled_reaches_store(monkeypatch):
         async def upsert(self, **kwargs):
             upserts.append(kwargs)
 
-    monkeypatch.setattr(bg, "FAISSVectorStore", _FakeVS)
-    monkeypatch.setattr(bg, "_vs_singleton", None)
+    _patch_vector_store(monkeypatch, _FakeVS)
 
     asyncio.run(
         bg.embed_personal_memory(
@@ -240,8 +256,7 @@ def test_shared_vector_store_singleton_reused(monkeypatch):
         def __init__(self, *a, **k):
             constructed.append(self)
 
-    monkeypatch.setattr(bg, "FAISSVectorStore", _FakeVS)
-    monkeypatch.setattr(bg, "_vs_singleton", None)
+    _patch_vector_store(monkeypatch, _FakeVS)
 
     first = bg._vector_store()
     second = bg._vector_store()
