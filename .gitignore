@@ -15,6 +15,7 @@ build/
 .env.*
 *.env
 *.env.*
+!.env.example
 venv/
 .venv/
 env/
@@ -57,5 +58,16 @@ tempCodeRunnerFile.py
 *.sql
 
 # Secrets / keys
-aerobic-datum-478513-u9-3daa581fd336.json
+credentials.json
+key.txt
+*serviceaccount*.json
+*service-account*.json
+*firebase-adminsdk*.json
+google-services.json
+GoogleService-Info.plist
+*.pem
+*.p12
+*.pfx
+id_rsa*
+!*.example
 .claude/

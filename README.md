@@ -261,7 +261,12 @@ turtle/
 
 ### Required API Keys
 
-Create a `.env` file in the repo root:
+Copy the example and fill it in. The `.env` file is gitignored.
+
+```bash
+cp .env.example .env
+```
+
 
 ```bash
 # Core LLM (OpenRouter) - key rotation: key1 → key2 → key3 on rate limit
