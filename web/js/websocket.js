@@ -8,6 +8,7 @@ import { addMessage, showThinking, hideThinking, setBubbleState } from './chat.j
 import { playAudioBlob, handleServerInterrupt } from './voice.js';
 import { updateTimings } from './devmode.js';
 import { renderConfirmationPrompt } from './memory.js';
+import { showHeard, clearHeard } from './ambient.js';
 
 /** Connect (or reconnect) to the WebSocket server */
 export function connectWebSocket() {
@@ -31,7 +32,7 @@ export function connectWebSocket() {
     AppState.ws.onclose = () => {
         AppState.isConnected = false;
         setStatus('disconnected', 'Disconnected');
-        setBubbleState('idle');
+        setBubbleState('disconnected');
         showBanner();
     };
 
@@ -61,17 +62,20 @@ function handleServerMessage(msg) {
             break;
         case 'transcription_partial':
             // Live interim transcript from streaming STT — show it as the
-            // thinking caption while the user is still speaking.
-            if (msg.text) showThinking(msg.text);
+            // thinking caption while the user is still speaking, and echo it
+            // under the orb so the user sees themselves being heard.
+            if (msg.text) { showThinking(msg.text); showHeard(msg.text, 'heard'); }
             break;
         case 'transcription':
             addMessage('user', msg.text);
+            if (msg.text) showHeard(msg.text, 'heard');
             break;
         case 'done':
             hideThinking();
             addMessage('assistant', msg.content);
             setStatus('ready', 'Ready');
             setBubbleState('idle');
+            if (msg.content) { showHeard(msg.content, 'spoken'); clearHeard(6000); }
             break;
         case 'timing':
             updateTimings(msg);
@@ -88,8 +92,9 @@ function handleServerMessage(msg) {
         case 'error':
             hideThinking();
             setStatus('ready', 'Ready');
-            setBubbleState('idle');
+            setBubbleState('error');
             showToast(msg.message, true);
+            setTimeout(() => setBubbleState('idle'), 2400);
             break;
         case 'notice':
             // Non-fatal server notice (e.g. storage_cap: memory writes are

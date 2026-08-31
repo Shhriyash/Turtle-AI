@@ -9,8 +9,8 @@
     justify-content: center;
     gap: 10px;
     padding: 10px;
-    background: rgba(248, 113, 113, 0.12);
-    border-bottom: 1px solid rgba(248, 113, 113, 0.3);
+    background: oklch(0.70 0.13 25 / 0.12);
+    border-bottom: 1px solid oklch(0.70 0.13 25 / 0.30);
     color: var(--error);
     font-size: 13px;
     font-weight: 500;
@@ -34,7 +34,7 @@
 }
 
 .reconnect-btn:hover {
-    background: rgba(248, 113, 113, 0.15);
+    background: oklch(0.70 0.13 25 / 0.15);
 }
 
 /* Toast notification */

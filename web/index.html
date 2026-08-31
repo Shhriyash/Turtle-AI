@@ -7,7 +7,8 @@
     <title>Turtle AI</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
 
     <!-- Component stylesheets -->
     <link rel="stylesheet" href="/static/css/tokens.css">
@@ -54,20 +55,49 @@
             </header>
 
             <!-- Central Bubble Area -->
-            <div class="bubble-container" id="bubble-container">
+            <div class="bubble-container" id="bubble-container" data-state="idle">
+                <div class="field-grid" aria-hidden="true"></div>
+
+                <div class="bubble-greeting" id="bubble-greeting">Good evening.</div>
+
                 <div class="bubble-glow" id="bubble-glow">
-                    <div class="ambient-particle"></div>
-                    <div class="ambient-particle"></div>
-                    <div class="ambient-particle"></div>
-                    <div class="bubble-orb" id="bubble-orb"
+                    <!-- Ambient rings (rest) -->
+                    <div class="ring ring-ambient r1" aria-hidden="true"></div>
+                    <div class="ring ring-ambient r2" aria-hidden="true"></div>
+                    <div class="ring ring-ambient r3" aria-hidden="true"></div>
+
+                    <!-- Organic blobs: inbound while listening, outbound while speaking -->
+                    <div class="ring ring-blob b1" aria-hidden="true"></div>
+                    <div class="ring ring-blob b2" aria-hidden="true"></div>
+                    <div class="ring ring-blob b3" aria-hidden="true"></div>
+
+                    <!-- Tight rings while transcribing -->
+                    <div class="ring ring-tight t1" aria-hidden="true"></div>
+                    <div class="ring ring-tight t2" aria-hidden="true"></div>
+
+                    <!-- Orbiting satellites while thinking -->
+                    <div class="ring ring-orbit" aria-hidden="true"><span></span><span></span></div>
+
+                    <div class="bubble-orb" id="bubble-orb" role="button" tabindex="0"
+                         aria-label="Hold to talk"
                          onmousedown="window._bubbleDown(event)"
                          onmouseup="window._bubbleUp(event)"
                          ontouchstart="window._bubbleDown(event)"
                          ontouchend="window._bubbleUp(event)">
-                        <span class="bubble-mark"><img src="/static/assets/turtle-icon.png" alt="Turtle" /></span>
                     </div>
                 </div>
-                <div class="bubble-status" id="bubble-status">Ready</div>
+
+                <div class="bubble-meta">
+                    <div class="bubble-wordmark" aria-hidden="true">TURTLE</div>
+                    <div class="bubble-status" id="bubble-status" role="status" aria-live="polite">Ask me anything</div>
+                </div>
+
+                <div class="bubble-wave" id="bubble-wave" aria-hidden="true">
+                    <span></span><span></span><span></span><span></span><span></span><span></span>
+                    <span></span><span></span><span></span><span></span><span></span>
+                </div>
+
+                <div class="bubble-heard" id="bubble-heard"></div>
             </div>
 
             <!-- Input Bar -->

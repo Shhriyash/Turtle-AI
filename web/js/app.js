@@ -11,6 +11,7 @@ import { sendMessage, handleInputKey, setupInputAutosize, closeResponsePanel, to
 import { startRecording, stopRecording, refreshVoiceButtonUi, interruptReply } from './voice.js';
 import { toggleDevPanel, applyDevConfig, resetDevDefaults } from './devmode.js';
 import { initMemoryUI } from './memory.js';
+import { initAmbient } from './ambient.js';
 
 function isTypingTarget(target) {
     const el = target;
@@ -210,6 +211,7 @@ function initEvents() {
 /** Boot the application */
 function init() {
     initDOM();
+    initAmbient();
     initEvents();
     initMemoryUI();
     updateVoiceModeUi();

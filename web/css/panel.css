@@ -114,7 +114,7 @@
 }
 
 .panel-msg-user .panel-msg-content {
-    background: linear-gradient(135deg, rgba(34, 211, 238, 0.10), rgba(167, 139, 250, 0.10));
+    background: var(--surface);
     border: 1px solid var(--border-accent);
     color: var(--text-primary);
 }
@@ -133,7 +133,7 @@
 .panel-msg-content a {
     color: var(--text-accent);
     text-decoration: underline;
-    text-decoration-color: rgba(34, 211, 238, 0.4);
+    text-decoration-color: var(--border-accent);
     text-underline-offset: 3px;
     transition: all 0.2s var(--ease-out);
 }

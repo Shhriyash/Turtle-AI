@@ -7,41 +7,18 @@
 
 import AppState from './state.js';
 import { escapeHtml, scrollToBottom } from './utils.js';
+import { setAmbientState } from './ambient.js';
 
 // ── Bubble state management ──────────────────────────────────
 
-/** Set the bubble to a named visual state */
+/**
+ * Set the bubble to a named visual state.
+ *
+ * The ambient state machine owns every visual layer now; this stays
+ * as the app-wide entry point so existing call sites are unchanged.
+ */
 export function setBubbleState(state) {
-    const { bubbleOrb, bubbleGlow, bubbleStatus } = AppState.dom;
-    if (!bubbleOrb) return;
-
-    // Clear all state classes
-    bubbleOrb.classList.remove('listening', 'thinking', 'speaking');
-    bubbleGlow.classList.remove('active');
-
-    const labels = {
-        idle:         'Ready',
-        listening:    'Listening',
-        recording:    'Listening',
-        transcribing: 'Transcribing',
-        thinking:     'Thinking',
-        speaking:     'Speaking',
-        ready:        'Ready',
-    };
-
-    bubbleStatus.textContent = labels[state] || 'Ready';
-    bubbleStatus.classList.toggle('active', state !== 'idle' && state !== 'ready');
-
-    if (state === 'listening' || state === 'recording') {
-        bubbleOrb.classList.add('listening');
-        bubbleGlow.classList.add('active');
-    } else if (state === 'thinking' || state === 'transcribing') {
-        bubbleOrb.classList.add('thinking');
-        bubbleGlow.classList.add('active');
-    } else if (state === 'speaking') {
-        bubbleOrb.classList.add('speaking');
-        bubbleGlow.classList.add('active');
-    }
+    setAmbientState(state);
 }
 
 // ── Thinking indicator in the panel ──────────────────────────

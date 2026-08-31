@@ -1,21 +1,25 @@
 /* ================================================================
-   INPUT BAR — Text input + send, centered below bubble
+   INPUT BAR — Floating pill row beneath the orb
+
+   The canvas treats input as an affordance that sits *over* the
+   field rather than a docked toolbar, so there is no opaque bar
+   and no hard top rule — just a pill group over the vignette.
    ================================================================ */
 .input-bar {
-    padding: 16px 24px 20px;
-    background: var(--bg-glass);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    border-top: 1px solid var(--border);
+    padding: 8px 24px 26px;
+    background: transparent;
+    border-top: none;
     flex-shrink: 0;
+    position: relative;
+    z-index: 2;
 }
 
 .input-wrapper {
-    max-width: 640px;
+    max-width: 620px;
     margin: 0 auto;
     display: flex;
-    align-items: flex-end;
-    gap: 10px;
+    align-items: center;
+    gap: 8px;
 }
 
 .input-field-wrap {
@@ -25,71 +29,81 @@
 
 #chat-input {
     width: 100%;
-    padding: 13px 18px;
-    border-radius: var(--radius-lg);
+    padding: 13px 20px;
+    border-radius: var(--radius-full);
     border: 1px solid var(--border);
-    background: var(--bg-tertiary);
+    background: var(--surface);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
     color: var(--text-primary);
     font-family: inherit;
-    font-size: 14px;
+    font-size: 13.5px;
     line-height: 1.5;
     resize: none;
     min-height: 46px;
     max-height: 120px;
-    transition: border-color 0.2s;
+    transition: border-color 0.25s var(--ease-out), background 0.25s var(--ease-out);
     outline: none;
 }
 
+/* Multi-line input relaxes back to a rounded rectangle */
+#chat-input.multiline { border-radius: var(--radius-lg); }
+
+#chat-input:hover { border-color: var(--border-strong); }
+
 #chat-input:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px var(--accent-dim);
+    border-color: var(--border-accent);
+    background: rgba(232, 234, 236, 0.06);
 }
 
-#chat-input::placeholder {
-    color: var(--text-muted);
-}
+#chat-input::placeholder { color: var(--text-muted); }
 
+/* ── Voice mode toggle (PTT / AUTO) ───────────────────────── */
 .btn-voice-mode {
-    min-width: 68px;
+    min-width: 62px;
     height: 46px;
-    padding: 0 10px;
-    border-radius: var(--radius-md);
+    padding: 0 14px;
+    border-radius: var(--radius-full);
     border: 1px solid var(--border);
     background: var(--surface);
-    color: var(--text-secondary);
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
     cursor: pointer;
-    transition: all 0.2s var(--ease-out);
+    transition: background 0.2s var(--ease-out), color 0.2s var(--ease-out),
+                border-color 0.2s var(--ease-out);
     flex-shrink: 0;
 }
 
 .btn-voice-mode:hover {
     background: var(--surface-hover);
     color: var(--text-primary);
-    border-color: var(--border-accent);
+    border-color: var(--border-strong);
 }
 
 .btn-voice-mode.auto {
-    color: var(--accent);
+    color: var(--accent-light);
     border-color: var(--border-accent);
-    background: rgba(34, 211, 238, 0.12);
+    background: var(--accent-dim);
 }
 
+/* ── Mic ──────────────────────────────────────────────────── */
 .btn-voice {
     width: 46px;
     height: 46px;
-    border-radius: var(--radius-md);
+    border-radius: 50%;
     border: 1px solid var(--border);
     background: var(--surface);
-    color: var(--text-secondary);
+    color: var(--text-muted);
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
-    transition: all 0.2s var(--ease-out);
+    transition: background 0.2s var(--ease-out), color 0.2s var(--ease-out),
+                border-color 0.2s var(--ease-out), box-shadow 0.25s var(--ease-out);
     flex-shrink: 0;
 }
 
@@ -98,67 +112,66 @@
     height: 18px;
     fill: none;
     stroke: currentColor;
-    stroke-width: 2;
+    stroke-width: 1.8;
     stroke-linecap: round;
     stroke-linejoin: round;
 }
 
 .btn-voice:hover {
     background: var(--surface-hover);
-    border-color: var(--border-accent);
+    border-color: var(--border-strong);
     color: var(--text-primary);
 }
 
+/* Recording reads in the accent, not an alarm colour — the orb
+   already carries the "we are listening" signal. */
 .btn-voice.recording {
-    color: var(--error);
-    border-color: rgba(248, 113, 113, 0.45);
-    background: rgba(248, 113, 113, 0.14);
-    box-shadow: 0 0 12px rgba(248, 113, 113, 0.16);
+    color: var(--accent-bright);
+    border-color: var(--border-accent);
+    background: var(--accent-dim);
+    box-shadow: 0 0 18px oklch(0.74 0.095 165 / 0.28);
 }
 
 .btn-voice.recording:hover {
-    background: rgba(248, 113, 113, 0.22);
+    background: oklch(0.74 0.095 165 / 0.22);
 }
 
-/* Send button — subtle, no gradient */
+/* ── Send ─────────────────────────────────────────────────── */
 .btn-send {
     width: 46px;
     height: 46px;
-    border-radius: var(--radius-md);
+    border-radius: 50%;
     border: 1px solid var(--border-accent);
-    background: rgba(34, 211, 238, 0.08);
-    color: var(--accent);
-    font-size: 16px;
+    background: var(--accent-dim);
+    color: var(--accent-bright);
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
-    transition: all 0.2s var(--ease-out);
+    transition: background 0.2s var(--ease-out), box-shadow 0.25s var(--ease-out),
+                opacity 0.2s var(--ease-out), transform 0.12s var(--ease-out);
     flex-shrink: 0;
 }
 
-.btn-send:hover {
-    background: rgba(34, 211, 238, 0.15);
-    box-shadow: 0 0 16px rgba(34, 211, 238, 0.10);
-}
-
-.btn-send:active {
-    transform: scale(0.95);
-}
-
-.btn-send:disabled {
-    opacity: 0.3;
-    cursor: not-allowed;
-    transform: none;
-}
-
-/* Send arrow SVG inside the button */
 .btn-send svg {
-    width: 18px;
-    height: 18px;
+    width: 17px;
+    height: 17px;
     fill: none;
     stroke: currentColor;
-    stroke-width: 2;
+    stroke-width: 1.9;
     stroke-linecap: round;
     stroke-linejoin: round;
+}
+
+.btn-send:hover:not(:disabled) {
+    background: oklch(0.74 0.095 165 / 0.26);
+    box-shadow: 0 0 18px oklch(0.74 0.095 165 / 0.25);
+}
+
+.btn-send:active:not(:disabled) { transform: scale(0.95); }
+
+.btn-send:disabled {
+    opacity: 0.28;
+    cursor: not-allowed;
+    transform: none;
 }

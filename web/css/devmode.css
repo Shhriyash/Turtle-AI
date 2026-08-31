@@ -189,9 +189,9 @@
 }
 
 .dev-btn.primary {
-    background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
-    color: var(--bg-primary);
-    border: none;
+    background: var(--accent-dim);
+    color: var(--accent-bright);
+    border: 1px solid var(--border-accent);
     font-weight: 600;
 }
 
@@ -283,9 +283,9 @@
     background: rgba(255, 255, 255, 0.04);
 }
 
-.dev-agent-status[data-status="active"] { color: #6ee7b7; }
-.dev-agent-status[data-status="hardcoded"] { color: #fcd34d; }
-.dev-agent-status[data-status="disabled"] { color: #f87171; }
+.dev-agent-status[data-status="active"] { color: var(--accent-light); }
+.dev-agent-status[data-status="hardcoded"] { color: var(--warning); }
+.dev-agent-status[data-status="disabled"] { color: var(--error); }
 .dev-agent-status[data-status="derived"] { color: var(--text-muted); }
 
 .dev-agent-model {
