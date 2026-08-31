@@ -26,9 +26,12 @@ venv.bak/
 **/env/
 **/ENV/
 
-# Markdown (keep only root README.md)
+# Markdown (track README and docs/, ignore scratch notes elsewhere)
 **/*.md
 !README.md
+!docs/
+!docs/**/*.md
+!web/FRONTEND.md
 
 # IDE / OS
 .vscode/

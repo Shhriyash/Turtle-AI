@@ -1,6 +1,6 @@
 # Turtle Personal Assistant
 
-A multi-agent personal assistant with persistent personal memory, web search, URL analysis, email capabilities, and a web chat UI — built with Pydantic AI.
+A multi-agent personal assistant with persistent personal memory, web search, URL analysis, email capabilities, and a web chat UI - built with Pydantic AI.
 
 ## Features
 
@@ -50,18 +50,18 @@ The journal + replay design gives a full audit trail, rollback safety, and idemp
 
 ### Three-Stage Pipeline
 
-**Stage A — Per-Turn Extraction (Deterministic)**
+**Stage A - Per-Turn Extraction (Deterministic)**
 - Trigger: Every message, after agent response
 - Regex/pattern extraction → `PersonalMemoryCandidate` objects
 - Writes `MemoryEvent(applied=False)` to journal, queues in `ConfirmationGate`
-- If not silenced: user shown "I noticed X — want me to remember that?"
+- If not silenced: user shown "I noticed X - want me to remember that?"
 
-**Stage B — Session-End Extraction (Deterministic)**
+**Stage B - Session-End Extraction (Deterministic)**
 - Trigger: Session finalization / archive sync
 - Full message history re-extracted; unconfirmed candidates queued
 - All `applied=True` events replayed → topic markdown updated
 
-**Stage C — Dream Pass (Batch LLM, optional)**
+**Stage C - Dream Pass (Batch LLM, optional)**
 - Trigger: Session end + per-turn after turn 8+
 - Run conditions: `pending_count >= 3` OR `>= 24h` since last pass with ≥1 pending
 - Process: snapshot → collect unapplied candidates → LLM promotes or drops each → `replay()` → sanity checks
@@ -75,7 +75,7 @@ Extract → MemoryEvent(applied=False) → ConfirmationGate.queue_candidate()
          ↓
 Gate: not silenced (14-day window) + not explicit?
          ↓ Yes
-Show prompt: "I noticed X — remember that?"
+Show prompt: "I noticed X - remember that?"
          ↓
 User accepts → MemoryEvent(applied=True) supersedes candidate → replay() → topic updated
 User rejects → contradiction event → 14-day silence window
@@ -120,7 +120,7 @@ class MemoryEvent:
     topic: str             # identity | preferences | workflow | contacts | projects | corrections
     key: str               # hierarchical, e.g. "preferences.response_style"
     value: dict
-    confidence: float      # 0.0–1.0
+    confidence: float      # 0.0-1.0
     source: str            # explicit | inferred | synthesized | migration
     extractor: str         # deterministic | llm_turn | dream_pass | migration
     evidence: dict
@@ -245,6 +245,10 @@ turtle/
 |   `-- rag/                     # FAISS vector storage
 |-- config/
 |   `-- turtle_config.json       # Runtime config (dream pass model, flush intervals)
+|-- docs/
+|   |-- vad-comparison.md        # VAD approach comparison notes
+|   |-- websearch-root-cause.md  # Web search failure analysis
+|   `-- email-agent.md           # Email agent design notes
 |-- test/
 |   `-- *.py                     # Unit/integration tests
 |-- requirements.txt
@@ -260,7 +264,7 @@ turtle/
 Create a `.env` file in the repo root:
 
 ```bash
-# Core LLM (OpenRouter) — key rotation: key1 → key2 → key3 on rate limit
+# Core LLM (OpenRouter) - key rotation: key1 → key2 → key3 on rate limit
 OPEN_ROUTER_MODEL="nvidia/nemotron-3-nano-30b-a3b:free"
 OPEN_ROUTER_API_KEY_1="your_openrouter_api_key_1"
 OPEN_ROUTER_API_KEY_2="your_openrouter_api_key_2"
@@ -268,7 +272,7 @@ OPEN_ROUTER_API_KEY_3="your_openrouter_api_key_3"
 OPENROUTER_APP_URL="your_app_url"
 OPENROUTER_APP_TITLE="your_app_title"
 
-# Fallback LLM + STT (Groq Whisper) — leave empty to disable Groq
+# Fallback LLM + STT (Groq Whisper) - leave empty to disable Groq
 GROQ_PRIMARY_MODEL=openai/gpt-oss-120b
 GROQ_FALLBACK_MODEL=llama-3.1-8b-instant
 GROQ_API_KEY="your_groq_api_key"
@@ -277,7 +281,7 @@ GROQ_API_KEY2="your_groq_api_key_2"
 # RAG conversation memory
 COHERE_API_KEY=your_cohere_api_key
 
-# TTS — Deepgram primary, Groq Orpheus fallback
+# TTS - Deepgram primary, Groq Orpheus fallback
 DEEPGRAM_API_KEY=your_deepgram_api_key
 DEEPGRAM_TTS_MODEL=aura-2-orion-en
 DEEPGRAM_TTS_ENCODING=linear16
@@ -382,13 +386,13 @@ Turtle: Searching... Google announced Gemini 2.5 Pro, a new NotebookLM app, and 
 **URL analysis**
 ```
 You: Summarise https://pydantic-ai.readthedocs.io/en/latest/agents/
-Turtle: The page covers Pydantic AI's Agent class — how to define tools, system prompts, result validators, and dependency injection...
+Turtle: The page covers Pydantic AI's Agent class - how to define tools, system prompts, result validators, and dependency injection...
 ```
 
 **Email**
 ```
 You: Email Alex at alex@example.com and tell him the Thursday standup is moved to 3pm
-Turtle: Drafting email to Alex... Subject: Standup time change — Thursday 3pm. Ready to send?
+Turtle: Drafting email to Alex... Subject: Standup time change - Thursday 3pm. Ready to send?
 ```
 
 **Memory recall**
@@ -401,7 +405,7 @@ Turtle: From our conversation on Monday: you settled on a single-table design wi
 ```
 Turtle: I noticed you prefer bullet-point summaries over prose. Want me to remember that?
 You: Yes
-Turtle: Got it — I'll default to bullet points going forward.
+Turtle: Got it - I'll default to bullet points going forward.
 ```
 
 ---
@@ -449,4 +453,4 @@ python -c "from core.memory_journal import JournalStore; js = JournalStore(); pr
 
 ---
 
-*Turtle Personal Assistant — Built with modern AI frameworks for practical daily assistance*
+*Turtle Personal Assistant - Built with modern AI frameworks for practical daily assistance*
