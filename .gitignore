@@ -42,9 +42,14 @@ venv.bak/
 .idea/
 .DS_Store
 
-# Personal notes / vaults (dev tooling, not part of the app)
+# Dev notes and vaults. Kept locally, deliberately out of git.
 turtle_vault/
 .obsidian/
+docs/
+design/
+review/
+VAD_COMPARISON.md
+emai_Agent.md
 
 # Runtime / data
 .temp/
