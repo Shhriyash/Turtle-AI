@@ -15,6 +15,7 @@ build/
 .env.*
 *.env
 *.env.*
+!.env.example
 venv/
 .venv/
 env/
@@ -41,6 +42,10 @@ venv.bak/
 .idea/
 .DS_Store
 
+# Personal notes / vaults (dev tooling, not part of the app)
+turtle_vault/
+.obsidian/
+
 # Runtime / data
 .temp/
 .gradio/
@@ -60,5 +65,16 @@ tempCodeRunnerFile.py
 *.sql
 
 # Secrets / keys
-aerobic-datum-478513-u9-3daa581fd336.json
+credentials.json
+key.txt
+*serviceaccount*.json
+*service-account*.json
+*firebase-adminsdk*.json
+google-services.json
+GoogleService-Info.plist
+*.pem
+*.p12
+*.pfx
+id_rsa*
+!*.example
 .claude/

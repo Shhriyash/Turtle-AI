@@ -1,6 +1,6 @@
 # Turtle Personal Assistant
 
-A personal assistant with persistent personal memory, web search, URL analysis, email, calendar, a web chat UI, and multi-channel messaging support — built with Pydantic AI. Each turn runs a single tool-equipped agent over a provider fallback cascade; the model's own tool choice is the routing.
+A personal assistant with persistent personal memory, web search, URL analysis, email, calendar, a web chat UI, and multi-channel messaging support - built with Pydantic AI. Each turn runs a single tool-equipped agent over a provider fallback cascade; the model's own tool choice is the routing.
 
 ## Features
 
@@ -12,7 +12,7 @@ A personal assistant with persistent personal memory, web search, URL analysis, 
 - **Email Integration**: Automated email sending with professional formatting
 - **Calendar**: Create and list events via the Google Calendar API
 - **Multi-Channel Messaging**: WhatsApp (Twilio), iMessage (SendBlue), Slack (Events API), and Twilio Voice
-- **Single-Agent, Tool-Routed Turns**: one Pydantic AI agent per turn with every tool always available — no separate intent router or graph executor
+- **Single-Agent, Tool-Routed Turns**: one Pydantic AI agent per turn with every tool always available - no separate intent router or graph executor
 - **Provider Fallback Cascade**: an ordered list of model rungs (Gemini / OpenRouter / Groq) with per-rung health cooldowns; a failing rung is skipped on the next call
 - **Identity Management**: Per-channel user identity mapping to a canonical internal user ID
 - **Trace Spans**: one on-disk span per turn (`data/traces/traces.jsonl`) replayable via `scripts/trace_replay.py`
@@ -38,7 +38,7 @@ Turn pipeline (apps/turtle_server.py :: _execute_turn)
   |-- ONE Pydantic AI agent call over the provider fallback cascade
   |     run_agent_with_fallbacks (core/llm_client.py)
   |       ordered rungs (Gemini / OpenRouter / Groq) + per-rung health cooldowns
-  |     tools always available — the model's tool choice IS the routing:
+  |     tools always available - the model's tool choice IS the routing:
   |       search_web · search_url · send_email_assistant · recall
   |       calendar_create · calendar_list · remember
   |
@@ -53,9 +53,9 @@ Turn pipeline (apps/turtle_server.py :: _execute_turn)
 Shared backends
 |-- RAG Memory System (FAISS + Cohere embeddings)
 |-- Personal Memory System (journal + topic markdown files)
-`-- Identity Manager (core/identity.py) — SQLite (channel, channel_user_id) → user_id
+`-- Identity Manager (core/identity.py) - SQLite (channel, channel_user_id) → user_id
 
-Channel Adapters (apps/channels/) — all funnel into the same _execute_turn
+Channel Adapters (apps/channels/) - all funnel into the same _execute_turn
 |-- WhatsApp  → Twilio Cloud API (POST /channels/whatsapp)
 |-- iMessage  → SendBlue API    (POST /channels/imessage)
 |-- Slack     → Events API      (POST /channels/slack/events)
@@ -81,18 +81,18 @@ The journal + replay design gives a full audit trail, rollback safety, and idemp
 | `PeriodicReflector` | `core/periodic_reflector.py` | Mid-session Stage B session extractor + episodic/rolling summaries |
 | `replay()` | `core/memory_replayer.py` | Projects journal events → markdown topic files deterministically |
 | `RetrievalBroker` | `core/retrieval_broker.py` | Budget-aware retrieval; selects memory to inject into the turn |
-| `PersonalMemoryPromptBuilder` | `core/personal_memory_prompt.py` | Fallback builder — selects relevant topic files for model context |
+| `PersonalMemoryPromptBuilder` | `core/personal_memory_prompt.py` | Fallback builder - selects relevant topic files for model context |
 | `extract_memory_candidates_from_messages()` | `core/personal_memory_extract.py` | Deterministic + LLM extraction from message history |
 
 ### Pipeline Stages
 
-**Stage A — Per-Turn Extraction (Deterministic)**
+**Stage A - Per-Turn Extraction (Deterministic)**
 - Trigger: Every message, in the turn's post-step
 - Deterministic/pattern extraction → `PersonalMemoryCandidate` objects
 - Explicit facts are applied straight to the journal; low-confidence candidates are queued in `ConfirmationGate` as `MemoryEvent(applied=False)`
-- If not silenced: user shown "I noticed X — want me to remember that?" via the web UI confirm panel
+- If not silenced: user shown "I noticed X - want me to remember that?" via the web UI confirm panel
 
-**Stage B — Session-Level Extraction (LLM, mid-session)**
+**Stage B - Session-Level Extraction (LLM, mid-session)**
 - Trigger: `PeriodicReflector` fires every N turns or after an idle gap (and again on the archive sweep at startup for `pending_finalization` sessions)
 - Windowed message history re-extracted with an LLM; candidates queued or applied
 - Also produces episodic summaries and a rolling-window session summary
@@ -105,7 +105,7 @@ Extract → MemoryEvent(applied=False) → ConfirmationGate.queue_candidate()
          ↓
 Gate: not silenced (14-day window) + not explicit?
          ↓ Yes
-Show prompt: "I noticed X — remember that?"
+Show prompt: "I noticed X - remember that?"
          ↓
 User accepts → MemoryEvent(applied=True) supersedes candidate → replay() → topic updated
 User rejects → contradiction event → 14-day silence window
@@ -149,7 +149,7 @@ class MemoryEvent:
     topic: str             # identity | preferences | workflow | contacts | projects | corrections
     key: str               # hierarchical, e.g. "preferences.response_style"
     value: dict
-    confidence: float      # 0.0–1.0
+    confidence: float      # 0.0-1.0
     source: str            # explicit | inferred | synthesized | migration
     extractor: str         # deterministic | llm_turn | migration | scheduler
     evidence: dict
@@ -223,10 +223,10 @@ turtle/
 |   |-- websearch_cli.py         # Web search CLI
 |   `-- channels/
 |       |-- __init__.py          # TurtleEvent / TurtleResponse types + dispatch wiring
-|       |-- whatsapp.py          # WhatsApp adapter — Twilio Cloud API webhook
-|       |-- imessage.py          # iMessage adapter — SendBlue webhook
-|       |-- slack.py             # Slack adapter — Events API (app_mention + DM)
-|       `-- twilio_voice.py      # Voice adapter — Twilio Media Streams WebSocket
+|       |-- whatsapp.py          # WhatsApp adapter - Twilio Cloud API webhook
+|       |-- imessage.py          # iMessage adapter - SendBlue webhook
+|       |-- slack.py             # Slack adapter - Events API (app_mention + DM)
+|       `-- twilio_voice.py      # Voice adapter - Twilio Media Streams WebSocket
 |-- core/
 |   |-- env.py                   # .env loader (shared)
 |   |-- config.py                # Centralised pydantic-settings config (TurtleSettings)
@@ -272,7 +272,6 @@ turtle/
 |   `-- system/complete_rag.py        # RAG orchestration
 |-- web/
 |   |-- index.html
-|   |-- FRONTEND.md              # Frontend architecture runbook
 |   |-- css/                     # Modular stylesheets
 |   `-- js/                      # Modular JS modules
 |-- tools/
@@ -302,10 +301,15 @@ turtle/
 
 ### Required API Keys
 
-Create a `.env` file in the repo root:
+Copy the example and fill it in. The `.env` file is gitignored.
 
 ```bash
-# Core LLM (OpenRouter) — key rotation: key1 → key2 → key3 on rate limit
+cp .env.example .env
+```
+
+
+```bash
+# Core LLM (OpenRouter) - key rotation: key1 → key2 → key3 on rate limit
 OPEN_ROUTER_MODEL="nvidia/nemotron-3-nano-30b-a3b:free"
 OPEN_ROUTER_API_KEY_1="your_openrouter_api_key_1"
 OPEN_ROUTER_API_KEY_2="your_openrouter_api_key_2"
@@ -313,7 +317,7 @@ OPEN_ROUTER_API_KEY_3="your_openrouter_api_key_3"
 OPENROUTER_APP_URL="your_app_url"
 OPENROUTER_APP_TITLE="your_app_title"
 
-# Fallback LLM + STT (Groq Whisper) — leave empty to disable Groq
+# Fallback LLM + STT (Groq Whisper) - leave empty to disable Groq
 GROQ_PRIMARY_MODEL=openai/gpt-oss-120b
 GROQ_FALLBACK_MODEL=llama-3.1-8b-instant
 GROQ_API_KEY="your_groq_api_key"
@@ -322,7 +326,7 @@ GROQ_API_KEY2="your_groq_api_key_2"
 # RAG conversation memory
 COHERE_API_KEY=your_cohere_api_key
 
-# TTS — Deepgram primary, Groq Orpheus fallback
+# TTS - Deepgram primary, Groq Orpheus fallback
 DEEPGRAM_API_KEY=your_deepgram_api_key
 DEEPGRAM_TTS_MODEL=aura-2-orion-en
 DEEPGRAM_TTS_ENCODING=linear16
@@ -340,25 +344,25 @@ TURTLE_EMAIL_PASSKEY="your_app_password"
 # Personal memory
 TURTLE_PERSONAL_MEMORY_ENABLED=1
 
-# Channel adapters — Twilio (WhatsApp + Voice)
+# Channel adapters - Twilio (WhatsApp + Voice)
 TWILIO_ACCOUNT_SID="your_twilio_account_sid"
 TWILIO_AUTH_TOKEN="your_twilio_auth_token"
 TWILIO_WHATSAPP_NUMBER="whatsapp:+14155238886"   # Twilio sandbox or purchased number
 TWILIO_VOICE_NUMBER="+15005550006"               # Twilio voice number
 
-# Channel adapters — iMessage via SendBlue
+# Channel adapters - iMessage via SendBlue
 SENDBLUE_API_KEY="your_sendblue_api_key"
 SENDBLUE_API_SECRET="your_sendblue_api_secret"
 
-# Channel adapters — Slack
+# Channel adapters - Slack
 SLACK_BOT_TOKEN="xoxb-your-slack-bot-token"
 SLACK_SIGNING_SECRET="your_slack_signing_secret"
 
-# Channel adapters — Google Calendar (optional)
+# Channel adapters - Google Calendar (optional)
 GOOGLE_CALENDAR_CREDENTIALS_JSON='{"installed":{"client_id":"..."}}'
 GOOGLE_CALENDAR_TOKEN_JSON='{"token":"..."}'
 
-# Additional LLM provider (Gemini) — key rotation: _1 unset falls through to _2/_3
+# Additional LLM provider (Gemini) - key rotation: _1 unset falls through to _2/_3
 GEMINI_API_KEY=your_gemini_api_key
 GEMINI_API_KEY_2=your_gemini_api_key_2
 GEMINI_API_KEY_3=your_gemini_api_key_3
@@ -366,9 +370,9 @@ GEMINI_API_KEY_3=your_gemini_api_key_3
 # Web search
 TAVILY_API_KEY=your_tavily_api_key
 
-# Cloud deployment — REQUIRED when TURTLE_DEPLOY=cloud (see ## Deployment below)
+# Cloud deployment - REQUIRED when TURTLE_DEPLOY=cloud (see ## Deployment below)
 TURTLE_DEPLOY=cloud                              # local | cloud (alias is TURTLE_DEPLOY, not TURTLE_DEPLOY_MODE)
-AUTH_SECRET_KEY=generate_a_long_random_secret    # signs session cookies — no default in cloud
+AUTH_SECRET_KEY=generate_a_long_random_secret    # signs session cookies - no default in cloud
 TURTLE_PUBLIC_BASE_URL=https://turtle.example.com  # externally reachable URL for magic/forget-me links
 TURTLE_ADMIN_TOKEN=generate_a_random_admin_token   # unlocks /admin + gates POST /api/config; unset = admin disabled
 
@@ -387,7 +391,7 @@ python -m pip install -r requirements.txt
 ## Deployment
 
 This section is for running Turtle as a multi-user cloud service. For local
-single-user development you can skip it — just run the server (see Usage) with
+single-user development you can skip it - just run the server (see Usage) with
 `TURTLE_DEPLOY` unset (defaults to `local`).
 
 ### Quickstart (Docker Compose)
@@ -417,25 +421,25 @@ baked into the image.
 ### The persistent-volume contract
 
 **Everything under `data/` is stateful and must live on a persistent volume**
-(`./data:/app/data` in compose). Losing it means losing users and their memory —
+(`./data:/app/data` in compose). Losing it means losing users and their memory -
 there is no re-derivation. In order of irreplaceability:
 
 | Path | What it is | Losing it means |
 | --- | --- | --- |
-| `data/users.sqlite` | **Identity** — email → user_id bindings | Every user is orphaned; next login mints a brand-new id and their memory is unreachable |
+| `data/users.sqlite` | **Identity** - email → user_id bindings | Every user is orphaned; next login mints a brand-new id and their memory is unreachable |
 | `data/memory/personal/<uid>/` | **Irreplaceable** per-user memory + journal | Permanent loss of everything Turtle learned about that user |
 | `data/scheduler.sqlite` | Routine/recurring-job schedules | All routines stop firing |
 | `data/rag/<uid>/` | Per-user conversation RAG vectors | Rebuildable-ish, but recall degrades until it repopulates |
 | `data/sessions.sqlite` | Session message history | In-flight conversations reset |
-| `data/tool_invocations.db` | Email idempotency window (60 s) | Negligible — self-heals |
+| `data/tool_invocations.db` | Email idempotency window (60 s) | Negligible - self-heals |
 | `data/traces/` | Optional turn-trace forensics | Optional; only used by `trace_replay.py` |
 
 ### Required environment (cloud mode)
 
 | Var | Purpose |
 | --- | --- |
-| `TURTLE_DEPLOY=cloud` | Enables strict auth: secure cookies, no dev-anon, no dev JWT fallback. The config alias is `TURTLE_DEPLOY` — **not** `TURTLE_DEPLOY_MODE` (which is silently ignored). |
-| `AUTH_SECRET_KEY` | Long random secret that signs session cookies. No default in cloud — set a real one. |
+| `TURTLE_DEPLOY=cloud` | Enables strict auth: secure cookies, no dev-anon, no dev JWT fallback. The config alias is `TURTLE_DEPLOY` - **not** `TURTLE_DEPLOY_MODE` (which is silently ignored). |
+| `AUTH_SECRET_KEY` | Long random secret that signs session cookies. No default in cloud - set a real one. |
 | `TURTLE_PUBLIC_BASE_URL` | The externally reachable base URL; used to build magic-link login and forget-me links. |
 | `TURTLE_ADMIN_TOKEN` | Unlocks `/admin` and gates `POST /api/config`. Unset → admin endpoints return 503 and config POST stays open (fine for local, unsafe for cloud). |
 | LLM keys | `GROQ_API_KEY`, `GROQ_API_KEY2`, `GEMINI_API_KEY` (`_2`/`_3` for rotation), `OPEN_ROUTER_API_KEY_1..3` |
@@ -443,43 +447,43 @@ there is no re-derivation. In order of irreplaceability:
 | Voice | `DEEPGRAM_API_KEY` |
 | Email | `TURTLE_EMAIL_NAME`, `TURTLE_EMAIL_ADDRESS`, `TURTLE_EMAIL_PASSKEY` (magic-link login, routine delivery, forget-me) |
 
-**Optional tuning** (sane defaults in `core/config.py` — override only as needed):
+**Optional tuning** (sane defaults in `core/config.py` - override only as needed):
 per-user storage cap `TURTLE_USER_STORAGE_CAP_MB` (default 50), WebSocket rate
 limits `TURTLE_WS_MESSAGES_PER_HOUR` / `TURTLE_WS_MESSAGES_PER_DAY`, personal
 embedding `TURTLE_PERSONAL_EMBED_ENABLED`, and the various latency-budget knobs.
-See `core/config.py` for the full list — don't duplicate it here.
+See `core/config.py` for the full list - don't duplicate it here.
 
 ### Operations
 
 - **Health:** `GET /healthz` (no auth, no I/O). The Dockerfile `HEALTHCHECK` and
   `test/smoke_boot_test.py` both hit it.
-- **Admin dashboard:** `GET /admin` — paste `TURTLE_ADMIN_TOKEN` into the page to
+- **Admin dashboard:** `GET /admin` - paste `TURTLE_ADMIN_TOKEN` into the page to
   list users with storage/activity stats. The page ships no secret; the token is
   held in the browser's `sessionStorage` and sent as `X-Admin-Token`.
 - **Backups:** `python -m scripts.backup_personal_memory [--out DIR] [--retention-days 30]`
   snapshots per-user memory to a dated `tar.gz` and prunes old snapshots. Run it
   from cron / Task Scheduler.
-  **Gap to know:** the snapshot covers `data/memory/personal/` **only** — it does
+  **Gap to know:** the snapshot covers `data/memory/personal/` **only** - it does
   **not** include `data/users.sqlite` (identity), `data/rag/`, or
   `data/sessions.sqlite`. For real disaster recovery, back up the **entire
   `data/` volume** (e.g. a volume snapshot), not just the memory tarball.
 - **GDPR delete:** users self-serve via `POST /forget-me` (emailed confirmation
   link); the admin dashboard is read-only.
 - **Wipe (fresh start):** `python -m scripts.wipe_data --confirm` clears RAG,
-  sessions, memory, and task history. Dry-runs without `--confirm`. Destructive —
+  sessions, memory, and task history. Dry-runs without `--confirm`. Destructive -
   operator-only.
 - **Forensics:** `python -m scripts.trace_replay [--sessions data/sessions.sqlite]`
   replays a stored turn for debugging.
 
 ### Hazards
 
-- **Never set `TURTLE_DEV_ANON` in production** — it bypasses auth and serves the
+- **Never set `TURTLE_DEV_ANON` in production** - it bypasses auth and serves the
   chat UI to anonymous visitors. It is honored only in local mode, but do not
   ship it.
 - **Set `TURTLE_DATA_DIR` to an absolute path** if you override it. A relative
   value is anchored to the repo root by `core/config.py`, but an absolute path is
   unambiguous and matches the mounted volume.
-- **`AUTH_SECRET_KEY` has no fallback in cloud** — a shared/hardcoded value lets
+- **`AUTH_SECRET_KEY` has no fallback in cloud** - a shared/hardcoded value lets
   anyone forge session cookies. Generate a unique long random secret per deploy.
 
 ---
@@ -519,20 +523,20 @@ Adapters operate without credentials in dev mode (signature verification is skip
 
 ## Turn Pipeline
 
-There is no separate intent router and no graph executor. Every user turn —
-from the web UI, voice, or any channel adapter — runs the same canonical
+There is no separate intent router and no graph executor. Every user turn -
+from the web UI, voice, or any channel adapter - runs the same canonical
 pipeline (`_execute_turn` in `apps/turtle_server.py`). The model does the
 routing by choosing tools.
 
 ### 1. Deterministic pre-step
 
-- **Pending-email bypass** — if a half-finished email draft exists in the
+- **Pending-email bypass** - if a half-finished email draft exists in the
   session, the turn is treated as a continuation of it (memory context and trace
   label are forced to the email flow) even when the words don't say "email".
-- **Memory-context injection** — `RetrievalBroker` (falling back to
+- **Memory-context injection** - `RetrievalBroker` (falling back to
   `PersonalMemoryPromptBuilder`) builds a budget-bounded memory block, injected
   via per-turn instructions. The persisted user turn stays the user's bare words.
-- **Confirmation surfacing** — on the WebSocket path, any pending memory
+- **Confirmation surfacing** - on the WebSocket path, any pending memory
   confirmation prompt is emitted as a sidecar frame so the web UI can render it.
 
 ### 2. One agent call over the fallback cascade
@@ -541,7 +545,7 @@ routing by choosing tools.
 agent against an ordered list of model rungs (Gemini / OpenRouter / Groq). Rungs
 in cooldown after a recent failure are skipped (`core/health_tracker.py`); if
 every rung is cooling, the tracker is bypassed rather than failing outright. All
-tools are offered on every turn — **the model's tool choice is the routing**:
+tools are offered on every turn - **the model's tool choice is the routing**:
 
 | Tool | Purpose |
 |------|---------|
@@ -573,20 +577,20 @@ All channel adapters normalise inbound payloads to a `TurtleEvent` and call the 
 
 ### WhatsApp (`apps/channels/whatsapp.py`)
 
-- Transport: Twilio Cloud API webhook — `POST /channels/whatsapp`
+- Transport: Twilio Cloud API webhook - `POST /channels/whatsapp`
 - Auth: HMAC-SHA1 `X-Twilio-Signature` verified on every request (403 on failure)
 - Idempotency: `MessageSid` cached for 60 s to deduplicate Twilio retries
 - Reply: Twilio Messages REST API (`From: whatsapp:<TWILIO_WHATSAPP_NUMBER>`)
 
 ### iMessage (`apps/channels/imessage.py`)
 
-- Transport: SendBlue webhook — `POST /channels/imessage`
+- Transport: SendBlue webhook - `POST /channels/imessage`
 - Auth: HMAC-SHA256 `X-SendBlue-Signature`
 - Reply: `POST https://api.sendblue.co/api/send-message`
 
 ### Slack (`apps/channels/slack.py`)
 
-- Transport: Slack Events API — `POST /channels/slack/events`
+- Transport: Slack Events API - `POST /channels/slack/events`
 - Auth: HMAC-SHA256 `X-Slack-Signature` with 5-minute replay protection
 - Events handled: `app_mention`, `message.im` (direct messages)
 - Reply: `chat.postMessage` as a threaded reply; response sent as a background task to satisfy Slack's 3-second acknowledgement requirement
@@ -668,13 +672,13 @@ Turtle: Searching... Google announced Gemini 2.5 Pro, a new NotebookLM app, and 
 **URL analysis**
 ```
 You: Summarise https://pydantic-ai.readthedocs.io/en/latest/agents/
-Turtle: The page covers Pydantic AI's Agent class — how to define tools, system prompts, result validators, and dependency injection...
+Turtle: The page covers Pydantic AI's Agent class - how to define tools, system prompts, result validators, and dependency injection...
 ```
 
 **Email**
 ```
 You: Email Alex at alex@example.com and tell him the Thursday standup is moved to 3pm
-Turtle: Drafting email to Alex... Subject: Standup time change — Thursday 3pm. Ready to send?
+Turtle: Drafting email to Alex... Subject: Standup time change - Thursday 3pm. Ready to send?
 ```
 
 **Memory recall**
@@ -687,7 +691,7 @@ Turtle: From our conversation on Monday: you settled on a single-table design wi
 ```
 Turtle: I noticed you prefer bullet-point summaries over prose. Want me to remember that?
 You: Yes
-Turtle: Got it — I'll default to bullet points going forward.
+Turtle: Got it - I'll default to bullet points going forward.
 ```
 
 ---
@@ -714,7 +718,7 @@ Turtle: Got it — I'll default to bullet points going forward.
 ### Personal Memory Not Persisting
 - Check `TURTLE_PERSONAL_MEMORY_ENABLED=1`
 - Inspect `data/memory/personal/journal/` for written events (the journal is the source of truth; topic markdown files are a replayed projection)
-- The journal is replayed into topic files after every turn — if a fact is in the journal but not in a topic file, check server logs for a replay/storage-cap error
+- The journal is replayed into topic files after every turn - if a fact is in the journal but not in a topic file, check server logs for a replay/storage-cap error
 
 ### URL Extraction Fails
 - JavaScript-heavy site: use alternative sources
@@ -728,7 +732,7 @@ Turtle: Got it — I'll default to bullet points going forward.
 - Confirm `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_WHATSAPP_NUMBER` are set
 - For iMessage: confirm `SENDBLUE_API_KEY` and `SENDBLUE_API_SECRET`
 - For Slack: confirm `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET`; ensure bot is invited to the channel
-- Check server logs for `403 Invalid * signature` — mismatch between configured secret and platform secret
+- Check server logs for `403 Invalid * signature` - mismatch between configured secret and platform secret
 
 ### Twilio Voice Call Gets No Audio
 - Confirm `DEEPGRAM_API_KEY` (TTS) and `GROQ_API_KEY` (STT Whisper)
@@ -749,4 +753,4 @@ python -c "from core.memory_journal import JournalStore; js = JournalStore(); pr
 
 ---
 
-*Turtle Personal Assistant — Built with modern AI frameworks for practical daily assistance*
+*Turtle Personal Assistant - Built with modern AI frameworks for practical daily assistance*
