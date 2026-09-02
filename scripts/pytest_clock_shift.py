@@ -41,6 +41,12 @@ false positive. Keeping one clock for everyone is what makes the run clean.
 
 Usage
 -----
+PowerShell (the shell this repo is normally driven from)::
+
+    $env:PYTHONPATH="scripts"; $env:SHIFT_DAYS="400"; pytest test -q -p pytest_clock_shift
+
+bash/zsh::
+
     PYTHONPATH=scripts SHIFT_DAYS=400 pytest test -q -p pytest_clock_shift
 
 Run it at +0 first as a control: that must be green, since nothing has moved.
