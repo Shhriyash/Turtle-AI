@@ -101,7 +101,10 @@ def normalize_spoken_email_text(text: str) -> str:
     for pattern, replacement in replacements:
         normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\s*@\s*", "@", normalized)
-    normalized = re.sub(r"\s*\.\s*", ".", normalized)
+    # Only join dots inside email-ish tokens (lowercase continuation): a
+    # production send misdelivered to "gmail.com.In" after a sentence
+    # boundary ("...@gmail.com. In the mail...") was glued into a TLD.
+    normalized = re.sub(r"(?<=[A-Za-z0-9])\s*\.\s*(?=[a-z0-9])", ".", normalized)
     return normalized
 
 
@@ -339,6 +342,97 @@ def format_missing_email_prompt(missing: list[str], details: dict[str, Any]) -> 
     if captured_text:
         return f"I have these details already:\n{captured_text}\n\nPlease provide the missing {missing_text}."
     return f"Please provide the missing {missing_text} so I can send the email."
+
+
+def build_compose_email_prompt(
+    *,
+    user_request: str,
+    merged: dict[str, Any],
+    email_tone: str = "",
+    sender_identity: str = "",
+    conversation_context: str = "",
+) -> str:
+    """Prompt the email agent to AUTHOR the subject/body the user delegated.
+
+    This is the composition counterpart to the extraction prompt. It is only
+    used when the user asked Turtle to write the email (or pick the subject)
+    rather than dictating it verbatim. The model owns the wording; we never
+    derive it from brittle templates. The model returns the same JSON shape as
+    extraction so ``parse_email_extraction_response`` can read it back.
+
+    ``conversation_context`` carries the recent conversation (assistant replies
+    and fetched tool results) so a request like "email me the fetched news" or
+    "send that summary" is written from the actual content — the email agent runs
+    without the main conversation's history, so without this it would author an
+    empty placeholder body.
+    """
+    existing_subject = merged.get("subject", "")
+    existing_content = merged.get("content", "")
+    tone_line = f"- Match this tone if natural: {email_tone}.\n" if email_tone else ""
+    identity_block = f"{sender_identity}\n\n" if sender_identity else ""
+    context_block = (
+        "Recent conversation and fetched content, for reference.\n"
+        "- If the request refers to earlier content (e.g. 'the fetched news', "
+        "'that summary', 'the results above', 'send it'), write the body FROM the "
+        "relevant part below — quote the real facts, headlines, numbers, or text.\n"
+        "- If the request does not refer to earlier content, ignore this block and "
+        "write from the request alone.\n"
+        "Never invent facts beyond what is given.\n"
+        "--- context ---\n"
+        f"{conversation_context}\n"
+        "--- end context ---\n\n"
+        if conversation_context and conversation_context.strip()
+        else ""
+    )
+    return (
+        "Compose an email on the user's behalf from their request below.\n"
+        f"{identity_block}"
+        f"{context_block}"
+        'Return ONLY a JSON object with string keys "subject" and "content".\n'
+        "Rules:\n"
+        "- Write a complete, ready-to-send body that fulfils the request.\n"
+        "- Do NOT add a sign-off or signature; one is appended automatically.\n"
+        "- Write a concise, specific subject line that fits the body.\n"
+        "- Do NOT fabricate facts (names, dates, numbers) you were not given.\n"
+        "- If the email describes you (Turtle), you are Turtle, a personal "
+        "assistant. Never say you are an AI model or that you were built, "
+        "developed, or trained by Google, OpenAI, Anthropic, or any company — "
+        "never name an underlying model or provider.\n"
+        "- If the request gives no basis to write a body, return an empty "
+        'string for "content".\n'
+        f"{tone_line}"
+        "\nAlready provided — reuse verbatim when non-empty, do not rewrite:\n"
+        f"- subject: {existing_subject!r}\n"
+        f"- content: {existing_content!r}\n\n"
+        f"User request:\n{user_request}"
+    )
+
+
+def derive_fallback_subject(content: str) -> str:
+    """Last-resort subject when the model returned a body but no subject.
+
+    Keeps a send from blocking on a missing subject. Uses the opening words of
+    the body; the composer normally supplies a better one.
+    """
+    first_line = next((ln.strip() for ln in content.splitlines() if ln.strip()), "")
+    if not first_line:
+        return "(no subject)"
+    words = first_line.split()
+    snippet = " ".join(words[:8]).rstrip(" .,:;!?")
+    return snippet or "(no subject)"
+
+
+def format_email_draft(details: dict[str, Any]) -> str:
+    """Render a human-readable draft preview (headers + body) for confirmation."""
+    lines = [f"To: {', '.join(details.get('recipients', []))}"]
+    if details.get("cc_recipients"):
+        lines.append(f"Cc: {', '.join(details['cc_recipients'])}")
+    if details.get("bcc_recipients"):
+        lines.append(f"Bcc: {', '.join(details['bcc_recipients'])}")
+    lines.append(f"Subject: {details.get('subject', '')}")
+    lines.append("")
+    lines.append(str(details.get("content", "")).strip())
+    return "\n".join(lines)
 
 
 def _looks_like_signoff_line(line: str) -> bool:

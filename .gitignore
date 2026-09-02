@@ -27,17 +27,29 @@ venv.bak/
 **/env/
 **/ENV/
 
-# Markdown (track README and docs/, ignore scratch notes elsewhere)
+# Markdown (keep only root README.md)
 **/*.md
 !README.md
-!docs/
-!docs/**/*.md
-!web/FRONTEND.md
+# ...but tool-contract prompts are load-bearing: _load_tool_contract() reads
+# them at runtime as each tool's description, and tests assert they exist. They
+# must be tracked, or a fresh clone (incl. CI) degrades every tool to
+# "Tool: {name}" and the contract tests fail.
+!core/system_prompts/tools/
+!core/system_prompts/tools/*.md
 
 # IDE / OS
 .vscode/
 .idea/
 .DS_Store
+
+# Dev notes and vaults. Kept locally, deliberately out of git.
+turtle_vault/
+.obsidian/
+docs/
+design/
+review/
+VAD_COMPARISON.md
+emai_Agent.md
 
 # Runtime / data
 .temp/

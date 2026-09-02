@@ -4,6 +4,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+import pytest
+
 from core.personal_memory_store import PersonalMemoryStore
 from core.retrieval_broker import (
     DEFAULT_BUDGET,
@@ -123,12 +125,22 @@ class HistoryTriggerTests(unittest.TestCase):
 
 class RetrievalBrokerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
         self.base = Path("test") / "_tmp" / f"broker_{uuid.uuid4().hex}"
         self.base.mkdir(parents=True, exist_ok=True)
         self.store = _make_store(self.base)
         self.task_store = TaskHistoryStore(self.base / "tasks" / "history.jsonl")
+        # write_topic inside a running loop enqueues embed_personal_memory,
+        # which would hit the live Cohere API and write the real
+        # data/memory/personal/default/vector index. No-op it for tests.
+        self._embed_patcher = patch(
+            "core.personal_memory_store.queue_service.enqueue", new=AsyncMock()
+        )
+        self._embed_patcher.start()
 
     def tearDown(self) -> None:
+        self._embed_patcher.stop()
         shutil.rmtree(self.base, ignore_errors=True)
 
     def _make_broker(self, rag_system=None, budget=DEFAULT_BUDGET) -> RetrievalBroker:
@@ -164,7 +176,7 @@ class RetrievalBrokerTests(unittest.IsolatedAsyncioTestCase):
                 self.store.update_index_entry("preferences", f"Summary for topic {i} with extra text to push tokens")
             except Exception:
                 pass
-        budget = RetrievalBudget(index_tokens=5, topic_tokens=200, episodic_tokens=100, task_tokens=40, total_tokens=400)
+        budget = RetrievalBudget(index_tokens=5, summary_tokens=150, total_tokens=400)
         broker = self._make_broker(budget=budget)
         result = await broker.build_context(task_type="general", query="hello")
         # Index section should be heavily truncated
@@ -199,6 +211,7 @@ class RetrievalBrokerTests(unittest.IsolatedAsyncioTestCase):
         result = await broker.build_context(task_type="general", query="what is my name?")
         self.assertNotIn("[Past Conversations]", result)
 
+    @pytest.mark.skip(reason="stale: episodic tier moved from build_context to the recall tool (scope='episodic') by design — 2026-07-16 Phase 1 triage")
     async def test_history_trigger_includes_episodic(self) -> None:
         rag = _FakeRagSystem(
             response='[{"content": "We discussed the Turtle project", "timestamp": "2026-01-01"}]'
@@ -219,6 +232,7 @@ class RetrievalBrokerTests(unittest.IsolatedAsyncioTestCase):
         result = await broker.build_context(task_type="general", query="do you remember last week?")
         self.assertNotIn("[Past Conversations]", result)
 
+    @pytest.mark.skip(reason="stale: task-history tier moved from build_context to the recall tool (scope='tasks') by design — 2026-07-16 Phase 1 triage")
     async def test_task_tier_fires_on_history_trigger(self) -> None:
         # Record a task so the task store has something to return
         self.task_store.record(
@@ -285,22 +299,99 @@ class RetrievalBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[Past Conversations]", result)
 
 
-class RetrievalBudgetTests(unittest.TestCase):
-    def test_default_budget_values(self) -> None:
-        b = DEFAULT_BUDGET
-        self.assertEqual(b.index_tokens, 60)
-        self.assertEqual(b.topic_tokens, 200)
-        self.assertEqual(b.episodic_tokens, 100)
-        self.assertEqual(b.task_tokens, 40)
-        self.assertEqual(b.total_tokens, 400)
-        self.assertEqual(
-            b.index_tokens + b.topic_tokens + b.episodic_tokens + b.task_tokens,
-            b.total_tokens,
+class PersonalTierTests(unittest.IsolatedAsyncioTestCase):
+    """Hybrid personal recall: FTS5-first, vector fallback."""
+
+    def setUp(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from core.memory_journal import make_event
+        from core.memory_sqlite import MemorySQLiteIndex
+
+        self.base = Path("test") / "_tmp" / f"ptier_{uuid.uuid4().hex}"
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.store = _make_store(self.base)
+        self.task_store = TaskHistoryStore(self.base / "tasks" / "history.jsonl")
+        self.index = MemorySQLiteIndex(db_path=self.base / "memory.sqlite")
+        for ev in (
+            make_event(
+                kind="fact", topic="relations", key="relations.best_friend",
+                value={"best_friend": "Aarav"}, confidence=1.0,
+                source="explicit", extractor="deterministic", applied=True,
+                session_id="s1", turn_id="t1", observed_at="2026-05-01T10:00:00Z",
+            ),
+            make_event(
+                kind="preference", topic="preferences", key="preferences.tone",
+                value={"tone": "concise"}, confidence=1.0,
+                source="explicit", extractor="deterministic", applied=True,
+                session_id="s1", turn_id="t2", observed_at="2026-05-01T10:01:00Z",
+            ),
+        ):
+            self.index.index_event(ev)
+        self.vector_store = AsyncMock()
+        self.vector_store.search = AsyncMock(return_value=[])
+
+    def tearDown(self) -> None:
+        self.index.close()
+        shutil.rmtree(self.base, ignore_errors=True)
+
+    def _broker(self) -> RetrievalBroker:
+        return RetrievalBroker(
+            store=self.store,
+            task_store=self.task_store,
+            sqlite_index=self.index,
+            vector_store=self.vector_store,
+            user_id="usr_test",
         )
 
+    async def test_strong_fts_skips_vector_call(self) -> None:
+        broker = self._broker()
+        result = await broker.recall(query="do you remember my best friend", scope="personal")
+        self.assertIn("Aarav", result)
+        self.vector_store.search.assert_not_awaited()
+
+    async def test_weak_fts_triggers_vector_fallback(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from core.storage import Hit
+
+        self.vector_store.search = AsyncMock(
+            return_value=[Hit(doc_id="d1", text="City: Mumbai", score=0.82, metadata={"topic": "identity"})]
+        )
+        broker = self._broker()
+        result = await broker.recall(query="where do I stay", scope="personal")
+        self.vector_store.search.assert_awaited_once()
+        self.assertIn("Mumbai", result)
+
+    async def test_empty_fts_and_empty_vector_returns_empty(self) -> None:
+        broker = self._broker()
+        result = await broker.recall(query="quantum chromodynamics", scope="personal")
+        self.assertEqual(result, "")
+        self.vector_store.search.assert_awaited_once()
+
+    async def test_token_overlap_math(self) -> None:
+        from core.retrieval_broker import _token_overlap
+
+        self.assertEqual(_token_overlap("best friend", "Best Friend Aarav"), 1.0)
+        self.assertEqual(_token_overlap("best friend", "no match here"), 0.0)
+        self.assertEqual(_token_overlap("", "anything"), 0.0)
+        self.assertAlmostEqual(_token_overlap("best friend pal", "best buddy"), 1 / 3)
+
+
+class RetrievalBudgetTests(unittest.TestCase):
+    def test_default_budget_values(self) -> None:
+        # Phase 2 W2: prompt-time injection is index + query-aware [Relevant
+        # Memory] + rolling-summary; total raised to 600 with headroom.
+        b = DEFAULT_BUDGET
+        self.assertEqual(b.index_tokens, 240)
+        self.assertEqual(b.relevant_tokens, 160)
+        self.assertEqual(b.summary_tokens, 150)
+        self.assertEqual(b.total_tokens, 600)
+        self.assertLessEqual(b.index_tokens + b.relevant_tokens + b.summary_tokens, b.total_tokens)
+
     def test_custom_budget(self) -> None:
-        b = RetrievalBudget(index_tokens=30, topic_tokens=100, episodic_tokens=50, task_tokens=20, total_tokens=200)
-        self.assertEqual(b.total_tokens, 200)
+        b = RetrievalBudget(index_tokens=30, summary_tokens=20, total_tokens=50)
+        self.assertEqual(b.total_tokens, 50)
 
 
 if __name__ == "__main__":

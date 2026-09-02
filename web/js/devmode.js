@@ -21,12 +21,33 @@ function bindTtsSpeedPreview() {
     slider.dataset.bound = '1';
 }
 
-async function postConfigPatch(cfgPatch) {
+const ADMIN_TOKEN_KEY = 'turtle_admin_token';
+
+async function postConfigPatch(cfgPatch, allowPrompt = true) {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = sessionStorage.getItem(ADMIN_TOKEN_KEY);
+    if (token) headers['X-Admin-Token'] = token;
+
     const res = await fetch('/api/config', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(cfgPatch),
     });
+
+    // When TURTLE_ADMIN_TOKEN is set server-side, POST /api/config is gated.
+    // On 401, drop any stale token, prompt once, cache it in sessionStorage
+    // (session-scoped — cleared when the tab closes, smaller blast radius than
+    // localStorage), then retry a single time (allowPrompt guards the recursion).
+    if (res.status === 401) {
+        sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+        if (allowPrompt) {
+            const entered = window.prompt('Admin token required to change server config:');
+            if (entered && entered.trim()) {
+                sessionStorage.setItem(ADMIN_TOKEN_KEY, entered.trim());
+                return postConfigPatch(cfgPatch, false);
+            }
+        }
+    }
     return await res.json();
 }
 
@@ -44,17 +65,22 @@ export function toggleDevPanel() {
 /** Load current config and model lists from the server */
 export async function loadDevConfig() {
     try {
-        const [modelsRes, configRes] = await Promise.all([
+        const [modelsRes, configRes, agentsRes] = await Promise.all([
             fetch('/api/models'),
             fetch('/api/config'),
+            fetch('/api/agents'),
         ]);
         const models = await modelsRes.json();
         const cfg = await configRes.json();
+        const agentsPayload = await agentsRes.json().catch(() => ({ agents: [] }));
+        renderAgentsList(agentsPayload.agents || []);
 
-        // Agent model overrides (prefixed: "groq:..." or "openrouter:...")
+        // Agent model overrides (prefixed: "groq:..." or "openrouter:...").
+        // The router, planner, and dream pass were removed in the Phase 4
+        // convergence to one agent per turn — only the main assistant and the
+        // email specialist remain as editable model rungs.
         populateSelect('dev-main-agent-model', models.all_models, cfg.MAIN_AGENT_MODEL);
         populateSelect('dev-email-agent-model', models.all_models, cfg.EMAIL_AGENT_MODEL);
-        populateSelect('dev-dream-agent-model', models.all_models, cfg.DREAM_PASS_AGENT_MODEL);
 
         // Fallback pools
         populateSelect('dev-openrouter-model', models.openrouter_models, cfg.OPEN_ROUTER_MODEL);
@@ -78,6 +104,23 @@ export async function loadDevConfig() {
         bindTtsSpeedPreview();
     } catch (e) {
         showToast('Failed to load config', true);
+    }
+}
+
+/** Render the read-only runtime agents list */
+function renderAgentsList(agents) {
+    const container = document.getElementById('dev-agents-list');
+    if (!container) return;
+    container.innerHTML = '';
+    for (const a of agents) {
+        const row = document.createElement('div');
+        row.className = 'dev-agent-row';
+        const editableTag = a.editable ? '' : ' (read-only)';
+        row.innerHTML = `
+            <div class="dev-agent-label">${a.label}<span class="dev-agent-status" data-status="${a.status}">${a.status}${editableTag}</span></div>
+            <div class="dev-agent-model">${a.model}</div>
+        `;
+        container.appendChild(row);
     }
 }
 
@@ -108,7 +151,6 @@ export async function applyDevConfig() {
     const cfg = {
         MAIN_AGENT_MODEL: document.getElementById('dev-main-agent-model').value,
         EMAIL_AGENT_MODEL: document.getElementById('dev-email-agent-model').value,
-        DREAM_PASS_AGENT_MODEL: document.getElementById('dev-dream-agent-model').value,
         OPEN_ROUTER_MODEL: document.getElementById('dev-openrouter-model').value,
         GROQ_PRIMARY_MODEL: document.getElementById('dev-groq-model').value,
         GROQ_FALLBACK_MODEL: document.getElementById('dev-groq-fallback').value,
@@ -138,9 +180,8 @@ export async function applyDevConfig() {
 /** Reset all fields to defaults and apply */
 export async function resetDevDefaults() {
     const defaults = {
-        MAIN_AGENT_MODEL: 'openrouter:openai/gpt-oss-120b',
+        MAIN_AGENT_MODEL: 'groq:openai/gpt-oss-120b',
         EMAIL_AGENT_MODEL: 'groq:llama-3.3-70b-versatile',
-        DREAM_PASS_AGENT_MODEL: '',
         OPEN_ROUTER_MODEL: 'nvidia/llama-3.1-nemotron-70b-instruct:free',
         GROQ_PRIMARY_MODEL: 'llama-3.3-70b-versatile',
         GROQ_FALLBACK_MODEL: 'llama-3.1-8b-instant',
@@ -184,6 +225,10 @@ export function updateTimings(data) {
     if (data.tts_ms !== undefined) {
         const el = document.getElementById('timing-tts');
         if (el) el.textContent = data.tts_ms + 'ms';
+    }
+    if (data.tts_first_byte_ms !== undefined) {
+        const el = document.getElementById('timing-ttfb');
+        if (el) el.textContent = data.tts_first_byte_ms + 'ms';
     }
     if (data.total_ms !== undefined) {
         const el = document.getElementById('timing-total');

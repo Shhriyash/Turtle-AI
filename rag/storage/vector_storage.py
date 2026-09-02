@@ -1,4 +1,4 @@
-﻿"""
+"""
 FAISS Vector Storage for RAG System
 
 This module handles vector storage and retrieval using FAISS (Facebook AI Similarity Search).
@@ -7,28 +7,44 @@ Provides efficient similarity search for conversation chunks.
 
 import os
 import json
+import threading
 import numpy as np
 import faiss
+from collections import OrderedDict
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
-from core.paths import RAG_VECTOR_DIR, ensure_dirs
+from core.paths import rag_vector_dir, ensure_dirs
 from core.io_atomic import atomic_write_json
 
 
 class VectorStorage:
     """FAISS-based vector storage for conversation chunks"""
     
-    def __init__(self, storage_dir: Optional[str] = None, embedding_dimension: int = 1024):
+    def __init__(
+        self,
+        user_id: Optional[str] = None,
+        *,
+        storage_dir: Optional[str] = None,
+        embedding_dimension: int = 1024,
+    ):
         """
-        Initialize FAISS vector storage
-        
+        Initialize FAISS vector storage.
+
         Args:
-            storage_dir: Directory to store FAISS index and metadata
-            embedding_dimension: Dimension of embeddings (1024 for Cohere embed-english-v3.0)
+            user_id: Tenant identifier. Required unless ``storage_dir`` is set.
+            storage_dir: Explicit directory for tests / single-tenant callers.
+                When provided, ``user_id`` may be omitted.
+            embedding_dimension: Dimension of embeddings (1024 for Cohere embed-english-v3.0).
         """
         ensure_dirs()
-        self.storage_dir = Path(storage_dir) if storage_dir else RAG_VECTOR_DIR
+        if storage_dir is not None:
+            self.storage_dir = Path(storage_dir)
+        else:
+            if not user_id:
+                raise ValueError("VectorStorage requires either user_id or storage_dir")
+            self.storage_dir = rag_vector_dir(user_id)
+        self.user_id = user_id
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
         self.embedding_dimension = embedding_dimension
@@ -126,6 +142,9 @@ class VectorStorage:
             "session_id": session_id,
             "content": content,
         }
+        for key in ("timestamp", "topics", "turn_id_range", "creation_time", "chunk_id"):
+            if key in entry:
+                normalized[key] = entry[key]
         if bool(entry.get("deleted", False)):
             normalized["deleted"] = True
         if bool(entry.get("orphaned", False)):
@@ -152,6 +171,9 @@ class VectorStorage:
             "session_id": session_id,
             "content": content,
         }
+        for key in ("timestamp", "topics", "turn_id_range", "creation_time", "chunk_id"):
+            if key in chunk:
+                entry[key] = chunk[key]
         if bool(chunk.get("deleted", False)):
             entry["deleted"] = True
         if bool(chunk.get("orphaned", False)):
@@ -400,23 +422,57 @@ class VectorStorage:
         return total_size / (1024 * 1024)  # Convert to MB
 
 
-# Global vector storage instance
-vector_storage = None
+# Per-tenant vector storage cache (one VectorStorage per user_id), bounded LRU.
+#
+# This was an unbounded dict with a "swap for an LRU when we have many active
+# users" TODO. Each entry holds a FAISS index in RAM, and nothing ever removed
+# one, so process memory grew with the number of DISTINCT users ever seen and
+# never came back down — a slow leak that only shows up once Turtle serves more
+# than its author.
+#
+# Eviction is safe because every mutating path (add_chunks, delete, the
+# transaction helpers) calls _save_index()/_save_metadata() eagerly: an evicted
+# tenant holds no dirty state, and the next access simply reloads it from disk.
+_VECTOR_STORAGE_CACHE_MAX = int(os.getenv("TURTLE_VECTOR_STORAGE_CACHE_MAX", "128"))
+_vector_storage_by_user: "OrderedDict[str, VectorStorage]" = OrderedDict()
+_vector_storage_lock = threading.Lock()
 
-def get_vector_storage() -> VectorStorage:
-    """Get global vector storage instance"""
-    global vector_storage
-    if vector_storage is None:
-        vector_storage = VectorStorage()
-    return vector_storage
 
-def add_to_vector_db(chunks: List[Dict[str, Any]], embeddings: np.ndarray):
-    """Convenience function to add chunks to vector storage"""
-    storage = get_vector_storage()
-    storage.add_chunks(chunks, embeddings)
+def get_vector_storage(user_id: str) -> VectorStorage:
+    """Return the cached VectorStorage for ``user_id`` (constructed on first use).
 
-def search_vector_db(query_embedding: np.ndarray, top_k: int = 5, threshold: float = 0.7) -> List[Dict[str, Any]]:
-    """Convenience function to search vector storage"""
-    storage = get_vector_storage()
-    return storage.search_similar(query_embedding, top_k, threshold)
+    Locked: FAISS search/upsert run on ``asyncio.to_thread`` worker threads, so
+    an unsynchronised check-then-insert here could hand two threads two
+    different VectorStorage objects for the same tenant — which then write the
+    same index.bin from two in-memory copies. Same class of bug that
+    ``FAISSVectorStore._get_lock`` guards against one layer down.
+    """
+    if not user_id:
+        raise ValueError("get_vector_storage requires a user_id")
+    with _vector_storage_lock:
+        store = _vector_storage_by_user.get(user_id)
+        if store is not None:
+            _vector_storage_by_user.move_to_end(user_id)
+            return store
+        store = VectorStorage(user_id=user_id)
+        _vector_storage_by_user[user_id] = store
+        while len(_vector_storage_by_user) > _VECTOR_STORAGE_CACHE_MAX:
+            evicted_id, _ = _vector_storage_by_user.popitem(last=False)
+            print(f"LOG: evicting vector storage cache entry for {evicted_id}")
+        return store
+
+
+def add_to_vector_db(user_id: str, chunks: List[Dict[str, Any]], embeddings: np.ndarray):
+    """Convenience function to add chunks to a user's vector storage."""
+    get_vector_storage(user_id).add_chunks(chunks, embeddings)
+
+
+def search_vector_db(
+    user_id: str,
+    query_embedding: np.ndarray,
+    top_k: int = 5,
+    threshold: float = 0.7,
+) -> List[Dict[str, Any]]:
+    """Convenience function to search a user's vector storage."""
+    return get_vector_storage(user_id).search_similar(query_embedding, top_k, threshold)
 

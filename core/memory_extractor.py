@@ -36,6 +36,12 @@ _ROLE_KEYWORDS = {
     "teacher",
     "marketer",
     "writer",
+    "player",
+    "athlete",
+    "freelancer",
+    "entrepreneur",
+    "intern",
+    "scientist",
 }
 
 _CLAUSE_SPLIT_REGEX = re.compile(
@@ -316,9 +322,12 @@ def _extract_identity_detail_events(user_text: str, lowered: str) -> list[dict[s
                 }
             )
 
+    # Explicit role performatives only. The bare copula ("I'm an AI engineer")
+    # is left to the LLM extractor — same reasoning as _extract_name: regex
+    # can't tell occupation from name/location/mood, so it must not claim a
+    # strong signal that short-circuits the LLM.
     role_patterns = [
         r"\b(?:i work as|working as)\s+(?:an?\s+)?([a-zA-Z][a-zA-Z\s/&\-]{2,50})",
-        r"\b(?:i am|i['’]?m)\s+(?:an?\s+)?([a-zA-Z][a-zA-Z\s/&\-]{2,50})",
     ]
     for pattern in role_patterns:
         match = re.search(pattern, user_text, flags=re.IGNORECASE)
@@ -347,10 +356,13 @@ def _extract_identity_detail_events(user_text: str, lowered: str) -> list[dict[s
 
 
 def _extract_name(user_text: str) -> str | None:
+    # Only explicit name performatives. The bare copula ("I'm X" / "I am X") is
+    # semantically ambiguous — name vs. occupation vs. location vs. mood — and
+    # cannot be disambiguated by pattern alone, so it is intentionally NOT here.
+    # Those statements fall through to the LLM extractor, which classifies the
+    # role correctly instead of the regex confidently mislabelling it as a name.
     patterns = [
         r"\bmy name is\s+([a-zA-Z][a-zA-Z\s'-]{1,40})",
-        r"\bi am\s+([a-zA-Z][a-zA-Z\s'-]{1,40})",
-        r"\bi['’]?m\s+([a-zA-Z][a-zA-Z\s'-]{1,40})",
         r"\bcall me\s+([a-zA-Z][a-zA-Z\s'-]{1,40})",
         r"\bname\s*[:\-]\s*([a-zA-Z][a-zA-Z\s'-]{1,40})",
     ]
@@ -368,6 +380,13 @@ def _extract_name(user_text: str) -> str | None:
         candidate = " ".join(candidate.split())
         words = candidate.split()
         if not words or len(words) > 4:
+            continue
+        # Defense-in-depth for the explicit patterns: "my name is a doctor" /
+        # "call me the boss" — a leading article or a role word means it isn't
+        # a name. (The ambiguous bare-copula patterns were removed above.)
+        if words[0].lower() in {"a", "an", "the"}:
+            continue
+        if any(word.lower() in _ROLE_KEYWORDS for word in words):
             continue
         if any(word.lower() in _NAME_STOPWORDS for word in words):
             continue

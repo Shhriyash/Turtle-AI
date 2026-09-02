@@ -7,17 +7,18 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
-from core.paths import PERSONAL_MEMORY_JOURNAL_DIR
+from core.guardrails import enforce_storage_cap
+from core.memory_schema import ALLOWED_TOPICS
+from core.paths import personal_journal_dir, personal_memory_dir
 
 
 ALLOWED_KINDS = frozenset({"fact", "preference", "behavior", "correction", "contradiction"})
-ALLOWED_TOPICS = frozenset(
-    {"identity", "preferences", "workflow", "contacts", "projects", "corrections"}
-)
+# The 11-topic vocabulary now has a single home in core.memory_schema; re-exported
+# here so existing `from core.memory_journal import ALLOWED_TOPICS` importers work.
 ALLOWED_SOURCES = frozenset({"explicit", "inferred", "synthesized", "migration"})
-ALLOWED_EXTRACTORS = frozenset({"deterministic", "llm_turn", "dream_pass", "migration"})
+ALLOWED_EXTRACTORS = frozenset({"deterministic", "llm_turn", "dream_pass", "migration", "scheduler"})
 
 
 def _utc_now() -> str:
@@ -56,6 +57,11 @@ class MemoryEvent:
     supersedes: str | None = None
     applied: bool = False
     rejected: bool = False
+    # Pre-rendered one-line projection, snapshotted at extraction time so the
+    # replayer can render verbatim (statement-based rendering). Empty on old
+    # events and on events built without one; the replayer falls back to the
+    # key templates in core.memory_schema in that case.
+    statement: str = ""
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -78,6 +84,7 @@ class MemoryEvent:
             supersedes=payload.get("supersedes"),
             applied=bool(payload.get("applied", False)),
             rejected=bool(payload.get("rejected", False)),
+            statement=str(payload.get("statement", "")),
         )
 
 
@@ -103,9 +110,20 @@ def validate_event(event: MemoryEvent) -> None:
 class JournalStore:
     """Append-only JSONL journal, sharded by month, idempotent by event_id."""
 
-    def __init__(self, journal_dir: Path = PERSONAL_MEMORY_JOURNAL_DIR) -> None:
-        self.journal_dir = journal_dir
+    def __init__(
+        self,
+        user_id: str = "default",
+        journal_dir: Path | None = None,
+        *,
+        on_append: Callable[[MemoryEvent], None] | None = None,
+    ) -> None:
+        self.user_id = user_id
+        self.journal_dir = journal_dir or personal_journal_dir(user_id)
         self.journal_dir.mkdir(parents=True, exist_ok=True)
+        # Optional write-through hook (e.g. SQLite FTS5 index). Wrapped in
+        # try/except at the call site so a failing index never blocks the
+        # journal write — the journal is the source of truth.
+        self.on_append = on_append
 
     def _shard_path_for(self, observed_at: str) -> Path:
         try:
@@ -122,6 +140,13 @@ class JournalStore:
             return event
         path = self._shard_path_for(event.observed_at)
         line = json.dumps(event.to_payload(), ensure_ascii=False, sort_keys=True)
+        # Phase 6: enforce per-user storage cap before appending.
+        if self.user_id and self.user_id != "default":
+            enforce_storage_cap(
+                self.user_id,
+                personal_memory_dir(self.user_id),
+                incoming_bytes=len(line.encode("utf-8")) + 1,
+            )
         with path.open("a", encoding="utf-8") as file:
             file.write(line + "\n")
             file.flush()
@@ -129,10 +154,93 @@ class JournalStore:
                 os.fsync(file.fileno())
             except Exception:
                 pass
+        if self.on_append is not None:
+            try:
+                self.on_append(event)
+            except Exception as exc:
+                print(f"LOG: JournalStore on_append hook failed for {event.event_id}: {exc}")
         return event
 
     def append_many(self, events: Iterable[MemoryEvent]) -> list[MemoryEvent]:
-        return [self.append(event) for event in events]
+        # Dedup-on-append: skip only TRUE no-ops — an incoming event whose
+        # (kind, applied, value) matches the CURRENT latest event for its
+        # (topic, key). Comparing against the current latest (not set-membership
+        # over the last 50) is what fixes the flip-back bug: with the journal at
+        # [humor=high, humor=low], a user restating "high" differs from the
+        # current latest ("low") and MUST journal — the old signature-set logic
+        # matched it against the earlier "high" and silently dropped it, leaving
+        # the stale "low" served (brutal review H1). Key+applied still matter so
+        # an applied=True restatement is never suppressed by a lingering
+        # applied=False candidate the gate is holding.
+        recent: list[MemoryEvent] = []
+        try:
+            recent = self.load_all()[-50:]
+        except Exception:
+            recent = []
+
+        def _normalized(ev: MemoryEvent) -> str:
+            try:
+                return json.dumps(ev.value, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                return str(ev.value)
+
+        def _sort_key(ev: MemoryEvent) -> tuple[str, str]:
+            return (str(ev.observed_at), str(ev.event_id))
+
+        # Current latest event per (topic, key) among recent journal events.
+        latest_by_key: dict[tuple[str, str], MemoryEvent] = {}
+        for ev in recent:
+            composite = (str(ev.topic), str(ev.key))
+            current = latest_by_key.get(composite)
+            if current is None or _sort_key(ev) > _sort_key(current):
+                latest_by_key[composite] = ev
+
+        def _is_noop(event: MemoryEvent) -> bool:
+            current = latest_by_key.get((str(event.topic), str(event.key)))
+            if current is None:
+                return False
+            return (
+                str(current.kind) == str(event.kind)
+                and bool(current.applied) == bool(event.applied)
+                and _normalized(current) == _normalized(event)
+            )
+
+        results: list[MemoryEvent] = []
+        for event in events:
+            if _is_noop(event):
+                continue
+            results.append(self.append(event))
+            # A freshly appended event is now the latest for its key, so a later
+            # event in this same batch dedups against it (in-batch no-ops still
+            # collapse, and a within-batch flip-back still lands).
+            latest_by_key[(str(event.topic), str(event.key))] = event
+        return results
+
+    def append_rejection(self, original: "MemoryEvent") -> "MemoryEvent":
+        """Append a tombstone that permanently rejects *original*.
+
+        Rejection must live in the journal (source of truth), not only as an
+        out-of-band index flag — otherwise any index rebuild resurrects the
+        rejected fact. ``MemorySQLiteIndex.backfill_from_journal`` honors
+        these tombstones.
+        """
+        tombstone = MemoryEvent(
+            event_id=generate_event_id(),
+            session_id=original.session_id,
+            turn_id=f"{original.turn_id}_rejected",
+            observed_at=_utc_now(),
+            kind="contradiction",
+            topic=original.topic,
+            key=original.key,
+            value={"rejected_event_id": original.event_id},
+            confidence=1.0,
+            source="explicit",
+            extractor="deterministic",
+            evidence={"note": "rejection tombstone"},
+            supersedes=original.event_id,
+            applied=False,
+        )
+        return self.append(tombstone)
 
     def iter_events(self) -> Iterator[MemoryEvent]:
         if not self.journal_dir.exists():
@@ -170,6 +278,26 @@ class JournalStore:
                 return True
         return False
 
+    def flush(self) -> None:
+        """Best-effort fsync for existing journal shards."""
+        if not self.journal_dir.exists():
+            return
+        for shard_dir in sorted(self.journal_dir.iterdir()):
+            if not shard_dir.is_dir():
+                continue
+            path = shard_dir / "events.jsonl"
+            if not path.exists():
+                continue
+            try:
+                with path.open("a", encoding="utf-8") as file:
+                    file.flush()
+                    try:
+                        os.fsync(file.fileno())
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
 
 def make_event(
     *,
@@ -187,6 +315,7 @@ def make_event(
     supersedes: str | None = None,
     applied: bool = False,
     event_id: str | None = None,
+    statement: str = "",
 ) -> MemoryEvent:
     event = MemoryEvent(
         event_id=event_id or generate_event_id(),
@@ -203,6 +332,7 @@ def make_event(
         evidence=dict(evidence or {}),
         supersedes=supersedes,
         applied=applied,
+        statement=statement,
     )
     validate_event(event)
     return event

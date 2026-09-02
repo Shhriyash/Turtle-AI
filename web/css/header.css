@@ -35,6 +35,10 @@
     width: 100%;
     height: 100%;
     object-fit: contain;
+    /* The asset is dark-on-white RGB with no alpha: invert it to a light
+       mark on black, then screen the black away against the dark header. */
+    filter: invert(1) brightness(1.6);
+    mix-blend-mode: screen;
 }
 
 .header-title {

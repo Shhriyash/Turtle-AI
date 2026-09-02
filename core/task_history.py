@@ -24,6 +24,9 @@ class TaskHistoryRecord:
     tool_used: str = ""
     outcome: str = ""
     payload: dict[str, Any] | None = None
+    # Owner. history.jsonl/.sqlite are ONE global store shared by every user, so
+    # every row must carry its tenant or search leaks across users.
+    user_id: str = ""
 
 
 class TaskHistoryStore:
@@ -35,7 +38,10 @@ class TaskHistoryStore:
     the JSONL row count, it is rebuilt from the JSONL on init.
     """
 
-    def __init__(self, history_path: Path) -> None:
+    def __init__(self, history_path: Path, *, user_id: str = "") -> None:
+        # Tenant this store instance reads/writes as. The file is global; the
+        # scoping is per-instance, so each SharedState gets its own owner view.
+        self.user_id = str(user_id or "").strip()
         self.history_path = history_path
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.history_path.exists():
@@ -57,6 +63,7 @@ class TaskHistoryStore:
         outcome: str = "",
         payload: dict[str, Any] | None = None,
         timestamp: str | None = None,
+        user_id: str | None = None,
     ) -> TaskHistoryRecord:
         record = TaskHistoryRecord(
             session_id=session_id,
@@ -68,6 +75,7 @@ class TaskHistoryStore:
             tool_used=tool_used,
             outcome=outcome,
             payload=dict(payload) if payload else None,
+            user_id=str(user_id if user_id is not None else self.user_id or "").strip(),
         )
         payload_record = _record_to_payload(record)
         with self.history_path.open("a", encoding="utf-8") as file:
@@ -94,13 +102,21 @@ class TaskHistoryStore:
 
     def list_by_session(self, session_id: str) -> list[dict[str, Any]]:
         target = str(session_id).strip()
-        return self._index.list_by_session(target)
+        return self._index.list_by_session(target, user_id=self.user_id)
 
-    def search(self, query: str, *, max_results: int = 5) -> list[dict[str, Any]]:
-        return self._index.search(query, max_results=max_results)
+    def search(
+        self, query: str, *, max_results: int = 5, user_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._index.search(
+            query,
+            max_results=max_results,
+            user_id=user_id if user_id is not None else self.user_id,
+        )
 
-    def format_search_results(self, query: str, *, max_results: int = 5) -> str:
-        results = self.search(query, max_results=max_results)
+    def format_search_results(
+        self, query: str, *, max_results: int = 5, user_id: str | None = None
+    ) -> str:
+        results = self.search(query, max_results=max_results, user_id=user_id)
         if not results:
             return ""
 
@@ -146,6 +162,7 @@ class TaskHistoryStore:
 
 def _record_to_payload(record: TaskHistoryRecord) -> dict[str, Any]:
     payload = {
+        "user_id": record.user_id,
         "session_id": record.session_id,
         "turn_id": record.turn_id,
         "task_type": record.task_type,

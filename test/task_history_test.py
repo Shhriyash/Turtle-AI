@@ -5,6 +5,10 @@ from pathlib import Path
 
 from core.task_history import TaskHistoryStore
 
+# Task history is tenant-scoped: search() requires an owner and fails closed
+# without one (see test/phase9_task_history_tenancy_test.py).
+_TEST_USER = "usr_test"
+
 
 class TaskHistoryStoreTests(unittest.TestCase):
     def test_record_and_filter_by_session(self) -> None:
@@ -12,7 +16,7 @@ class TaskHistoryStoreTests(unittest.TestCase):
         history_path = base / "history.jsonl"
         base.mkdir(parents=True, exist_ok=True)
         try:
-            store = TaskHistoryStore(history_path)
+            store = TaskHistoryStore(history_path, user_id=_TEST_USER)
             store.record(
                 session_id="s1",
                 turn_id="t1",
@@ -47,7 +51,7 @@ class TaskHistoryStoreTests(unittest.TestCase):
         history_path = base / "history.jsonl"
         base.mkdir(parents=True, exist_ok=True)
         try:
-            store = TaskHistoryStore(history_path)
+            store = TaskHistoryStore(history_path, user_id=_TEST_USER)
             store.record(
                 session_id="s1",
                 turn_id="t1",

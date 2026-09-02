@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Turtle · Admin</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f1115;
+      --panel: #181b22;
+      --fg: #e8eaf0;
+      --muted: #8a93a6;
+      --accent: #4fd1c5;
+      --accent-fg: #08221f;
+      --border: #262a33;
+      --error: #ff7373;
+      --row-hover: #1e222b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 24px;
+    }
+    .wrap { max-width: 1040px; margin: 0 auto; }
+    header.top { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
+    header.top h1 { margin: 0; font-size: 22px; }
+    header.top .sub { color: var(--muted); font-size: 13px; }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+    }
+
+    /* Token gate */
+    #gate { max-width: 420px; margin: 8vh auto 0; }
+    #gate h2 { margin: 0 0 6px; font-size: 18px; }
+    #gate p.lede { margin: 0 0 20px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    input[type="password"] {
+      width: 100%;
+      padding: 11px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #0f1115;
+      color: var(--fg);
+      font-size: 15px;
+      margin-bottom: 16px;
+      outline: none;
+    }
+    input:focus { border-color: var(--accent); }
+    button {
+      padding: 10px 16px;
+      border-radius: 8px;
+      border: none;
+      background: var(--accent);
+      color: var(--accent-fg);
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button.ghost {
+      background: transparent;
+      color: var(--fg);
+      border: 1px solid var(--border);
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    #gate button { width: 100%; }
+
+    .status { margin-top: 14px; font-size: 14px; min-height: 20px; line-height: 1.5; }
+    .status.err { color: var(--error); }
+    .status.ok { color: var(--accent); }
+    .status code {
+      background: #0f1115;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 1px 6px;
+      font-size: 13px;
+    }
+
+    /* Dashboard */
+    #dash { display: none; }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .summary { color: var(--muted); font-size: 14px; }
+    .summary strong { color: var(--fg); }
+    .toolbar .actions { display: flex; gap: 8px; }
+
+    .table-scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td {
+      text-align: left;
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+      position: sticky;
+      top: 0;
+      background: var(--panel);
+    }
+    th:hover { color: var(--fg); }
+    th .arrow { opacity: 0.5; font-size: 11px; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); }
+    tbody tr:hover { background: var(--row-hover); }
+    td.empty { color: var(--muted); text-align: center; padding: 32px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <h1>Turtle Admin</h1>
+      <span class="sub">operator dashboard · read-only</span>
+    </header>
+
+    <!-- Token gate -->
+    <div id="gate" class="card">
+      <h2>Connect</h2>
+      <p class="lede">Paste the admin token (<code>TURTLE_ADMIN_TOKEN</code>) to view users. It is held in this tab's session only and never stored on the page.</p>
+      <label for="token">Admin token</label>
+      <input id="token" type="password" autocomplete="off" placeholder="TURTLE_ADMIN_TOKEN" />
+      <button id="connect-btn" type="button">Connect</button>
+      <div class="status" id="gate-status"></div>
+    </div>
+
+    <!-- Dashboard -->
+    <div id="dash">
+      <div class="card">
+        <div class="toolbar">
+          <div class="summary" id="summary"></div>
+          <div class="actions">
+            <button class="ghost" id="refresh-btn" type="button">Refresh</button>
+            <button class="ghost" id="disconnect-btn" type="button">Disconnect</button>
+          </div>
+        </div>
+        <div class="status" id="dash-status"></div>
+        <div class="table-scroll">
+          <table id="users-table">
+            <thead>
+              <tr>
+                <th data-key="user_id" data-type="str">User ID <span class="arrow"></span></th>
+                <th data-key="primary_email" data-type="str">Email <span class="arrow"></span></th>
+                <th data-key="created_at" data-type="str">Created <span class="arrow"></span></th>
+                <th data-key="last_seen" data-type="str">Last seen <span class="arrow"></span></th>
+                <th data-key="storage_mb" data-type="num">Storage MB <span class="arrow"></span></th>
+                <th data-key="rag_mb" data-type="num">RAG MB <span class="arrow"></span></th>
+                <th data-key="journal_events" data-type="num">Journal <span class="arrow"></span></th>
+              </tr>
+            </thead>
+            <tbody id="users-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Session-scoped token store. sessionStorage (not localStorage) so the token
+    // dies with the tab — a smaller blast radius for a privileged secret.
+    const TOKEN_KEY = 'turtle_admin_token';
+
+    const gate = document.getElementById('gate');
+    const dash = document.getElementById('dash');
+    const tokenInput = document.getElementById('token');
+    const connectBtn = document.getElementById('connect-btn');
+    const gateStatus = document.getElementById('gate-status');
+    const dashStatus = document.getElementById('dash-status');
+    const summary = document.getElementById('summary');
+    const usersBody = document.getElementById('users-body');
+    const refreshBtn = document.getElementById('refresh-btn');
+    const disconnectBtn = document.getElementById('disconnect-btn');
+
+    let rows = [];
+    let sortKey = 'created_at';
+    let sortDir = -1; // -1 desc, 1 asc
+
+    function token() { return sessionStorage.getItem(TOKEN_KEY) || ''; }
+
+    function showGate(msg, isErr) {
+      dash.style.display = 'none';
+      gate.style.display = 'block';
+      gateStatus.textContent = msg || '';
+      gateStatus.className = 'status' + (isErr ? ' err' : '');
+    }
+
+    function showDash() {
+      gate.style.display = 'none';
+      dash.style.display = 'block';
+    }
+
+    function fmtMb(bytes) {
+      return (Number(bytes || 0) / 1048576).toFixed(1);
+    }
+
+    async function fetchUsers() {
+      dashStatus.textContent = 'Loading…';
+      dashStatus.className = 'status';
+      let res;
+      try {
+        res = await fetch('/admin/users', { headers: { 'X-Admin-Token': token() } });
+      } catch (e) {
+        // Network / server unreachable.
+        showGate('Could not reach the server. Check that Turtle is running and try again.', true);
+        return;
+      }
+
+      if (res.status === 401) {
+        sessionStorage.removeItem(TOKEN_KEY);
+        showGate('That token was rejected. Check TURTLE_ADMIN_TOKEN and try again.', true);
+        return;
+      }
+      if (res.status === 503) {
+        sessionStorage.removeItem(TOKEN_KEY);
+        showGate('Admin endpoints are disabled on this server. Set TURTLE_ADMIN_TOKEN in the environment and restart, then reconnect.', true);
+        return;
+      }
+      if (!res.ok) {
+        dashStatus.textContent = 'Request failed (' + res.status + ').';
+        dashStatus.className = 'status err';
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      rows = (data.users || []).map((u) => ({
+        ...u,
+        storage_mb: Number(u.storage_bytes || 0) / 1048576,
+        rag_mb: Number(u.rag_bytes || 0) / 1048576,
+      }));
+      const cap = data.storage_cap_mb ? (data.storage_cap_mb + ' MB') : 'disabled';
+      summary.innerHTML = '<strong>' + (data.count || 0) + '</strong> user'
+        + ((data.count === 1) ? '' : 's')
+        + ' · storage cap <strong>' + cap + '</strong> per user';
+      dashStatus.textContent = '';
+      showDash();
+      render();
+    }
+
+    function render() {
+      const sorted = [...rows].sort((a, b) => {
+        let av = a[sortKey];
+        let bv = b[sortKey];
+        if (typeof av === 'number' || typeof bv === 'number') {
+          return ((av || 0) - (bv || 0)) * sortDir;
+        }
+        av = (av == null ? '' : String(av)).toLowerCase();
+        bv = (bv == null ? '' : String(bv)).toLowerCase();
+        if (av < bv) return -1 * sortDir;
+        if (av > bv) return 1 * sortDir;
+        return 0;
+      });
+
+      usersBody.innerHTML = '';
+      if (!sorted.length) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td class="empty" colspan="7">No users yet.</td>';
+        usersBody.appendChild(tr);
+      } else {
+        for (const u of sorted) {
+          const tr = document.createElement('tr');
+          tr.appendChild(cell(u.user_id, 'mono'));
+          tr.appendChild(cell(u.primary_email || '—'));
+          tr.appendChild(cell(u.created_at || '—'));
+          tr.appendChild(cell(u.last_seen || '—'));
+          tr.appendChild(cell(fmtMb(u.storage_bytes), 'num'));
+          tr.appendChild(cell(fmtMb(u.rag_bytes), 'num'));
+          tr.appendChild(cell(String(u.journal_events ?? 0), 'num'));
+          usersBody.appendChild(tr);
+        }
+      }
+      updateArrows();
+    }
+
+    function cell(text, cls) {
+      const td = document.createElement('td');
+      if (cls) td.className = cls;
+      td.textContent = text;
+      return td;
+    }
+
+    function updateArrows() {
+      document.querySelectorAll('#users-table th').forEach((th) => {
+        const arrow = th.querySelector('.arrow');
+        if (!arrow) return;
+        arrow.textContent = (th.dataset.key === sortKey) ? (sortDir === 1 ? '▲' : '▼') : '';
+      });
+    }
+
+    // Column sort on header click.
+    document.querySelectorAll('#users-table th').forEach((th) => {
+      th.addEventListener('click', () => {
+        const key = th.dataset.key;
+        if (sortKey === key) {
+          sortDir = -sortDir;
+        } else {
+          sortKey = key;
+          sortDir = (th.dataset.type === 'num') ? -1 : 1;
+        }
+        render();
+      });
+    });
+
+    connectBtn.addEventListener('click', () => {
+      const val = tokenInput.value.trim();
+      if (!val) {
+        gateStatus.textContent = 'Enter a token first.';
+        gateStatus.className = 'status err';
+        return;
+      }
+      sessionStorage.setItem(TOKEN_KEY, val);
+      tokenInput.value = '';
+      fetchUsers();
+    });
+
+    tokenInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') connectBtn.click();
+    });
+
+    refreshBtn.addEventListener('click', fetchUsers);
+
+    disconnectBtn.addEventListener('click', () => {
+      sessionStorage.removeItem(TOKEN_KEY);
+      showGate('Disconnected.', false);
+    });
+
+    // Auto-connect if a token is already in this session (e.g. after a refresh).
+    if (token()) {
+      fetchUsers();
+    }
+  </script>
+</body>
+</html>

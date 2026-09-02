@@ -123,7 +123,11 @@ class PersonalMemoryPromptBuilder:
             add("identity")
         if any(token in lowered for token in ("prefer", "usually", "style", "tone", "concise", "detailed", "default response")):
             add("preferences")
-        if any(token in lowered for token in ("workflow", "habit", "normally", "default", "often", "send it", "recipient")):
+        if any(token in lowered for token in (
+            "workflow", "habit", "normally", "default", "often", "send it", "recipient",
+            "routine", "routines", "schedule", "every morning", "every day", "daily",
+            "every week", "weekly",
+        )):
             add("workflow")
         if any(token in lowered for token in ("recipient", "contact", "send to", "mail to", "cc ", "bcc ")):
             add("contacts")

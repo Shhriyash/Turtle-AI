@@ -1,0 +1,262 @@
+/* ================================================================
+   MEMORY — Confirmation card (inline) + pending-memories panel
+   Phase 2 / W4. Purple (accent-secondary) distinguishes memory
+   surfaces from chat (cyan accent).
+   ================================================================ */
+
+/* ── Inline confirmation card (rendered in the response panel) ── */
+.memory-card {
+    align-self: stretch;
+    max-width: 100%;
+    padding: 14px 16px;
+    border-radius: var(--radius-md);
+    background: oklch(0.74 0.095 250 / 0.07);
+    border: 1px solid oklch(0.74 0.095 250 / 0.30);
+    animation: panel-msg-in 0.35s var(--ease-out) forwards;
+    opacity: 0;
+    transform: translateX(16px);
+}
+
+.memory-card.settled {
+    background: var(--bg-glass);
+    border-color: var(--border);
+}
+
+.memory-card-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--accent-secondary);
+    margin-bottom: 6px;
+}
+
+.memory-card-msg {
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--text-primary);
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+
+.mem-meta {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    word-break: break-all;
+}
+
+.memory-card-error {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--error);
+}
+
+.memory-card-note {
+    margin-top: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--success);
+    letter-spacing: 0.3px;
+}
+
+/* ── Shared action buttons (card + panel items) ──────────────── */
+.mem-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+}
+
+.mem-btn {
+    padding: 7px 16px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s var(--ease-out);
+}
+
+.mem-btn:hover:not(:disabled) {
+    background: var(--surface-hover);
+    color: var(--text-primary);
+    border-color: var(--border-accent);
+}
+
+.mem-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.mem-btn-yes {
+    background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+    color: var(--bg-primary);
+    border: none;
+    font-weight: 600;
+}
+
+.mem-btn-yes:hover:not(:disabled) {
+    opacity: 0.92;
+    box-shadow: var(--shadow-glow);
+    color: var(--bg-primary);
+}
+
+.mem-btn-no:hover:not(:disabled) {
+    border-color: var(--error);
+    color: var(--error);
+}
+
+.mem-btn-later {
+    color: var(--text-muted);
+}
+
+/* ── Pending-memories panel (slide-in from right) ────────────── */
+.memory-panel {
+    width: 0;
+    overflow: hidden;
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--border);
+    transition: width 0.4s var(--ease-out);
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.memory-panel.open {
+    width: var(--sidebar-width);
+}
+
+.memory-panel-header {
+    height: var(--header-height);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 20px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+.memory-panel-header h3 {
+    font-size: 15px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-primary);
+}
+
+.memory-panel-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.memory-panel-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.mem-item {
+    padding: 12px 14px;
+    border-radius: var(--radius-md);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+}
+
+.mem-item-q {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-primary);
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+
+.memory-empty {
+    padding: 24px 12px;
+    text-align: center;
+    font-size: 13px;
+    color: var(--text-muted);
+}
+
+@media (max-width: 768px) {
+    .memory-panel.open {
+        position: fixed;
+        top: 0; right: 0; bottom: 0;
+        z-index: 100;
+    }
+}
+
+/* ── Tabs (What I remember | To confirm) ─────────────────────── */
+.memory-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 8px 12px 0;
+    border-bottom: 1px solid var(--border);
+}
+.memory-tab {
+    flex: 1;
+    padding: 8px 10px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.15s var(--ease-out), border-color 0.15s var(--ease-out);
+}
+.memory-tab:hover { color: var(--text-primary); }
+.memory-tab.active {
+    color: var(--accent-secondary);
+    border-bottom-color: var(--accent-secondary);
+}
+.memory-pending-badge:not(:empty) {
+    display: inline-block;
+    margin-left: 6px;
+    min-width: 16px;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: var(--accent-secondary);
+    color: #fff;
+    font-size: 10px;
+    line-height: 16px;
+    text-align: center;
+}
+
+/* ── "What I remember" topic groups ──────────────────────────── */
+.mem-topic {
+    padding: 12px 14px;
+    border-radius: var(--radius-md);
+    background: var(--bg-glass);
+    border: 1px solid var(--border);
+}
+.mem-topic + .mem-topic { margin-top: 8px; }
+.mem-topic-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--accent-secondary);
+    margin-bottom: 6px;
+}
+.mem-topic-lines {
+    margin: 0;
+    padding-left: 16px;
+    list-style: disc;
+}
+.mem-topic-lines li {
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--text-primary);
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}

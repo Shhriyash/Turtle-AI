@@ -3,12 +3,14 @@ import unittest
 import uuid
 from pathlib import Path
 
+import pytest
 from pydantic_ai import ModelMessagesTypeAdapter
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from core.session_store import SessionStore
 
 
+@pytest.mark.skip(reason="stale: SessionStore dropped the manifest/messages file layout (active_dir/archive_dir kwargs) for a SQLite backend; see test/session_memory_continuity_test.py for the current spec — 2026-07-16 Phase 1 triage")
 class SessionStoreLayoutTests(unittest.TestCase):
     def test_default_layout_namespaces_active_session_by_session_id(self) -> None:
         base = Path("test") / "_tmp" / f"session_store_{uuid.uuid4().hex}"

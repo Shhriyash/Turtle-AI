@@ -7,7 +7,8 @@
     <title>Turtle AI</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
 
     <!-- Component stylesheets -->
     <link rel="stylesheet" href="/static/css/tokens.css">
@@ -18,6 +19,7 @@
     <link rel="stylesheet" href="/static/css/input.css">
     <link rel="stylesheet" href="/static/css/devmode.css">
     <link rel="stylesheet" href="/static/css/components.css">
+    <link rel="stylesheet" href="/static/css/memory.css">
 </head>
 <body>
     <div id="app">
@@ -43,6 +45,9 @@
                         <div class="status-dot"></div>
                         <span id="status-text">Connecting</span>
                     </div>
+                    <button class="btn-icon" id="btn-memory-toggle" title="Memory" aria-label="Pending memories">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>
+                    </button>
                     <button class="btn-icon" id="btn-dev-toggle" title="Dev Mode">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
                     </button>
@@ -50,20 +55,49 @@
             </header>
 
             <!-- Central Bubble Area -->
-            <div class="bubble-container" id="bubble-container">
+            <div class="bubble-container" id="bubble-container" data-state="idle">
+                <div class="field-grid" aria-hidden="true"></div>
+
+                <div class="bubble-greeting" id="bubble-greeting">Good evening.</div>
+
                 <div class="bubble-glow" id="bubble-glow">
-                    <div class="ambient-particle"></div>
-                    <div class="ambient-particle"></div>
-                    <div class="ambient-particle"></div>
-                    <div class="bubble-orb" id="bubble-orb"
+                    <!-- Ambient rings (rest) -->
+                    <div class="ring ring-ambient r1" aria-hidden="true"></div>
+                    <div class="ring ring-ambient r2" aria-hidden="true"></div>
+                    <div class="ring ring-ambient r3" aria-hidden="true"></div>
+
+                    <!-- Organic blobs: inbound while listening, outbound while speaking -->
+                    <div class="ring ring-blob b1" aria-hidden="true"></div>
+                    <div class="ring ring-blob b2" aria-hidden="true"></div>
+                    <div class="ring ring-blob b3" aria-hidden="true"></div>
+
+                    <!-- Tight rings while transcribing -->
+                    <div class="ring ring-tight t1" aria-hidden="true"></div>
+                    <div class="ring ring-tight t2" aria-hidden="true"></div>
+
+                    <!-- Orbiting satellites while thinking -->
+                    <div class="ring ring-orbit" aria-hidden="true"><span></span><span></span></div>
+
+                    <div class="bubble-orb" id="bubble-orb" role="button" tabindex="0"
+                         aria-label="Hold to talk"
                          onmousedown="window._bubbleDown(event)"
                          onmouseup="window._bubbleUp(event)"
                          ontouchstart="window._bubbleDown(event)"
                          ontouchend="window._bubbleUp(event)">
-                        <span class="bubble-mark"><img src="/static/assets/turtle-icon.png" alt="Turtle" /></span>
                     </div>
                 </div>
-                <div class="bubble-status" id="bubble-status">Ready</div>
+
+                <div class="bubble-meta">
+                    <div class="bubble-wordmark" aria-hidden="true">TURTLE</div>
+                    <div class="bubble-status" id="bubble-status" role="status" aria-live="polite">Ask me anything</div>
+                </div>
+
+                <div class="bubble-wave" id="bubble-wave" aria-hidden="true">
+                    <span></span><span></span><span></span><span></span><span></span><span></span>
+                    <span></span><span></span><span></span><span></span><span></span>
+                </div>
+
+                <div class="bubble-heard" id="bubble-heard"></div>
             </div>
 
             <!-- Input Bar -->
@@ -89,6 +123,15 @@
                 </div>
             </div>
         </div>
+
+        <!-- Floating toggle to reopen the chat/response panel after it's closed -->
+        <button class="btn-chat-toggle" id="btn-chat-toggle" type="button"
+                title="Show chat" aria-label="Show chat" aria-pressed="false">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            </svg>
+            <span class="btn-chat-toggle-label">Chat</span>
+        </button>
 
         <!-- Response Panel (slides in from right) -->
         <div class="response-panel" id="response-panel">
@@ -121,11 +164,40 @@
                     <span class="panel-timing-value" id="timing-tts">--</span>
                 </div>
                 <div class="panel-timing-item">
+                    <span>1st audio</span>
+                    <span class="panel-timing-value" id="timing-ttfb">--</span>
+                </div>
+                <div class="panel-timing-item">
                     <span>Total</span>
                     <span class="panel-timing-value" id="timing-total">--</span>
                 </div>
             </div>
         </div>
+
+        <!-- Pending Memories Panel (slides in from right) -->
+        <aside class="memory-panel" id="memory-panel">
+            <div class="memory-panel-header">
+                <h3>Memory</h3>
+                <div class="memory-panel-actions">
+                    <button class="btn-icon" id="btn-memory-refresh" title="Refresh">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                    </button>
+                    <button class="btn-icon" id="btn-memory-close" title="Close">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    </button>
+                </div>
+            </div>
+            <div class="memory-tabs" role="tablist">
+                <button class="memory-tab active" id="memory-tab-remembered" data-view="remembered" role="tab">What I remember</button>
+                <button class="memory-tab" id="memory-tab-pending" data-view="pending" role="tab">To confirm<span class="memory-pending-badge" id="memory-pending-count"></span></button>
+            </div>
+            <div class="memory-panel-list" id="memory-remembered-list">
+                <!-- Remembered profile rendered here by memory.js -->
+            </div>
+            <div class="memory-panel-list" id="memory-pending-list" style="display:none">
+                <!-- Pending candidates rendered here by memory.js -->
+            </div>
+        </aside>
 
         <!-- Dev Mode Sidebar -->
         <aside class="dev-sidebar" id="dev-sidebar">
@@ -139,17 +211,17 @@
                 <div class="dev-section">
                     <div class="dev-section-title">Agent Models</div>
                     <div class="dev-field">
-                        <label for="dev-main-agent-model">Main Orchestrator</label>
+                        <label for="dev-main-agent-model">Main Assistant</label>
                         <select id="dev-main-agent-model"></select>
                     </div>
                     <div class="dev-field">
-                        <label for="dev-email-agent-model">Email Agent</label>
+                        <label for="dev-email-agent-model">Email Specialist</label>
                         <select id="dev-email-agent-model"></select>
                     </div>
-                    <div class="dev-field">
-                        <label for="dev-dream-agent-model">Dream Pass Reviewer</label>
-                        <select id="dev-dream-agent-model"></select>
-                    </div>
+                </div>
+                <div class="dev-section">
+                    <div class="dev-section-title">All Agents (Runtime)</div>
+                    <div id="dev-agents-list" class="dev-agents-list"></div>
                 </div>
                 <div class="dev-section">
                     <div class="dev-section-title">Model Fallbacks</div>

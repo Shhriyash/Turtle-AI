@@ -1,0 +1,47 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    env:
+      # Dummy keys so module imports succeed offline; no test hits a live API.
+      GROQ_API_KEY: ci-dummy
+      GEMINI_API_KEY: ci-dummy
+      OPEN_ROUTER_API_KEY_1: ci-dummy
+      COHERE_API_KEY: ci-dummy
+      TAVILY_API_KEY: ci-dummy
+      DEEPGRAM_API_KEY: ci-dummy
+      AUTH_SECRET_KEY: ci-dummy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install system libraries
+        # pyaudio builds a C extension against PortAudio; ubuntu-latest ships
+        # neither the headers (portaudio.h) nor the lib, so its wheel build
+        # fails and aborts `pip install` before any test runs. pyaudio is used
+        # only by the standalone VAD/TTS scripts (rtc_vad/, tools/tts/),
+        # not by the app or the test suite — but it's pinned in requirements.txt,
+        # so the install must be able to build it.
+        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
+
+      - name: Install dependencies
+        # pytest is a test-only dependency, deliberately not in requirements.txt
+        # (the app doesn't need it at runtime). Install it here so the suite can
+        # run. Pinned to match local dev.
+        run: |
+          pip install -r requirements.txt
+          pip install pytest==9.0.3
+
+      - name: Run test suite
+        # Phase 2 W5 made test/evals genuinely offline — no ignore needed.
+        # Boot smoke (app imports + /healthz + /api/config + /) rides the suite
+        # via test/smoke_boot_test.py, so no separate CI boot job is needed.
+        run: python -m pytest test -q

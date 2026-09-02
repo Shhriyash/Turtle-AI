@@ -1,0 +1,274 @@
+"""
+Phase 9 — the two race findings from the Codex verification pass.
+
+  [medium] Two-target race: two authenticated redeemers with different target
+    user_ids both passed peek, both merged the source into their own account,
+    then last-writer-wins the mapping — memory disclosed into two accounts,
+    "single-use" was a lie because the loser observed mark_consumed=False and
+    the endpoint only logged it and still returned 200.
+
+  [medium] Detached writers escape the source lock: per-turn extraction and
+    reflector run as background tasks that continue writing through the old
+    source SharedState after the handler releases the lock; a redemption can
+    snapshot / merge / repoint / release and the delayed task then appends to
+    the now-unreachable source journal, stranding those writes with no retry.
+"""
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+import core.account_linking as al
+
+
+# ── two-target reservation is atomic ─────────────────────────────────────────
+
+def test_reserve_blocks_a_different_target(tmp_path):
+    store = al.LinkCodeStore(tmp_path / "users.sqlite")
+    code = store.issue(channel="discord", channel_user_id="759", source_user_id="usr_src").code
+
+    status_a, claim_a = store.reserve(code, "usr_target_A")
+    assert status_a == "ok" and claim_a is not None
+
+    # A different target hitting the same live code MUST be rejected — this is
+    # what closed the race Codex found (two 200s, memory into two accounts).
+    status_b, claim_b = store.reserve(code, "usr_target_B")
+    assert status_b == "locked"
+    assert claim_b is None
+
+
+def test_reserve_same_target_is_idempotent(tmp_path):
+    """The same target retrying inside the reservation window MUST get through
+    (transient failure retry), not be locked out by its own prior reservation."""
+    store = al.LinkCodeStore(tmp_path / "users.sqlite")
+    code = store.issue(channel="discord", channel_user_id="759", source_user_id="usr_src").code
+
+    assert store.reserve(code, "usr_A")[0] == "ok"
+    assert store.reserve(code, "usr_A")[0] == "ok"
+    assert store.reserve(code, "usr_A")[0] == "ok"
+
+
+def test_release_reservation_unblocks_retry(tmp_path):
+    """Merge failure releases the reservation eagerly so a different target
+    could redeem after a real failure (this MOSTLY exists for the same target's
+    fast retry; blocking a different target here would strand a legitimate
+    re-issue). Retention still holds until TTL if we don't release."""
+    store = al.LinkCodeStore(tmp_path / "users.sqlite")
+    code = store.issue(channel="discord", channel_user_id="759", source_user_id="usr_src").code
+
+    store.reserve(code, "usr_A")
+    store.release_reservation(code, "usr_A")
+    # After release, a different target CAN reserve — the merge for target A
+    # already failed and rolled back, so this is a normal race window not a leak.
+    assert store.reserve(code, "usr_B")[0] == "ok"
+
+
+def test_only_the_holder_can_release(tmp_path):
+    """release_reservation is target-scoped; a stranger can't drop someone
+    else's lock. Otherwise an attacker could park a release call and race in."""
+    store = al.LinkCodeStore(tmp_path / "users.sqlite")
+    code = store.issue(channel="discord", channel_user_id="759", source_user_id="usr_src").code
+    store.reserve(code, "usr_A")
+
+    store.release_reservation(code, "usr_evil")  # no-op — doesn't hold it
+    assert store.reserve(code, "usr_B")[0] == "locked"
+
+
+def test_reserve_expires_after_ttl(tmp_path, monkeypatch):
+    """A crashed redeemer's stale reservation ages out so a different target
+    can eventually redeem (e.g. after the source user reissues a code)."""
+    from datetime import UTC, datetime, timedelta
+
+    store = al.LinkCodeStore(tmp_path / "users.sqlite")
+    code = store.issue(channel="discord", channel_user_id="759", source_user_id="usr_src").code
+    store.reserve(code, "usr_A")
+
+    later = datetime.now(UTC) + timedelta(seconds=al.RESERVATION_TTL_SECONDS + 2)
+    monkeypatch.setattr(al, "_utc_now", lambda: later)
+    assert store.reserve(code, "usr_B")[0] == "ok"
+
+
+def test_reserve_rejects_invalid_and_consumed(tmp_path):
+    store = al.LinkCodeStore(tmp_path / "users.sqlite")
+    assert store.reserve("NOPE", "usr_A")[0] == "invalid"
+    assert store.reserve("", "usr_A")[0] == "invalid"
+
+    code = store.issue(channel="discord", channel_user_id="759", source_user_id="usr_src").code
+    assert store.reserve(code, "usr_A")[0] == "ok"
+    al.mark_consumed(store, code)
+    assert store.reserve(code, "usr_A")[0] == "invalid"
+    assert store.reserve(code, "usr_B")[0] == "invalid"
+
+
+# ── drain-user-tasks awaits in-flight writers ────────────────────────────────
+
+def test_drain_user_tasks_waits_for_tagged_tasks():
+    """Tasks tagged for a user must finish before drain returns."""
+    from core.worker import drain_user_tasks, track_task
+
+    finished: list[str] = []
+
+    async def slow_writer(marker: str, delay: float = 0.05):
+        await asyncio.sleep(delay)
+        finished.append(marker)
+
+    async def run():
+        t1 = asyncio.create_task(slow_writer("A1"))
+        t2 = asyncio.create_task(slow_writer("A2"))
+        t_other = asyncio.create_task(slow_writer("B1"))
+        track_task(t1, user_id="usr_A")
+        track_task(t2, user_id="usr_A")
+        track_task(t_other, user_id="usr_B")
+
+        awaited = await drain_user_tasks("usr_A", timeout=2.0)
+        # both A tasks must have completed before drain returned
+        assert "A1" in finished and "A2" in finished
+        assert awaited == 2
+        # B was not awaited — let it finish so the loop exits cleanly
+        await t_other
+
+    asyncio.run(run())
+
+
+def test_drain_user_tasks_is_bounded():
+    """A hung task must not stall linking indefinitely — timeout is honoured."""
+    from core.worker import drain_user_tasks, track_task
+    import time
+
+    async def hung():
+        await asyncio.sleep(3.0)
+
+    async def run():
+        t = asyncio.create_task(hung())
+        track_task(t, user_id="usr_hung")
+        t0 = time.perf_counter()
+        awaited = await drain_user_tasks("usr_hung", timeout=0.2)
+        elapsed = time.perf_counter() - t0
+        # returned early via TimeoutError inside gather; still reported the count
+        assert awaited == 1
+        assert elapsed < 1.0, f"drain waited {elapsed:.2f}s past its timeout"
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+
+
+def test_drain_untagged_users_is_a_noop():
+    """A user with zero tracked tasks returns 0 immediately."""
+    from core.worker import drain_user_tasks
+    assert asyncio.run(drain_user_tasks("usr_never_seen")) == 0
+
+
+# ── writer paths I missed on the first drain-writers pass ────────────────────
+
+def test_worker_queue_enqueue_tags_jobs_with_user_id():
+    """queue_service.enqueue jobs (embed_personal_memory etc.) carry user_id
+    in their payload — the enqueue wrapper must pick it up so drain_user_tasks
+    catches the ACTUAL work coroutine, not just the outer enqueue call."""
+    from core.worker import LocalWorkerQueue, _TASKS_BY_USER, task
+
+    finished: list[str] = []
+
+    @task("__test_per_user_job")
+    async def _job(user_id: str, marker: str):
+        await asyncio.sleep(0.02)
+        finished.append(marker)
+
+    async def run():
+        q = LocalWorkerQueue()
+        # release the semaphore for this test
+        import core.worker as w
+        w._job_semaphore = None
+        await q.enqueue("__test_per_user_job", user_id="usr_A", marker="A")
+        # tags immediately, before the job body runs
+        assert "usr_A" in _TASKS_BY_USER, "enqueued job was not tagged by user_id"
+        # drain waits for the body
+        from core.worker import drain_user_tasks
+        awaited = await drain_user_tasks("usr_A", timeout=2.0)
+        assert awaited == 1
+        assert "A" in finished
+
+    asyncio.run(run())
+    from core.worker import _REGISTRY
+    _REGISTRY.pop("__test_per_user_job", None)
+
+
+def test_personal_memory_store_write_tags_embed_by_user(tmp_path, monkeypatch):
+    """write_topic spawns an embed job; the outer create_task AND the inner
+    _wrapper both need the user_id tag so a linking drain awaits them."""
+    import core.paths as core_paths
+
+    monkeypatch.setattr(core_paths, "PERSONAL_MEMORY_DIR", tmp_path, raising=False)
+    from core.personal_memory_store import PersonalMemoryStore
+    from core.worker import _TASKS_BY_USER, task
+
+    saw: list[str] = []
+
+    @task("embed_personal_memory")
+    async def _fake_embed(user_id: str, topic_name: str, lines):
+        saw.append(user_id)
+        await asyncio.sleep(0.02)
+
+    async def run():
+        import core.worker as w
+        w._job_semaphore = None
+        store = PersonalMemoryStore(user_id="usr_embed")
+        store.write_topic("identity", ["- Name: Grace"], {"title": "Identity"})
+        # the OUTER create_task must be tagged (it's what track_task sees)
+        assert "usr_embed" in _TASKS_BY_USER, "embed enqueue wasn't user-tagged"
+        from core.worker import drain_user_tasks
+        awaited = await drain_user_tasks("usr_embed", timeout=2.0)
+        assert awaited >= 1 and "usr_embed" in saw
+
+    asyncio.run(run())
+    from core.worker import _REGISTRY
+    # restore the real handler if it was there
+    _REGISTRY.pop("embed_personal_memory", None)
+    try:
+        import core.background_tasks  # re-registers the real one
+        # importing already ran the decorator, but reimport just to be sure
+    except Exception:
+        pass
+
+
+# ── channel dispatch re-resolves under the lock after a link redemption ──────
+
+def test_dispatch_re_resolves_user_id_inside_the_lock(tmp_path, monkeypatch):
+    """A queued channel turn that resolved user_id BEFORE a link redemption
+    must, on the other side of the lock, pick up the NEW target user_id — not
+    run under the stale source id and strand its post-turn writes into a
+    now-unreachable journal."""
+    import apps.turtle_server as ts
+    from apps.channels import TurtleEvent
+    from core.identity import IdentityManager
+
+    db = tmp_path / "users.sqlite"
+    mgr = IdentityManager(db_path=db)
+    monkeypatch.setattr("core.identity.identity_manager", mgr, raising=False)
+
+    async def scenario():
+        await mgr.init_db()
+        source = await mgr.resolve_user("discord", "759")
+        target = await mgr.resolve_user("web_email", "me@example.com")
+
+        # A link redemption just re-pointed the discord id.
+        await mgr.link_channel(user_id=target, channel="discord", channel_user_id="759")
+
+        # A queued dispatch was assembled with the STALE source user_id.
+        stale_event = TurtleEvent(
+            user_id=source, channel="discord", modality="text",
+            content="hi", message_id="m", thread_id="t",
+            channel_user_id="759",
+        )
+
+        # Simulate ONLY the re-resolve block from _channel_dispatch_handler.
+        chan_uid = stale_event.channel_user_id
+        resolved = await mgr.resolve_user(stale_event.channel, chan_uid)
+        assert resolved == target, "re-resolve must return the NEW target user_id"
+        assert resolved != stale_event.user_id, "would have run under stale source"
+
+    asyncio.run(scenario())

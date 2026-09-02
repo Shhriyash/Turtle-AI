@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Start with Turtle</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f1115;
+      --panel: #181b22;
+      --fg: #e8eaf0;
+      --muted: #8a93a6;
+      --accent: #4fd1c5;
+      --accent-fg: #08221f;
+      --border: #262a33;
+      --error: #ff7373;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      width: 100%;
+      max-width: 420px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 32px 28px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+    }
+    h1 { margin: 0 0 6px; font-size: 22px; }
+    p.lede { margin: 0 0 24px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    input[type="text"], input[type="email"] {
+      width: 100%;
+      padding: 11px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #0f1115;
+      color: var(--fg);
+      font-size: 15px;
+      margin-bottom: 16px;
+      outline: none;
+    }
+    input:focus { border-color: var(--accent); }
+    button {
+      width: 100%;
+      padding: 12px;
+      border-radius: 8px;
+      border: none;
+      background: var(--accent);
+      color: var(--accent-fg);
+      font-weight: 600;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .status { margin-top: 16px; font-size: 14px; min-height: 20px; }
+    .status.ok { color: var(--accent); }
+    .status.err { color: var(--error); }
+    .sent {
+      text-align: center;
+      padding: 8px 0;
+    }
+    .sent h2 { margin: 0 0 8px; font-size: 18px; }
+    .sent p { color: var(--muted); font-size: 14px; line-height: 1.5; margin: 0; }
+  </style>
+</head>
+<body>
+  <div class="card" id="card">
+    <div id="form-view">
+      <h1>Start with Turtle</h1>
+      <p class="lede">Enter your email and name. We'll send you a link to begin — no password.</p>
+      <form id="onboarding-form" autocomplete="on">
+        <label for="name">Name</label>
+        <input id="name" name="name" type="text" required autocomplete="name" />
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" required autocomplete="email" />
+        <button type="submit" id="submit-btn">Send me a link to start</button>
+        <div class="status" id="status"></div>
+      </form>
+    </div>
+    <div id="sent-view" class="sent" style="display:none;">
+      <h2>Check your inbox</h2>
+      <p>We sent a link to <span id="sent-email"></span>. It expires in 15 minutes.</p>
+    </div>
+  </div>
+  <script>
+    const form = document.getElementById("onboarding-form");
+    const status = document.getElementById("status");
+    const submitBtn = document.getElementById("submit-btn");
+    const formView = document.getElementById("form-view");
+    const sentView = document.getElementById("sent-view");
+    const sentEmail = document.getElementById("sent-email");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      status.textContent = "";
+      status.className = "status";
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Sending…";
+      try {
+        const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+        const res = await fetch("/onboarding/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email: document.getElementById("email").value.trim(),
+            name: document.getElementById("name").value.trim(),
+            timezone,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || data.error || `Request failed (${res.status})`);
+        }
+        sentEmail.textContent = document.getElementById("email").value.trim();
+        formView.style.display = "none";
+        sentView.style.display = "block";
+      } catch (err) {
+        status.textContent = err.message || "Something went wrong. Try again.";
+        status.className = "status err";
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Send me a link to start";
+      }
+    });
+  </script>
+</body>
+</html>

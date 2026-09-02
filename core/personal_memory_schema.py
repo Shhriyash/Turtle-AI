@@ -12,8 +12,14 @@ ALLOWED_MEMORY_TYPES = frozenset(
         "contact",
         "project",
         "correction",
+        "relation",
         "index",
         "log",
+        # Style topics project under their journal names (no singular alias).
+        "working_style",
+        "communication_style",
+        "tool_preferences",
+        "decision_style",
     }
 )
 ALLOWED_CONFIDENCE_LEVELS = frozenset({"confirmed", "inferred", "weak_signal"})
@@ -26,6 +32,7 @@ ALLOWED_METADATA_FIELDS = frozenset(
         "confidence",
         "updated_at",
         "last_confirmed_at",
+        "source",
         "source_session_id",
         "version",
         "tags",

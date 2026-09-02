@@ -5,8 +5,10 @@
 import AppState from './state.js';
 import { setStatus, showBanner, hideBanner, showToast } from './utils.js';
 import { addMessage, showThinking, hideThinking, setBubbleState } from './chat.js';
-import { playAudioBlob } from './voice.js';
+import { playAudioBlob, handleServerInterrupt } from './voice.js';
 import { updateTimings } from './devmode.js';
+import { renderConfirmationPrompt } from './memory.js';
+import { showHeard, clearHeard } from './ambient.js';
 
 /** Connect (or reconnect) to the WebSocket server */
 export function connectWebSocket() {
@@ -30,7 +32,7 @@ export function connectWebSocket() {
     AppState.ws.onclose = () => {
         AppState.isConnected = false;
         setStatus('disconnected', 'Disconnected');
-        setBubbleState('idle');
+        setBubbleState('disconnected');
         showBanner();
     };
 
@@ -58,23 +60,51 @@ function handleServerMessage(msg) {
         case 'status':
             handleStatusMessage(msg);
             break;
+        case 'transcription_partial':
+            // Live interim transcript from streaming STT — show it as the
+            // thinking caption while the user is still speaking, and echo it
+            // under the orb so the user sees themselves being heard.
+            if (msg.text) { showThinking(msg.text); showHeard(msg.text, 'heard'); }
+            break;
         case 'transcription':
             addMessage('user', msg.text);
+            if (msg.text) showHeard(msg.text, 'heard');
             break;
         case 'done':
             hideThinking();
             addMessage('assistant', msg.content);
             setStatus('ready', 'Ready');
             setBubbleState('idle');
+            if (msg.content) { showHeard(msg.content, 'spoken'); clearHeard(6000); }
             break;
         case 'timing':
             updateTimings(msg);
             break;
+        case 'interrupted':
+            // Server cancelled the reply (barge-in or explicit interrupt).
+            handleServerInterrupt();
+            break;
+        case 'confirmation_prompt':
+            // Server queued an uncertain memory fact behind the gate.
+            // Surface it as an inline card the user can confirm/dismiss.
+            renderConfirmationPrompt(msg);
+            break;
         case 'error':
             hideThinking();
             setStatus('ready', 'Ready');
-            setBubbleState('idle');
+            setBubbleState('error');
             showToast(msg.message, true);
+            setTimeout(() => setBubbleState('idle'), 2400);
+            break;
+        case 'notice':
+            // Non-fatal server notice (e.g. storage_cap: memory writes are
+            // failing). Surface as an error-styled toast so the user knows.
+            showToast(msg.message, true);
+            break;
+        case 'routine':
+            // A scheduled routine fired (Phase 5 / W2). Informational, not an
+            // error — showToast without the error flag = accent-styled toast.
+            showToast(msg.message);
             break;
         case 'pong':
             break;
@@ -88,12 +118,19 @@ function handleStatusMessage(msg) {
         ready:        'Ready',
         thinking:     'Thinking',
         transcribing: 'Transcribing',
+        listening:    'Listening',
         speaking:     'Speaking',
         restored:     'Session restored',
     };
 
+    // The ready frame advertises whether the server has streaming STT enabled.
+    if (msg.status === 'ready') {
+        AppState.streamSttEnabled = !!msg.stream_stt;
+    }
+
+    // 'listening' is a streaming-STT state; map its bubble to the recording look.
     setStatus(msg.status, labelMap[msg.status] || msg.status);
-    setBubbleState(msg.status);
+    setBubbleState(msg.status === 'listening' ? 'listening' : msg.status);
 
     if (msg.status === 'thinking') {
         showThinking('Thinking');

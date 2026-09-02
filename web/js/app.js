@@ -7,9 +7,11 @@
 
 import AppState from './state.js';
 import { connectWebSocket, startConnectionWatchdog } from './websocket.js';
-import { sendMessage, handleInputKey, setupInputAutosize, closeResponsePanel } from './chat.js';
-import { startRecording, stopRecording, refreshVoiceButtonUi } from './voice.js';
+import { sendMessage, handleInputKey, setupInputAutosize, closeResponsePanel, toggleResponsePanel, updateChatToggleUi } from './chat.js';
+import { startRecording, stopRecording, refreshVoiceButtonUi, interruptReply } from './voice.js';
 import { toggleDevPanel, applyDevConfig, resetDevDefaults } from './devmode.js';
+import { initMemoryUI } from './memory.js';
+import { initAmbient } from './ambient.js';
 
 function isTypingTarget(target) {
     const el = target;
@@ -56,6 +58,7 @@ function initDOM() {
     AppState.dom.panelThinking    = document.getElementById('panel-thinking');
     AppState.dom.panelThinkingLabel = document.getElementById('panel-thinking-label');
     AppState.dom.panelTiming      = document.getElementById('panel-timing');
+    AppState.dom.btnChatToggle    = document.getElementById('btn-chat-toggle');
 }
 
 /** Wire up all event listeners */
@@ -112,6 +115,16 @@ function initEvents() {
     });
 
     // Hold SPACE to record in PTT mode (like CLI option 1)
+    // Escape interrupts the agent mid-reply (works in any voice mode).
+    window.addEventListener('keydown', (e) => {
+        if (e.code !== 'Escape') return;
+        if (isTypingTarget(e.target)) return;
+        if (AppState.isTtsPlaying || (AppState.ttsSources && AppState.ttsSources.length)) {
+            e.preventDefault();
+            interruptReply();
+        }
+    });
+
     window.addEventListener('keydown', async (e) => {
         if (AppState.voiceMode !== 'ptt') return;
         if (e.code !== 'Space' || e.repeat) return;
@@ -188,6 +201,8 @@ function initEvents() {
 
     // Response panel close button
     document.getElementById('btn-panel-close')?.addEventListener('click', closeResponsePanel);
+    AppState.dom.btnChatToggle?.addEventListener('click', toggleResponsePanel);
+    updateChatToggleUi();
 
     // Input autosize
     setupInputAutosize();
@@ -196,7 +211,9 @@ function initEvents() {
 /** Boot the application */
 function init() {
     initDOM();
+    initAmbient();
     initEvents();
+    initMemoryUI();
     updateVoiceModeUi();
     connectWebSocket();
     startConnectionWatchdog();

@@ -7,41 +7,18 @@
 
 import AppState from './state.js';
 import { escapeHtml, scrollToBottom } from './utils.js';
+import { setAmbientState } from './ambient.js';
 
 // ── Bubble state management ──────────────────────────────────
 
-/** Set the bubble to a named visual state */
+/**
+ * Set the bubble to a named visual state.
+ *
+ * The ambient state machine owns every visual layer now; this stays
+ * as the app-wide entry point so existing call sites are unchanged.
+ */
 export function setBubbleState(state) {
-    const { bubbleOrb, bubbleGlow, bubbleStatus } = AppState.dom;
-    if (!bubbleOrb) return;
-
-    // Clear all state classes
-    bubbleOrb.classList.remove('listening', 'thinking', 'speaking');
-    bubbleGlow.classList.remove('active');
-
-    const labels = {
-        idle:         'Ready',
-        listening:    'Listening',
-        recording:    'Listening',
-        transcribing: 'Transcribing',
-        thinking:     'Thinking',
-        speaking:     'Speaking',
-        ready:        'Ready',
-    };
-
-    bubbleStatus.textContent = labels[state] || 'Ready';
-    bubbleStatus.classList.toggle('active', state !== 'idle' && state !== 'ready');
-
-    if (state === 'listening' || state === 'recording') {
-        bubbleOrb.classList.add('listening');
-        bubbleGlow.classList.add('active');
-    } else if (state === 'thinking' || state === 'transcribing') {
-        bubbleOrb.classList.add('thinking');
-        bubbleGlow.classList.add('active');
-    } else if (state === 'speaking') {
-        bubbleOrb.classList.add('speaking');
-        bubbleGlow.classList.add('active');
-    }
+    setAmbientState(state);
 }
 
 // ── Thinking indicator in the panel ──────────────────────────
@@ -67,11 +44,32 @@ export function openResponsePanel() {
     if (AppState.responsePanelOpen) return;
     AppState.responsePanelOpen = true;
     AppState.dom.responsePanel.classList.add('open');
+    updateChatToggleUi();
 }
 
 export function closeResponsePanel() {
     AppState.responsePanelOpen = false;
     AppState.dom.responsePanel.classList.remove('open');
+    updateChatToggleUi();
+}
+
+/** Toggle the response panel — lets the user reopen a closed chat to review it. */
+export function toggleResponsePanel() {
+    if (AppState.responsePanelOpen) {
+        closeResponsePanel();
+    } else {
+        openResponsePanel();
+        scrollPanelToBottom();
+    }
+    updateChatToggleUi();
+}
+
+/** Reflect panel state on the floating toggle (hide it while the panel is open). */
+export function updateChatToggleUi() {
+    const btn = AppState.dom.btnChatToggle;
+    if (!btn) return;
+    btn.classList.toggle('hidden', AppState.responsePanelOpen);
+    btn.setAttribute('aria-pressed', AppState.responsePanelOpen ? 'true' : 'false');
 }
 
 function scrollPanelToBottom() {
@@ -119,9 +117,17 @@ export function formatMessage(text) {
     // Code blocks
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    
+    // Markdown Links
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+
+    // Raw URLs (using negative lookbehind to avoid replacing URLs inside href attributes)
+    html = html.replace(/(?<!href=")(https?:\/\/[^\s<]+[^<.,:;"')\]\s])/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+
     // Bold / Italic
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    
     // Paragraphs
     html = html.split('\n\n').map(p => `<p>${p}</p>`).join('');
     html = html.replace(/\n/g, '<br>');

@@ -1,233 +1,330 @@
 /* ================================================================
-   BUBBLE — Central wobbling orb with neon glow (Shazam-style)
+   BUBBLE — Ambient core orb, ring systems, waveform, captions
+
+   Ported from the "Turtle Ambient States" canvas. One small solid
+   core breathes at the centre; the *rings around it* carry state:
+
+     idle/ready   concentric ambient rings, slow drift
+     listening    organic blobs collapsing inward  (tIn)
+     transcribing tight static rings, core shrinks
+     thinking     orbiting satellites, core dims
+     speaking     organic blobs expanding outward  (tOut)
+
+   State is driven by a single [data-state] attribute on
+   .bubble-container, so every layer reads from one source.
    ================================================================ */
 
-/* Container centers the bubble in the available space */
 .bubble-container {
     flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 24px;
+    gap: 0;
     position: relative;
     z-index: 1;
+    padding-bottom: 8px;
 }
 
-/* Outer glow rings — concentric pulses when active */
+/* ── Greeting ─────────────────────────────────────────────── */
+.bubble-greeting {
+    min-height: 46px;
+    display: flex;
+    align-items: center;
+    font-family: var(--font-serif);
+    font-size: 39px;
+    line-height: 1;
+    letter-spacing: -0.015em;
+    color: rgba(232, 234, 236, 0.93);
+    opacity: 1;
+    transition: opacity 0.5s var(--ease-out);
+}
+
+/* The greeting is an idle-only affordance. */
+.bubble-container:not([data-state="idle"]) .bubble-greeting {
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* ── Ring stage ───────────────────────────────────────────── */
 .bubble-glow {
     position: relative;
-    width: 220px;
-    height: 220px;
+    width: 340px;
+    height: 300px;
     display: flex;
     align-items: center;
     justify-content: center;
+    margin-top: 14px;
 }
 
-.bubble-glow::before,
-.bubble-glow::after {
-    content: '';
+.ring {
     position: absolute;
     border-radius: 50%;
     opacity: 0;
-    transition: opacity 0.6s ease;
+    pointer-events: none;
+    transition: opacity 0.55s var(--ease-out);
 }
 
-.bubble-glow::before {
-    width: 280px;
-    height: 280px;
-    border: 1.5px solid rgba(34, 211, 238, 0.15);
+/* Ambient — three concentric rings, present at rest */
+.ring-ambient { border: 1px solid; }
+.ring-ambient.r1 { width: 270px; height: 270px; border-color: oklch(0.74 0.095 165 / 0.16); animation: tRing 15s ease-in-out infinite; }
+.ring-ambient.r2 { width: 198px; height: 198px; border-color: oklch(0.74 0.095 165 / 0.22); animation: tRing 13s ease-in-out infinite 0.6s; }
+.ring-ambient.r3 { width: 132px; height: 132px; border-color: oklch(0.74 0.095 165 / 0.30); animation: tRing 11s ease-in-out infinite 1.2s; }
+
+/* Blob rings — organic, used for inbound (listening) and outbound (speaking) */
+.ring-blob {
+    width: 286px;
+    height: 286px;
+    border-radius: 48% 52% 55% 45% / 52% 48% 52% 48%;
+    border: 1px solid oklch(0.74 0.095 165 / 0.5);
+    animation-fill-mode: both;
+}
+.ring-blob.b2 { border-color: oklch(0.74 0.095 165 / 0.45); }
+.ring-blob.b3 { border-color: oklch(0.74 0.095 250 / 0.34); }
+
+/* Tight rings — the captured/transcribing beat */
+.ring-tight.t1 { width: 126px; height: 126px; border: 1px solid oklch(0.74 0.095 165 / 0.5); }
+.ring-tight.t2 { width: 96px;  height: 96px;  border: 1px solid oklch(0.74 0.095 165 / 0.34); }
+
+/* Orbiting satellites — thinking */
+.ring-orbit {
+    width: 118px;
+    height: 118px;
+    border: none;
+}
+.ring-orbit span {
+    position: absolute;
+    border-radius: 50%;
+}
+.ring-orbit span:nth-child(1) {
+    top: -3px; left: 50%;
+    width: 5px; height: 5px;
+    background: oklch(0.74 0.095 165 / 0.8);
+}
+.ring-orbit span:nth-child(2) {
+    bottom: -3px; left: 50%;
+    width: 4px; height: 4px;
+    background: oklch(0.74 0.095 250 / 0.7);
 }
 
-.bubble-glow::after {
-    width: 340px;
-    height: 340px;
-    border: 1px solid rgba(167, 139, 250, 0.08);
-}
-
-/* When active (listening/thinking), show glow rings */
-.bubble-glow.active::before {
-    opacity: 1;
-    animation: ring-pulse 2.5s ease-in-out infinite;
-}
-
-.bubble-glow.active::after {
-    opacity: 1;
-    animation: ring-pulse 3s ease-in-out infinite 0.4s;
-}
-
-@keyframes ring-pulse {
-    0%, 100% { transform: scale(1); opacity: 0.5; }
-    50%      { transform: scale(1.08); opacity: 0.15; }
-}
-
-/* The main bubble — organic wobbling shape */
+/* ── The core ─────────────────────────────────────────────── */
 .bubble-orb {
-    width: 200px;
-    height: 200px;
-    border-radius: 60% 40% 30% 70% / 60% 30% 70% 40%;
-    background: radial-gradient(
-        circle at 35% 35%,
-        rgba(34, 211, 238, 0.20) 0%,
-        rgba(167, 139, 250, 0.15) 30%,
-        rgba(10, 14, 23, 0.90) 70%
-    );
-    border: 1.5px solid rgba(34, 211, 238, 0.12);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
     position: relative;
-    animation: wobble-idle 8s ease-in-out infinite;
-    transition: box-shadow 0.6s ease, border-color 0.6s ease;
-    box-shadow:
-        0 0 40px rgba(34, 211, 238, 0.06),
-        inset 0 0 40px rgba(34, 211, 238, 0.03);
+    z-index: 2;
+    width: 62px;
+    height: 62px;
+    border-radius: 50%;
+    overflow: hidden;
+    border: none;
+    background: radial-gradient(circle at 34% 30%,
+        var(--accent-bright) 0%,
+        oklch(0.66 0.10 165) 46%,
+        var(--accent-deep) 100%);
+    box-shadow: 0 0 40px oklch(0.74 0.095 165 / 0.35),
+                0 0 90px oklch(0.74 0.095 165 / 0.14);
+    animation: tBreathe 11s ease-in-out infinite;
+    cursor: pointer;
     user-select: none;
     -webkit-user-select: none;
+    transition: transform 0.6s var(--ease-out), opacity 0.6s var(--ease-out);
 }
 
-/* Idle wobble — very subtle, organic */
-@keyframes wobble-idle {
-    0%   { border-radius: 60% 40% 30% 70% / 60% 30% 70% 40%; }
-    25%  { border-radius: 30% 60% 70% 40% / 50% 60% 30% 60%; }
-    50%  { border-radius: 50% 60% 30% 60% / 30% 40% 70% 60%; }
-    75%  { border-radius: 60% 40% 60% 40% / 70% 30% 50% 60%; }
-    100% { border-radius: 60% 40% 30% 70% / 60% 30% 70% 40%; }
-}
-
-/* Active state — stronger wobble + neon glow */
-.bubble-orb.listening {
-    animation: wobble-active 3s ease-in-out infinite;
-    border-color: rgba(248, 113, 113, 0.35);
-    box-shadow:
-        0 0 60px rgba(248, 113, 113, 0.15),
-        0 0 120px rgba(248, 113, 113, 0.06),
-        inset 0 0 40px rgba(248, 113, 113, 0.05);
-    background: radial-gradient(
-        circle at 35% 35%,
-        rgba(248, 113, 113, 0.18) 0%,
-        rgba(167, 139, 250, 0.12) 30%,
-        rgba(10, 14, 23, 0.90) 70%
-    );
-}
-
-.bubble-orb.thinking {
-    animation: wobble-think 4s ease-in-out infinite;
-    border-color: rgba(34, 211, 238, 0.30);
-    box-shadow:
-        0 0 60px rgba(34, 211, 238, 0.12),
-        0 0 120px rgba(167, 139, 250, 0.06),
-        inset 0 0 40px rgba(34, 211, 238, 0.05);
-    background: radial-gradient(
-        circle at 35% 35%,
-        rgba(34, 211, 238, 0.22) 0%,
-        rgba(167, 139, 250, 0.15) 30%,
-        rgba(10, 14, 23, 0.90) 70%
-    );
-}
-
-.bubble-orb.speaking {
-    animation: wobble-speak 2s ease-in-out infinite;
-    border-color: rgba(52, 211, 153, 0.30);
-    box-shadow:
-        0 0 60px rgba(52, 211, 153, 0.12),
-        0 0 120px rgba(34, 211, 238, 0.06),
-        inset 0 0 40px rgba(52, 211, 153, 0.05);
-}
-
-@keyframes wobble-active {
-    0%   { border-radius: 50% 50% 50% 50% / 50% 50% 50% 50%; transform: scale(1); }
-    15%  { border-radius: 42% 58% 55% 45% / 55% 45% 58% 42%; transform: scale(1.03); }
-    30%  { border-radius: 55% 45% 42% 58% / 42% 58% 45% 55%; transform: scale(0.98); }
-    45%  { border-radius: 48% 52% 58% 42% / 58% 42% 52% 48%; transform: scale(1.02); }
-    60%  { border-radius: 58% 42% 45% 55% / 45% 55% 42% 58%; transform: scale(0.99); }
-    75%  { border-radius: 45% 55% 52% 48% / 52% 48% 55% 45%; transform: scale(1.01); }
-    100% { border-radius: 50% 50% 50% 50% / 50% 50% 50% 50%; transform: scale(1); }
-}
-
-@keyframes wobble-think {
-    0%   { border-radius: 55% 45% 40% 60% / 55% 45% 60% 40%; transform: rotate(0deg); }
-    33%  { border-radius: 40% 60% 55% 45% / 45% 55% 40% 60%; transform: rotate(3deg); }
-    66%  { border-radius: 60% 40% 45% 55% / 60% 40% 55% 45%; transform: rotate(-3deg); }
-    100% { border-radius: 55% 45% 40% 60% / 55% 45% 60% 40%; transform: rotate(0deg); }
-}
-
-@keyframes wobble-speak {
-    0%, 100% { border-radius: 50% 50% 50% 50%; transform: scale(1); }
-    25% { border-radius: 46% 54% 52% 48%; transform: scale(1.02); }
-    50% { border-radius: 54% 46% 48% 52%; transform: scale(0.98); }
-    75% { border-radius: 48% 52% 54% 46%; transform: scale(1.01); }
-}
-
-/* Letter mark inside the bubble */
-.bubble-mark {
-    width: 60px;
-    height: 60px;
-    opacity: 0.8;
-    transition: opacity 0.4s;
+/* Specular sheen drifting across the core */
+.bubble-orb::after {
+    content: '';
+    position: absolute;
+    inset: -30%;
+    background: radial-gradient(circle at 30% 26%,
+        rgba(255, 255, 255, 0.5) 0%, rgba(255, 255, 255, 0) 52%);
+    animation: tSheen 19s ease-in-out infinite;
     pointer-events: none;
+}
+
+/* ── Wordmark + caption ───────────────────────────────────── */
+.bubble-meta {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    margin-top: -18px;
+}
+
+.bubble-wordmark {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.44em;
+    text-indent: 0.44em;
+    color: rgba(232, 234, 236, 0.32);
+}
+
+.bubble-status {
+    min-height: 18px;
+    font-size: 13.5px;
+    color: rgba(232, 234, 236, 0.54);
+    letter-spacing: 0;
+    text-transform: none;
+    transition: color 0.3s var(--ease-out);
+}
+
+.bubble-status.active { color: var(--accent-light); }
+
+/* ── Waveform ─────────────────────────────────────────────── */
+.bubble-wave {
+    min-height: 38px;
     display: flex;
     align-items: center;
     justify-content: center;
-}
-
-.bubble-mark img {
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-    filter: drop-shadow(0 0 8px rgba(34, 211, 238, 0.4));
-}
-
-.bubble-orb.listening .bubble-mark,
-.bubble-orb.thinking .bubble-mark {
-    opacity: 1;
-}
-
-/* Status label beneath the bubble */
-.bubble-status {
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text-muted);
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    transition: color 0.3s;
-}
-
-.bubble-status.active {
-    color: var(--accent);
-}
-
-/* Ambient background particles (subtle depth) */
-.ambient-particle {
-    position: absolute;
-    border-radius: 50%;
-    background: var(--accent);
+    gap: 5px;
+    margin-top: 8px;
     opacity: 0;
-    pointer-events: none;
+    transition: opacity 0.35s var(--ease-out);
 }
 
-.bubble-glow.active .ambient-particle {
-    animation: float-particle 6s ease-in-out infinite;
+.bubble-wave span {
+    width: 2px;
+    border-radius: 2px;
+    background: oklch(0.74 0.095 165 / 0.6);
+    transform: scaleY(0.35);
 }
 
-.ambient-particle:nth-child(1) {
-    width: 3px; height: 3px;
-    top: 15%; left: 20%;
-    animation-delay: 0s;
-}
-.ambient-particle:nth-child(2) {
-    width: 2px; height: 2px;
-    top: 70%; right: 15%;
-    animation-delay: 1.5s;
-}
-.ambient-particle:nth-child(3) {
-    width: 4px; height: 4px;
-    bottom: 20%; left: 35%;
-    animation-delay: 3s;
+/* Eleven bars, irregular heights + offsets so it never reads as a loop */
+.bubble-wave span:nth-child(1)  { height: 14px; background: oklch(0.74 0.095 165 / .50); animation-duration: 1.20s; animation-delay: -0.90s; }
+.bubble-wave span:nth-child(2)  { height: 26px; background: oklch(0.74 0.095 165 / .60); animation-duration: 1.40s; animation-delay: -0.20s; }
+.bubble-wave span:nth-child(3)  { height: 19px; background: oklch(0.74 0.095 165 / .55); animation-duration: 1.10s; animation-delay: -0.60s; }
+.bubble-wave span:nth-child(4)  { height: 34px; background: oklch(0.74 0.095 165 / .75); animation-duration: 1.50s; animation-delay: -1.10s; }
+.bubble-wave span:nth-child(5)  { height: 22px; background: oklch(0.74 0.095 165 / .60); animation-duration: 1.25s; animation-delay: -0.35s; }
+.bubble-wave span:nth-child(6)  { height: 30px; background: oklch(0.74 0.095 165 / .70); animation-duration: 1.35s; animation-delay: -0.75s; }
+.bubble-wave span:nth-child(7)  { height: 16px; background: oklch(0.74 0.095 165 / .50); animation-duration: 1.15s; animation-delay: -0.15s; }
+.bubble-wave span:nth-child(8)  { height: 25px; background: oklch(0.74 0.095 165 / .62); animation-duration: 1.45s; animation-delay: -0.95s; }
+.bubble-wave span:nth-child(9)  { height: 12px; background: oklch(0.74 0.095 165 / .45); animation-duration: 1.30s; animation-delay: -0.50s; }
+.bubble-wave span:nth-child(10) { height: 20px; background: oklch(0.74 0.095 165 / .55); animation-duration: 1.20s; animation-delay: -1.30s; }
+.bubble-wave span:nth-child(11) { height: 9px;  background: oklch(0.74 0.095 165 / .40); animation-duration: 1.50s; animation-delay: -0.25s; }
+
+/* ── Heard / spoken transcript line ───────────────────────── */
+.bubble-heard {
+    min-height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 40px;
+    margin-top: 2px;
+    text-align: center;
+    max-width: 620px;
+    opacity: 0;
+    transition: opacity 0.35s var(--ease-out);
 }
 
-@keyframes float-particle {
-    0%, 100% { opacity: 0; transform: translateY(0); }
-    50%      { opacity: 0.3; transform: translateY(-20px); }
+.bubble-heard.visible { opacity: 1; }
+
+.bubble-heard .heard-text {
+    font-size: 13px;
+    color: rgba(232, 234, 236, 0.34);
+    text-wrap: pretty;
+}
+
+.bubble-heard .spoken-text {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 19px;
+    color: rgba(232, 234, 236, 0.72);
+    text-wrap: pretty;
+}
+
+/* ================================================================
+   STATE MACHINE — every layer reads [data-state]
+   ================================================================ */
+
+/* idle / ready ------------------------------------------------- */
+.bubble-container[data-state="idle"]  .ring-ambient,
+.bubble-container[data-state="ready"] .ring-ambient { opacity: 1; }
+
+/* listening ---------------------------------------------------- */
+.bubble-container[data-state="listening"] .ring-blob.b1 { animation: tIn 2.6s ease-in-out infinite,        tBlob 7.0s ease-in-out infinite; }
+.bubble-container[data-state="listening"] .ring-blob.b2 { animation: tIn 2.6s ease-in-out infinite 0.85s,  tBlob 8.4s ease-in-out infinite 0.4s; }
+.bubble-container[data-state="listening"] .ring-blob.b3 { animation: tIn 2.6s ease-in-out infinite 1.70s,  tBlob 9.6s ease-in-out infinite 0.9s; }
+.bubble-container[data-state="listening"] .bubble-orb   { transform: scale(1.06); }
+.bubble-container[data-state="listening"] .bubble-wave  { opacity: 1; }
+.bubble-container[data-state="listening"] .bubble-wave span { animation-name: tBarIn; animation-timing-function: ease-in-out; animation-iteration-count: infinite; }
+
+/* transcribing ------------------------------------------------- */
+.bubble-container[data-state="transcribing"] .ring-tight { opacity: 1; }
+.bubble-container[data-state="transcribing"] .bubble-orb {
+    transform: scale(0.94);
+    animation-play-state: paused;
+}
+.bubble-container[data-state="transcribing"] .bubble-wave { opacity: 1; }
+.bubble-container[data-state="transcribing"] .bubble-wave span { animation-name: tBarIn; animation-timing-function: ease-in-out; animation-iteration-count: infinite; }
+
+/* thinking ----------------------------------------------------- */
+.bubble-container[data-state="thinking"] .ring-orbit {
+    opacity: 1;
+    animation: tOrbit 5.2s linear infinite;
+}
+.bubble-container[data-state="thinking"] .bubble-orb {
+    transform: scale(0.82);
+    opacity: 0.8;
+}
+
+/* speaking ----------------------------------------------------- */
+.bubble-container[data-state="speaking"] .ring-blob.b1 { animation: tOut 2.9s ease-in-out infinite,       tBlob 7.0s ease-in-out infinite; }
+.bubble-container[data-state="speaking"] .ring-blob.b2 { animation: tOut 2.9s ease-in-out infinite 0.95s, tBlob 8.4s ease-in-out infinite 0.4s; }
+.bubble-container[data-state="speaking"] .ring-blob.b3 { animation: tOut 2.9s ease-in-out infinite 1.90s, tBlob 9.6s ease-in-out infinite 0.9s; }
+.bubble-container[data-state="speaking"] .bubble-orb   { transform: scale(1.06); }
+.bubble-container[data-state="speaking"] .bubble-wave  { opacity: 1; }
+.bubble-container[data-state="speaking"] .bubble-wave span { animation-name: tBarOut; animation-timing-function: ease-in-out; animation-iteration-count: infinite; }
+
+/* error -------------------------------------------------------- */
+.bubble-container[data-state="error"] .ring-ambient { opacity: 0.5; }
+.bubble-container[data-state="error"] .bubble-orb   { animation: tWobble 0.5s ease-in-out 1, tBreathe 11s ease-in-out infinite; }
+
+/* disconnected ------------------------------------------------- */
+.bubble-container[data-state="disconnected"] .ring-ambient { opacity: 0.22; }
+.bubble-container[data-state="disconnected"] .bubble-orb {
+    filter: saturate(0.25);
+    opacity: 0.55;
+}
+
+/* ── Keyframes (canvas-native names) ──────────────────────── */
+@keyframes tBreathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.04); } }
+@keyframes tRing    { 0%, 100% { opacity: 0.16; transform: scale(1); } 50% { opacity: 0.30; transform: scale(1.05); } }
+@keyframes tSheen   { 0% { transform: translate(-8%, -6%); } 50% { transform: translate(9%, 7%); } 100% { transform: translate(-8%, -6%); } }
+@keyframes tOrbit   { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+@keyframes tIn {
+    0%   { opacity: 0.05; transform: scale(1.18) rotate(0deg); }
+    60%  { opacity: 0.42; }
+    100% { opacity: 0;    transform: scale(0.82) rotate(28deg); }
+}
+
+@keyframes tOut {
+    0%   { opacity: 0;    transform: scale(0.80) rotate(0deg); }
+    40%  { opacity: 0.40; }
+    100% { opacity: 0.02; transform: scale(1.22) rotate(-26deg); }
+}
+
+@keyframes tBlob {
+    0%, 100% { border-radius: 48% 52% 55% 45% / 52% 48% 52% 48%; }
+    33%      { border-radius: 56% 44% 46% 54% / 45% 56% 44% 55%; }
+    66%      { border-radius: 44% 56% 52% 48% / 56% 45% 55% 44%; }
+}
+
+@keyframes tBarIn  { 0%, 100% { transform: scaleY(0.35); } 50% { transform: scaleY(1); } }
+@keyframes tBarOut { 0%, 100% { transform: scaleY(1); }    50% { transform: scaleY(0.30); } }
+
+@keyframes tWobble {
+    0%   { transform: translateX(0) rotate(0); }
+    22%  { transform: translateX(-5px) rotate(-2.5deg); }
+    48%  { transform: translateX(4px)  rotate(1.8deg); }
+    74%  { transform: translateX(-2px) rotate(-0.8deg); }
+    100% { transform: translateX(0) rotate(0); }
+}
+
+/* ── Compact viewports ────────────────────────────────────── */
+@media (max-height: 700px) {
+    .bubble-greeting { font-size: 30px; min-height: 34px; }
+    .bubble-glow { width: 280px; height: 240px; }
+    .ring-ambient.r1 { width: 220px; height: 220px; }
+    .ring-ambient.r2 { width: 164px; height: 164px; }
+    .ring-ambient.r3 { width: 112px; height: 112px; }
+    .ring-blob { width: 236px; height: 236px; }
 }

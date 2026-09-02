@@ -7,6 +7,10 @@ from pathlib import Path
 from core.task_history import TaskHistoryStore
 from core.task_history_index import TaskHistoryIndex
 
+# Task history is tenant-scoped: search() requires an owner and fails closed
+# without one (see test/phase9_task_history_tenancy_test.py).
+_TEST_USER = "usr_test"
+
 
 class TaskHistoryIndexTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -26,7 +30,7 @@ class TaskHistoryIndexTests(unittest.TestCase):
         self._seed_jsonl(
             [
                 {
-                    "session_id": "s1",
+                    "user_id": _TEST_USER, "session_id": "s1",
                     "turn_id": "t1",
                     "task_type": "email",
                     "status": "completed",
@@ -36,7 +40,7 @@ class TaskHistoryIndexTests(unittest.TestCase):
                     "outcome": "sent to team",
                 },
                 {
-                    "session_id": "s2",
+                    "user_id": _TEST_USER, "session_id": "s2",
                     "turn_id": "t2",
                     "task_type": "web",
                     "status": "completed",
@@ -47,14 +51,14 @@ class TaskHistoryIndexTests(unittest.TestCase):
                 },
             ]
         )
-        store = TaskHistoryStore(self.history_path)
+        store = TaskHistoryStore(self.history_path, user_id=_TEST_USER)
         sqlite_path = self.history_path.with_suffix(".sqlite")
         self.assertTrue(sqlite_path.exists())
         self.assertEqual(len(store.search("quarterly report")), 1)
         self.assertEqual(store.search("quarterly report")[0]["task_type"], "email")
 
     def test_search_ranking_prefers_stronger_match(self) -> None:
-        store = TaskHistoryStore(self.history_path)
+        store = TaskHistoryStore(self.history_path, user_id=_TEST_USER)
         store.record(
             session_id="s1",
             turn_id="t1",
@@ -78,7 +82,7 @@ class TaskHistoryIndexTests(unittest.TestCase):
         self.assertEqual(results[0]["turn_id"], "t1")
 
     def test_list_by_session_returns_only_session_records(self) -> None:
-        store = TaskHistoryStore(self.history_path)
+        store = TaskHistoryStore(self.history_path, user_id=_TEST_USER)
         store.record(
             session_id="alpha",
             turn_id="t1",
@@ -107,7 +111,7 @@ class TaskHistoryIndexTests(unittest.TestCase):
         self.assertEqual([r["turn_id"] for r in alpha], ["t1", "t3"])
 
     def test_rebuild_is_idempotent(self) -> None:
-        store = TaskHistoryStore(self.history_path)
+        store = TaskHistoryStore(self.history_path, user_id=_TEST_USER)
         store.record(
             session_id="s1",
             turn_id="t1",
@@ -120,7 +124,7 @@ class TaskHistoryIndexTests(unittest.TestCase):
         self.assertEqual(len(store.search("quarterly revenue")), 1)
 
     def test_sqlite_stays_in_sync_with_jsonl_on_init(self) -> None:
-        store = TaskHistoryStore(self.history_path)
+        store = TaskHistoryStore(self.history_path, user_id=_TEST_USER)
         store.record(
             session_id="s1",
             turn_id="t1",
@@ -132,7 +136,7 @@ class TaskHistoryIndexTests(unittest.TestCase):
             file.write(
                 json.dumps(
                     {
-                        "session_id": "s2",
+                        "user_id": _TEST_USER, "session_id": "s2",
                         "turn_id": "t2",
                         "task_type": "web",
                         "status": "completed",
@@ -145,13 +149,13 @@ class TaskHistoryIndexTests(unittest.TestCase):
                 + "\n"
             )
 
-        reopened = TaskHistoryStore(self.history_path)
+        reopened = TaskHistoryStore(self.history_path, user_id=_TEST_USER)
         second_hits = reopened.search("out-of-band")
         self.assertEqual(len(second_hits), 1)
         self.assertEqual(second_hits[0]["turn_id"], "t2")
 
     def test_payload_survives_index_roundtrip(self) -> None:
-        store = TaskHistoryStore(self.history_path)
+        store = TaskHistoryStore(self.history_path, user_id=_TEST_USER)
         store.record(
             session_id="s1",
             turn_id="t1",
@@ -166,7 +170,7 @@ class TaskHistoryIndexTests(unittest.TestCase):
         self.assertEqual(results[0]["payload"]["retries"], 0)
 
     def test_index_direct_search_matches_store(self) -> None:
-        store = TaskHistoryStore(self.history_path)
+        store = TaskHistoryStore(self.history_path, user_id=_TEST_USER)
         store.record(
             session_id="s1",
             turn_id="t1",
@@ -176,7 +180,7 @@ class TaskHistoryIndexTests(unittest.TestCase):
             tool_used="send_email_now",
         )
         index = TaskHistoryIndex(self.history_path.with_suffix(".sqlite"))
-        self.assertEqual(len(index.search("meeting recap")), 1)
+        self.assertEqual(len(index.search("meeting recap", user_id=_TEST_USER)), 1)
         index.close()
 
 

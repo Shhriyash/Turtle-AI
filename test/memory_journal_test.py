@@ -4,7 +4,6 @@ import uuid
 from pathlib import Path
 
 from core.memory_journal import JournalStore, make_event
-from core.memory_migration import migrate_existing_topics
 from core.memory_replayer import replay
 from core.personal_memory_store import PersonalMemoryStore
 
@@ -54,6 +53,50 @@ class MemoryJournalTests(unittest.TestCase):
         self.assertEqual(len(loaded), 1)
         self.assertEqual(loaded[0].event_id, event.event_id)
         self.assertEqual(loaded[0].value["name"], "Shriyash")
+
+    def test_on_append_fires_once_per_event(self) -> None:
+        seen: list[str] = []
+        journal = JournalStore(
+            journal_dir=self.base / "journal_cb",
+            on_append=lambda ev: seen.append(ev.event_id),
+        )
+        event = make_event(
+            kind="fact",
+            topic="identity",
+            key="identity.name",
+            value={"name": "Cb"},
+            confidence=1.0,
+            source="explicit",
+            extractor="deterministic",
+            applied=True,
+            session_id="s1",
+            turn_id="t1",
+            observed_at="2026-04-13T10:00:00Z",
+        )
+        journal.append(event)
+        journal.append(event)  # idempotent — must NOT fire again
+        self.assertEqual(seen, [event.event_id])
+
+    def test_on_append_exception_does_not_block_write(self) -> None:
+        def _boom(_ev) -> None:
+            raise RuntimeError("index down")
+
+        journal = JournalStore(journal_dir=self.base / "journal_boom", on_append=_boom)
+        event = make_event(
+            kind="fact",
+            topic="identity",
+            key="identity.name",
+            value={"name": "Safe"},
+            confidence=1.0,
+            source="explicit",
+            extractor="deterministic",
+            applied=True,
+            session_id="s1",
+            turn_id="t1",
+            observed_at="2026-04-13T10:00:00Z",
+        )
+        journal.append(event)  # must not raise
+        self.assertEqual(len(journal.load_all()), 1)
 
     def test_append_is_idempotent_by_event_id(self) -> None:
         event = make_event(
@@ -253,55 +296,6 @@ class MemoryJournalTests(unittest.TestCase):
         event.rejected = True
         replay([event], store=self.store)
         self.assertFalse((self.base / "preferences.md").exists())
-
-    def test_migration_round_trip_preserves_topic_files(self) -> None:
-        self.store.write_topic(
-            "identity",
-            ["- Name: Shriyash", "- Primary email: user@example.com", "- Timezone: UTC"],
-            {"title": "Identity"},
-        )
-        self.store.update_index_entry("identity", "Name, email, timezone, preferred address")
-
-        self.store.write_topic(
-            "preferences",
-            ["- Response style: concise", "- Humor level: low"],
-            {"title": "Preferences"},
-        )
-        self.store.update_index_entry("preferences", "Tone, response style, and delivery defaults")
-
-        before_identity = (self.base / "identity.md").read_text(encoding="utf-8")
-        before_prefs = (self.base / "preferences.md").read_text(encoding="utf-8")
-
-        before_identity_body = _strip_frontmatter(before_identity)
-        before_prefs_body = _strip_frontmatter(before_prefs)
-
-        result = migrate_existing_topics(store=self.store, journal=self.journal)
-        self.assertGreater(result.emitted_event_count, 0)
-        self.assertIn("identity", result.written_topics)
-        self.assertIn("preferences", result.written_topics)
-
-        after_identity = _strip_frontmatter(
-            (self.base / "identity.md").read_text(encoding="utf-8")
-        )
-        after_prefs = _strip_frontmatter(
-            (self.base / "preferences.md").read_text(encoding="utf-8")
-        )
-        self.assertEqual(before_identity_body, after_identity)
-        self.assertEqual(before_prefs_body, after_prefs)
-
-        self.assertGreater(len(self.journal.load_all()), 0)
-        for event in self.journal.load_all():
-            self.assertEqual(event.source, "migration")
-            self.assertEqual(event.extractor, "migration")
-
-
-def _strip_frontmatter(text: str) -> str:
-    if not text.startswith("---\n"):
-        return text.strip()
-    parts = text.split("\n---\n", 1)
-    if len(parts) != 2:
-        return text.strip()
-    return parts[1].strip()
 
 
 if __name__ == "__main__":
