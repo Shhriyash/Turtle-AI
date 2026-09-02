@@ -80,5 +80,8 @@ def test_evidence_supports_value_requires_grounded_leaf_values():
     assert not _evidence_supports_value({}, {"note": "my name is Shriyash"})
 
 
-def test_turn_extractor_default_model_is_70b():
-    assert settings.personal_memory_turn_extractor_model == "llama-3.3-70b-versatile"
+def test_turn_extractor_default_model_is_pinned():
+    # Groq decommissioned llama-3.3-70b-versatile and it 404d on every turn,
+    # silently swallowed, so core/config.py repointed the default at the
+    # roster model. Assert whatever config actually ships, not the old name.
+    assert settings.personal_memory_turn_extractor_model == "openai/gpt-oss-20b"

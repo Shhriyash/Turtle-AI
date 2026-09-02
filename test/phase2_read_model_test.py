@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -19,6 +20,24 @@ from core.confirmation_gate import ConfirmationGate
 from core.memory_journal import JournalStore, MemoryEvent
 from core.memory_sqlite import MemorySQLiteIndex
 from core.personal_memory_store import PersonalMemoryStore
+
+
+def _ago(hours: float) -> str:
+    """ISO-Z timestamp ``hours`` before now.
+
+    These timestamps must stay inside memory_schema.DECAY_DAYS (30):
+    latest_for_key() and search() drop a decayed row on purpose, so absolute
+    dates here quietly rot the suite once they age past that window, which is
+    what happened to the fixed July dates this replaced. Only the ordering
+    matters to these tests, so anchor it to now.
+    """
+    stamp = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_T_OLD = _ago(2)    # oldest
+_T_MID = _ago(1.5)  # between the two
+_T_NEW = _ago(1)    # newest
 
 
 # The events table exactly as it stood before Phase 2 W3 added the read-model
@@ -56,7 +75,7 @@ def _event(
     source: str = "inferred",
     extractor: str = "llm_turn",
     confidence: float = 0.75,
-    observed_at: str = "2026-07-17T09:00:00Z",
+    observed_at: str = _T_OLD,
     session_id: str = "s1",
     turn_id: str = "t1",
     supersedes: str | None = None,
@@ -200,9 +219,9 @@ def test_backfill_sets_superseded_by_for_tombstones(tmp_path):
 def test_backfill_sets_superseded_by_for_supersedes_chain(tmp_path):
     journal = JournalStore(journal_dir=tmp_path / "j")
     journal.append(_event("a-1", value={"response_style": "verbose"}, applied=True,
-                          observed_at="2026-07-17T09:00:00Z"))
+                          observed_at=_T_OLD))
     journal.append(_event("b-1", value={"response_style": "concise"}, applied=True,
-                          observed_at="2026-07-17T10:00:00Z", supersedes="a-1"))
+                          observed_at=_T_NEW, supersedes="a-1"))
 
     idx = MemorySQLiteIndex(db_path=tmp_path / "m.sqlite")
     idx.backfill_from_journal(journal)
@@ -219,9 +238,9 @@ def test_backfill_sets_superseded_by_for_supersedes_chain(tmp_path):
 def test_latest_for_key_returns_newest_non_superseded(tmp_path):
     journal = JournalStore(journal_dir=tmp_path / "j")
     journal.append(_event("a-1", value={"response_style": "verbose"}, applied=True,
-                          observed_at="2026-07-17T09:00:00Z"))
+                          observed_at=_T_OLD))
     journal.append(_event("b-1", value={"response_style": "concise"}, applied=True,
-                          observed_at="2026-07-17T10:00:00Z", supersedes="a-1"))
+                          observed_at=_T_NEW, supersedes="a-1"))
 
     idx = MemorySQLiteIndex(db_path=tmp_path / "m.sqlite")
     idx.backfill_from_journal(journal)
@@ -246,10 +265,10 @@ def test_latest_for_key_returns_newest_non_superseded(tmp_path):
 def test_events_for_key_scopes_to_topic_key(tmp_path):
     idx = MemorySQLiteIndex(db_path=tmp_path / "m.sqlite")
     idx.index_event(_event("k1", key="preferences.response_style", applied=True,
-                           observed_at="2026-07-17T09:00:00Z"))
+                           observed_at=_T_OLD))
     idx.index_event(_event("k2", key="preferences.response_style",
                            kind="contradiction", value={"rejected": True},
-                           observed_at="2026-07-17T10:00:00Z"))
+                           observed_at=_T_NEW))
     idx.index_event(_event("other", key="preferences.humor_level",
                            value={"humor_level": "low"}, applied=True))
 
@@ -290,7 +309,7 @@ def _run_representative_flow(gate: ConfirmationGate) -> list:
     # Same key, later — must be dropped by the fresh silence window.
     c2 = _event("cand-2", key="preferences.response_style",
                 value={"response_style": "concise"}, turn_id="t2",
-                observed_at="2026-07-17T09:30:00Z")
+                observed_at=_T_MID)
     outcomes.append(("requeue_silenced", gate.queue_candidate(c2)))
 
     # Different key — queues and accepts cleanly.

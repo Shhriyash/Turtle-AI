@@ -27,7 +27,7 @@ jobs:
         # pyaudio builds a C extension against PortAudio; ubuntu-latest ships
         # neither the headers (portaudio.h) nor the lib, so its wheel build
         # fails and aborts `pip install` before any test runs. pyaudio is used
-        # only by the standalone VAD/TTS scripts (backup/, rtc_vad/, tools/tts/),
+        # only by the standalone VAD/TTS scripts (rtc_vad/, tools/tts/),
         # not by the app or the test suite — but it's pinned in requirements.txt,
         # so the install must be able to build it.
         run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
