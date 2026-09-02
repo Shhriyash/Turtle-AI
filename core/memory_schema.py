@@ -43,6 +43,8 @@ class TopicSpec:
 #   2. pin reference_time alongside the fixed dates, as phase0_decay_render_test
 #      does, so the age is fixed forever;
 #   3. build timestamps relative to now, as phase2_read_model_test now does.
+# scripts/pytest_clock_shift.py runs the suite with the clock pushed forward
+# so this rot shows up on demand instead of a month after it is introduced.
 # ---------------------------------------------------------------------------
 DECAY_DAYS = 30
 # Identity facts (name, email, timezone) are load-bearing and never expire.
