@@ -1,4 +1,4 @@
-"""Run the test suite as if it were N days in the future, to surface date rot.
+r"""Run the test suite as if it were N days in the future, to surface date rot.
 
 Why this exists
 ---------------
@@ -41,13 +41,20 @@ false positive. Keeping one clock for everyone is what makes the run clean.
 
 Usage
 -----
-PowerShell (the shell this repo is normally driven from)::
+Run from the repo root. ``-p scripts.pytest_clock_shift`` needs the repo root
+on ``sys.path``, which ``python -m pytest`` provides and the bare ``pytest``
+entry point does not, so keep the ``-m``. No PYTHONPATH needed.
 
-    $env:PYTHONPATH="scripts"; $env:SHIFT_DAYS="400"; pytest test -q -p pytest_clock_shift
+PowerShell::
+
+    $env:SHIFT_DAYS="400"; .\venv\Scripts\python.exe -m pytest test -q -p scripts.pytest_clock_shift
 
 bash/zsh::
 
-    PYTHONPATH=scripts SHIFT_DAYS=400 pytest test -q -p pytest_clock_shift
+    SHIFT_DAYS=400 ./venv/bin/python -m pytest test -q -p scripts.pytest_clock_shift
+
+Use the venv interpreter, not a system one: the suite imports pydantic_ai and
+the rest of requirements.txt.
 
 Run it at +0 first as a control: that must be green, since nothing has moved.
 Then push it out past ``DECAY_DAYS``.
