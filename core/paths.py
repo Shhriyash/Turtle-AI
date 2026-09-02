@@ -1,10 +1,37 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
-DATA_DIR = ROOT_DIR / "data"
+
+def _resolve_data_dir() -> Path:
+    """Where all persistent state lives.
+
+    Mirrors ``TurtleSettings.data_dir`` in core/config.py, including its
+    anchoring rule, so identity (users.sqlite, via settings) and memory
+    (journals and topic files, via these helpers) can never disagree about
+    the location. The two used to disagree: settings honoured TURTLE_DATA_DIR
+    while this module hardcoded the repo root, so pointing the env var at a
+    temp dir moved only half the writers. That is why the test suite kept
+    minting synthetic tenants into production memory (ISSUE-010).
+
+    Resolved at import, not per call, so the value cannot change underneath a
+    running process. Tests set the variable in conftest.py before importing
+    anything from core.
+    """
+    raw = os.environ.get("TURTLE_DATA_DIR", "").strip()
+    if not raw:
+        return ROOT_DIR / "data"
+    path = Path(raw)
+    # A relative override (TURTLE_DATA_DIR=data) would be CWD-relative and
+    # reintroduce the orphaned-memory hazard the absolute default fixes, so
+    # anchor it to the repo root exactly as config.py does.
+    return path if path.is_absolute() else ROOT_DIR / path
+
+
+DATA_DIR = _resolve_data_dir()
 OUTPUT_DIR = ROOT_DIR / "output"
 
 MEMORY_DIR = DATA_DIR / "memory"
