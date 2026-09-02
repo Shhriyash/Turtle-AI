@@ -35,6 +35,14 @@ class TopicSpec:
 # read model (which retrieval actually queries) kept returning it — two
 # contradictory truths injected into the same prompt (brutal review H2). Both
 # projections now import this one predicate so they agree.
+#
+# Writing tests against this: a fixture pinned to an absolute date passes when
+# written and starts failing DECAY_DAYS later, silently. phase2_read_model_test
+# rotted exactly that way. Three patterns are safe, pick one:
+#   1. use a decay-exempt topic/source (see the two frozensets below);
+#   2. pin reference_time alongside the fixed dates, as phase0_decay_render_test
+#      does, so the age is fixed forever;
+#   3. build timestamps relative to now, as phase2_read_model_test now does.
 # ---------------------------------------------------------------------------
 DECAY_DAYS = 30
 # Identity facts (name, email, timezone) are load-bearing and never expire.
