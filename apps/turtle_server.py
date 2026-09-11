@@ -93,11 +93,14 @@ from core.email_flow import (
     merge_email_details,
     missing_email_fields,
     parse_email_extraction_response,
+    resolve_suggested_recipient,
     send_email_now,
+    suggest_recipient_completion,
     validate_recipients,
     validate_send_email_args,
 )
 from core.output_clean import clean_text_for_model, clean_text_for_tts, clean_text_for_display
+from core.channel_gate import ChannelGateBuffer
 from core.confirmation_gate import ConfirmationGate
 from core.guardrails import (
     StorageCapExceededError,
@@ -2043,6 +2046,14 @@ class AgentManager:
             print(f"\nEMAIL: Delegating to email specialist")
             pending_email = ctx.deps.session_store.get_pending_email()
             deterministic = extract_deterministic_email_details(query)
+            # "x@gmail" (no ".com") extracts zero recipients — the strict
+            # regex correctly refuses to guess a TLD. If the user is simply
+            # confirming a completion we proposed last turn ("yes"), use it
+            # now instead of asking them to retype the address.
+            if not deterministic["recipients"]:
+                confirmed_recipient = resolve_suggested_recipient(query, pending_email)
+                if confirmed_recipient:
+                    deterministic["recipients"] = [confirmed_recipient]
             # The email sub-agent runs WITHOUT the main conversation, so a request
             # like "email me the fetched news" would otherwise lose the content it
             # names. Capture the recent conversation + fetched results to hand to
@@ -2112,6 +2123,7 @@ class AgentManager:
                 await ctx.deps.session_store.set_pending_email(
                     recipients=valid_recipients, cc_recipients=valid_cc,
                     bcc_recipients=valid_bcc, subject=merged["subject"], content=merged["content"],
+                    suggested_recipient="",
                 )
                 parts = []
                 if invalid_recipients:
@@ -2159,11 +2171,15 @@ class AgentManager:
 
             missing = missing_email_fields(merged)
             if missing:
+                suggested_recipient = (
+                    suggest_recipient_completion(query) if "recipients" in missing else None
+                )
                 await ctx.deps.session_store.set_pending_email(
                     recipients=merged["recipients"], cc_recipients=merged["cc_recipients"],
                     bcc_recipients=merged["bcc_recipients"], subject=merged["subject"], content=merged["content"],
+                    suggested_recipient=suggested_recipient[1] if suggested_recipient else "",
                 )
-                return clean_text_for_model(format_missing_email_prompt(missing, merged))
+                return clean_text_for_model(format_missing_email_prompt(missing, merged, suggested_recipient))
 
             # Draft-before-send: when the body was authored by Turtle this turn
             # (not dictated by the user) and the user prefers drafts, show the
@@ -2180,6 +2196,7 @@ class AgentManager:
                 await ctx.deps.session_store.set_pending_email(
                     recipients=merged["recipients"], cc_recipients=merged["cc_recipients"],
                     bcc_recipients=merged["bcc_recipients"], subject=merged["subject"], content=merged["content"],
+                    suggested_recipient="",
                 )
                 return clean_text_for_model(
                     "Here's the draft:\n\n"
@@ -2218,6 +2235,7 @@ class AgentManager:
                 await ctx.deps.session_store.set_pending_email(
                     recipients=merged["recipients"], cc_recipients=merged["cc_recipients"],
                     bcc_recipients=merged["bcc_recipients"], subject=merged["subject"], content=merged["content"],
+                    suggested_recipient="",
                 )
                 return clean_text_for_model(f"Failed to send email: {e}")
 
@@ -2231,6 +2249,7 @@ class AgentManager:
                 await ctx.deps.session_store.set_pending_email(
                     recipients=merged["recipients"], cc_recipients=merged["cc_recipients"],
                     bcc_recipients=merged["bcc_recipients"], subject=merged["subject"], content=merged["content"],
+                    suggested_recipient="",
                 )
             try:
                 # recall(scope="tasks") finally has data: record the action.
@@ -2500,6 +2519,33 @@ async def _stop_discord_gateway_hook() -> None:
         print(f"LOG: discord gateway shutdown error: {e}")
 
 
+@app.on_event("startup")
+async def _start_telegram_gateway_hook() -> None:
+    # Optional natural-DM/@mention Telegram bot. Guarded so absence of the
+    # python-telegram-bot library or a bot token is a clean no-op (see
+    # apps/channels/telegram_gateway.py).
+    #
+    # Same pytest guard as Discord: don't open a real long-poll connection
+    # from inside a test's app lifespan — one bot session, many test entries.
+    import sys
+    if "pytest" in sys.modules:
+        return
+    try:
+        from apps.channels.telegram_gateway import start_telegram_gateway
+        await start_telegram_gateway()
+    except Exception as e:
+        print(f"LOG: telegram gateway startup skipped: {e}")
+
+
+@app.on_event("shutdown")
+async def _stop_telegram_gateway_hook() -> None:
+    try:
+        from apps.channels.telegram_gateway import stop_telegram_gateway
+        await stop_telegram_gateway()
+    except Exception as e:
+        print(f"LOG: telegram gateway shutdown error: {e}")
+
+
 @app.on_event("shutdown")
 async def _flush_trace_spans() -> None:
     # Drain the BatchSpanProcessor's in-memory buffer; without this, spans from
@@ -2593,6 +2639,12 @@ _CHANNEL_STATE_CAP = 64
 # means a returning channel user rebuilds state and STILL lands inside the
 # resume window, so the session (and its history) comes back warm.
 _CHANNEL_STATE_IDLE_TTL_S = 10 * 60
+
+# Channel-native confirmation-gate answer buffer (ISSUE-011) — tracks the one
+# outstanding memory-gate prompt per (user_id, channel) so a plain "yes"/"no"
+# chat reply can answer it. See core/channel_gate.py for the narrow-match
+# rules; this is a process-local singleton, same posture as _CHANNEL_STATES.
+_CHANNEL_GATE_BUFFER = ChannelGateBuffer()
 
 
 def _channel_state_lock(key: tuple[str, str]) -> asyncio.Lock:
@@ -2803,6 +2855,46 @@ async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
         state.channel_user_id = str(getattr(event, "channel_user_id", "") or "")
         state.channel_is_private = bool(getattr(event, "is_private", False))
 
+        # Channel-native confirmation-gate answering (ISSUE-011). The web UI
+        # answers a pending memory candidate through a dedicated REST call,
+        # never by parsing chat text — a bare "yes" in ordinary conversation
+        # could silently promote a stale candidate. Channels have no such
+        # panel, so a candidate queued for a channel user was never asked
+        # about at all. This reopens chat-text answering, but ONLY when a
+        # prompt was actually surfaced to this (user, channel) moments ago
+        # AND the reply parses as an unambiguous yes/no (see
+        # core/channel_gate.py) — narrow enough to avoid the original hazard.
+        #
+        # Private-only: a group chat must never resolve a personal-fact
+        # prompt, mirroring the is_private gate already used for account-link
+        # claim codes (never let anyone but the sender answer, or see it).
+        if state.channel_is_private:
+            gate_key = (event.user_id, str(event.channel or ""))
+            gate_answer = _CHANNEL_GATE_BUFFER.try_consume_answer(gate_key, event.content)
+            if gate_answer is not None:
+                accepted, answered_event_ids = gate_answer
+                for eid in answered_event_ids:
+                    state.confirmation_gate.record_response(eid, accepted=accepted)
+                if accepted:
+                    ack_text = (
+                        "Got it — saved."
+                        if len(answered_event_ids) == 1
+                        else "Got it — saved all of those."
+                    )
+                else:
+                    ack_text = (
+                        "Okay, I won't save that."
+                        if len(answered_event_ids) == 1
+                        else "Okay, I won't save any of those."
+                    )
+                return TurtleResponse(
+                    content=ack_text,
+                    channel=event.channel,
+                    user_id=event.user_id,
+                    message_id=event.message_id,
+                    thread_id=event.thread_id,
+                )
+
         message_history = state.session_store.message_history or None
 
         # Tools need a live http client; lend the cached state one for this
@@ -2822,6 +2914,19 @@ async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
                 state.http_client = None
 
     text = outcome.reply_text or outcome.output_text or ""
+
+    # Surface the next pending memory-gate prompt as a trailing question, and
+    # remember it so the user's next private reply can answer it in plain
+    # chat (see the answer-consuming branch above + core/channel_gate.py).
+    # Private-only for the same reason as that branch — never ask about (or
+    # leak) a personal-fact candidate in a shared channel.
+    if state.channel_is_private:
+        pending_prompt = state.confirmation_gate.next_prompt()
+        if pending_prompt is not None:
+            gate_key = (event.user_id, str(event.channel or ""))
+            _CHANNEL_GATE_BUFFER.note_prompt(gate_key, pending_prompt.all_event_ids)
+            text = f"{text}\n\n📋 {pending_prompt.question}".strip()
+
     return TurtleResponse(
         content=text,
         channel=event.channel,

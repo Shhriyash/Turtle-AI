@@ -18,7 +18,9 @@ from core.email_flow import (
     merge_email_details,
     missing_email_fields,
     normalize_spoken_email_text,
+    resolve_suggested_recipient,
     send_email_now,
+    suggest_recipient_completion,
     validate_recipients,
     validate_send_email_args,
 )
@@ -160,6 +162,37 @@ class EmailFlowTests(unittest.TestCase):
         self.assertIn("To: user@example.com", prompt)
         self.assertIn("Subject: hello", prompt)
         self.assertIn("missing email body/message", prompt)
+
+    def test_suggest_recipient_completion_flags_missing_tld(self) -> None:
+        suggestion = suggest_recipient_completion(
+            "Send a mail to shriyashbeohar1@gmail reminding him about invoices"
+        )
+        self.assertEqual(suggestion, ("shriyashbeohar1@gmail", "shriyashbeohar1@gmail.com"))
+
+    def test_suggest_recipient_completion_ignores_complete_addresses(self) -> None:
+        self.assertIsNone(
+            suggest_recipient_completion("Send a mail to shriyashbeohar1@gmail.com about invoices")
+        )
+        self.assertIsNone(
+            suggest_recipient_completion("Send a mail to someone@my-custom-domain about invoices")
+        )
+
+    def test_missing_recipient_prompt_offers_completion_confirmation(self) -> None:
+        details = {"recipients": [], "subject": "hello", "content": "body"}
+        missing = missing_email_fields(details)
+        suggestion = suggest_recipient_completion("mail shriyashbeohar1@gmail about hello")
+        prompt = format_missing_email_prompt(missing, details, suggestion)
+
+        self.assertEqual(missing, ["recipients"])
+        self.assertIn("shriyashbeohar1@gmail.com", prompt)
+        self.assertIn("Reply \"yes\" to confirm", prompt)
+
+    def test_resolve_suggested_recipient_on_affirmation(self) -> None:
+        pending = {"suggested_recipient": "shriyashbeohar1@gmail.com"}
+        self.assertEqual(resolve_suggested_recipient("yes", pending), "shriyashbeohar1@gmail.com")
+        self.assertEqual(resolve_suggested_recipient("Yeah, that's right", pending), "shriyashbeohar1@gmail.com")
+        self.assertIsNone(resolve_suggested_recipient("no, it's different@gmail.com", pending))
+        self.assertIsNone(resolve_suggested_recipient("yes", {}))
 
     def test_compose_prompt_includes_request_identity_and_existing_fields(self) -> None:
         prompt = build_compose_email_prompt(

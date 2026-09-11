@@ -143,6 +143,73 @@ def extract_recipients(text: str) -> list[str]:
     return dedupe_strings(re.findall(pattern, normalized))
 
 
+# Bare provider name (no TLD) -> the domain it almost certainly means. Used
+# only to PROPOSE a completion for confirmation — never to silently complete
+# and send to a guessed address. "gmail" is the recurring real-world typo
+# (dropping ".com"); the rest are the other large free providers.
+_KNOWN_EMAIL_PROVIDER_DOMAINS: dict[str, str] = {
+    "gmail": "gmail.com",
+    "googlemail": "googlemail.com",
+    "outlook": "outlook.com",
+    "hotmail": "hotmail.com",
+    "yahoo": "yahoo.com",
+    "icloud": "icloud.com",
+    "live": "live.com",
+    "aol": "aol.com",
+    "protonmail": "protonmail.com",
+    "zoho": "zoho.com",
+    "yandex": "yandex.com",
+    "rediffmail": "rediffmail.com",
+}
+
+_INCOMPLETE_PROVIDER_EMAIL_PATTERN = re.compile(
+    r"\b([a-zA-Z0-9._%+-]+)@("
+    + "|".join(re.escape(name) for name in _KNOWN_EMAIL_PROVIDER_DOMAINS)
+    + r")\b(?!\.[a-zA-Z])",
+    flags=re.IGNORECASE,
+)
+
+_AFFIRMATION_PATTERN = re.compile(
+    r"^\s*(yes|yeah|yep|yup|correct|right|that'?s it|confirm(?:ed)?|"
+    r"use that|go ahead|exactly|sounds right)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def suggest_recipient_completion(text: str) -> tuple[str, str] | None:
+    """Find a "local@provider" fragment missing its TLD (e.g. "x@gmail")
+    and propose the completed address (e.g. "x@gmail.com").
+
+    Returns (typed_fragment, suggested_email) for the first match, or None.
+    Only fires for well-known free providers — never guesses a TLD for an
+    unrecognized/custom domain. A real match already caught by
+    extract_recipients (i.e. one that DOES have a dot-TLD) never matches
+    here because of the trailing negative lookahead.
+    """
+    normalized = normalize_spoken_email_text(text)
+    match = _INCOMPLETE_PROVIDER_EMAIL_PATTERN.search(normalized)
+    if not match:
+        return None
+    local_part, provider = match.group(1), match.group(2).lower()
+    domain = _KNOWN_EMAIL_PROVIDER_DOMAINS[provider]
+    typed_fragment = f"{local_part}@{provider}"
+    suggested_email = f"{local_part}@{domain}"
+    return typed_fragment, suggested_email
+
+
+def resolve_suggested_recipient(query: str, pending_email: dict[str, Any]) -> str | None:
+    """When the user simply confirms ("yes", "correct", ...) and a prior turn
+    proposed a completed address, return that address so it can be used as
+    the recipient without asking the user to retype it.
+    """
+    suggested = str(pending_email.get("suggested_recipient") or "").strip()
+    if not suggested:
+        return None
+    if not _AFFIRMATION_PATTERN.match(query.strip()):
+        return None
+    return suggested
+
+
 def extract_labeled_recipients(text: str, label: str) -> list[str]:
     normalized = normalize_spoken_email_text(text)
     common_stop_pattern = (
@@ -320,13 +387,31 @@ def missing_email_fields(details: dict[str, Any]) -> list[str]:
     return missing
 
 
-def format_missing_email_prompt(missing: list[str], details: dict[str, Any]) -> str:
+def format_missing_email_prompt(
+    missing: list[str],
+    details: dict[str, Any],
+    suggested_recipient: tuple[str, str] | None = None,
+) -> str:
     missing_map = {
         "recipients": "recipient email address",
         "subject": "subject line",
         "content": "email body/message",
     }
-    missing_text = ", ".join(missing_map[item] for item in missing)
+    # When recipients are missing but the request contained a near-miss
+    # address for a known provider (e.g. "x@gmail" with no ".com"), ask a
+    # confirm-the-completion question instead of a bare "it's missing" —
+    # the address wasn't actually absent, just incomplete.
+    remaining_missing = list(missing)
+    recipient_question = ""
+    if "recipients" in remaining_missing and suggested_recipient:
+        typed_fragment, completed_email = suggested_recipient
+        recipient_question = (
+            f"It looks like you typed \"{typed_fragment}\" — did you mean "
+            f"{completed_email}? Reply \"yes\" to confirm, or give the correct address."
+        )
+        remaining_missing.remove("recipients")
+
+    missing_text = ", ".join(missing_map[item] for item in remaining_missing)
     captured_parts = []
     if details.get("recipients"):
         captured_parts.append(f"To: {', '.join(details['recipients'])}")
@@ -339,9 +424,15 @@ def format_missing_email_prompt(missing: list[str], details: dict[str, Any]) -> 
     if details.get("content"):
         captured_parts.append(f"Body: {details['content']}")
     captured_text = "\n".join(captured_parts)
+
+    ask_text = (
+        f"Please provide the missing {missing_text}." if missing_text else ""
+    )
+    combined_ask = " ".join(part for part in (recipient_question, ask_text) if part)
+
     if captured_text:
-        return f"I have these details already:\n{captured_text}\n\nPlease provide the missing {missing_text}."
-    return f"Please provide the missing {missing_text} so I can send the email."
+        return f"I have these details already:\n{captured_text}\n\n{combined_ask}"
+    return combined_ask or "Please provide the missing details so I can send the email."
 
 
 def build_compose_email_prompt(
