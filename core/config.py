@@ -83,6 +83,11 @@ class TurtleSettings(BaseSettings):
     discord_public_key: Optional[SecretStr] = Field(default=None, alias="DISCORD_PUBLIC_KEY")
     discord_application_id: Optional[str] = Field(default=None, alias="DISCORD_APPLICATION_ID")
 
+    # Channel Adapters — Telegram (registered BOT via @BotFather; never a user
+    # account). api_id / api_hash from my.telegram.org are NOT needed for the
+    # HTTP Bot API — python-telegram-bot only needs the bot token.
+    telegram_bot_token: Optional[SecretStr] = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
+
     # Channel Adapters — SendBlue (iMessage)
     sendblue_api_key: Optional[SecretStr] = Field(default=None, alias="SENDBLUE_API_KEY")
     sendblue_api_secret: Optional[SecretStr] = Field(default=None, alias="SENDBLUE_API_SECRET")
@@ -93,6 +98,14 @@ class TurtleSettings(BaseSettings):
     )
     google_calendar_token_json: Optional[str] = Field(
         default=None, alias="GOOGLE_CALENDAR_TOKEN_JSON"
+    )
+
+    # Google Maps Platform — Places API (New) + Routes API.
+    # A single API key covers both surfaces. Enable the "Places API (New)" and
+    # "Routes API" in the Google Cloud project and restrict the key to those
+    # APIs plus your server's IP or HTTP referrer.
+    google_maps_api_key: Optional[SecretStr] = Field(
+        default=None, alias="GOOGLE_MAPS_API_KEY"
     )
 
     # -----------------------------------------------------------------------

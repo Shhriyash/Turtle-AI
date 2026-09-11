@@ -21,7 +21,7 @@ from typing import Awaitable, Callable, Literal, Optional
 # ---------------------------------------------------------------------------
 
 Modality = Literal["text", "voice"]
-Channel = Literal["web", "whatsapp", "imessage", "slack", "twilio_voice", "discord"]
+Channel = Literal["web", "whatsapp", "imessage", "slack", "twilio_voice", "discord", "telegram"]
 
 
 @dataclass

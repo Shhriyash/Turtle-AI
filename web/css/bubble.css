@@ -223,8 +223,8 @@
 }
 
 .bubble-heard .spoken-text {
-    font-family: var(--font-serif);
-    font-style: italic;
+    font-family: inherit;
+    font-style: normal;
     font-size: 19px;
     color: rgba(232, 234, 236, 0.72);
     text-wrap: pretty;

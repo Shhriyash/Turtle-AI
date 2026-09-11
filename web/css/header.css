@@ -58,7 +58,71 @@
 .header-right {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
+}
+
+/* Glassmorphic Icon Buttons in Header */
+.header-right .btn-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-secondary);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 0.25s var(--ease-out);
+    position: relative;
+    outline: none;
+}
+
+.header-right .btn-icon:hover {
+    background: var(--surface-hover);
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.header-right .btn-icon:active {
+    transform: translateY(0);
+}
+
+/* Discord Header Icon Button */
+.btn-discord-header {
+    background: rgba(88, 101, 242, 0.12) !important;
+    border: 1px solid rgba(88, 101, 242, 0.3) !important;
+    color: #7983f5 !important;
+}
+
+/* Google Calendar connect button — connected state shows a small green dot
+   so the state is visible without clicking (avoids re-triggering the OAuth
+   consent screen just to check whether it's connected). */
+#btn-calendar-connect.connected {
+    background: rgba(52, 168, 83, 0.12) !important;
+    border: 1px solid rgba(52, 168, 83, 0.3) !important;
+    color: #34a853 !important;
+}
+
+#btn-calendar-connect.connected::after {
+    content: '';
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #34a853;
+    border: 2px solid var(--bg-primary, #08090b);
+}
+
+.btn-discord-header:hover {
+    background: #5865F2 !important;
+    border-color: #5865F2 !important;
+    color: #ffffff !important;
+    box-shadow: 0 4px 14px rgba(88, 101, 242, 0.45) !important;
 }
 
 /* Status indicator pill */

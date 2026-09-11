@@ -8,6 +8,8 @@ httpx==0.28.1
 # Google / Vertex AI
 google-genai==1.66.0
 google-auth==2.49.0
+google-api-python-client==2.184.0  # googleapiclient.discovery — tools/calendar_tool.py
+opentelemetry-api==1.39.1  # pinned: google-api-core wants >=1.44 but logfire's opentelemetry-sdk wants ==1.39.1
 
 # RAG / Embeddings
 cohere==5.20.7
@@ -55,3 +57,6 @@ PyJWT==2.12.1       # apps/auth session tokens
 # test suite run cleanly without it installed.
 discord.py>=2.3
 
+# Telegram gateway (long-polling bot mode). Optional; the adapter guards the
+# import so the app and test suite run cleanly without it installed.
+python-telegram-bot>=21.0

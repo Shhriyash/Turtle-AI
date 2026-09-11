@@ -24,7 +24,7 @@ Search the web for real-time information, current events, prices, news, sports s
 Structured list of search hits: each hit has `title`, `url`, and `snippet`. Results are pre-formatted as a readable block.
 
 ## Citation requirement (B6)
-After calling search_web, your final response MUST cite at least one URL from the returned results when making factual claims. If the results are empty or irrelevant, say "I couldn't find reliable information on that" — do not invent facts.
+After calling search_web, your final response MUST cite at least one URL from the returned results when making factual claims, formatted as `[source](https://url)` (the clickable word "source", nothing else as the link text). If the results are empty or irrelevant, say "I couldn't find reliable information on that" — do not invent facts.
 
 ## Common failure modes
 - **Empty results**: Happens with overly narrow queries. Broaden or rephrase.

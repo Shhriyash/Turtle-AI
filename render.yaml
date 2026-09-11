@@ -1,0 +1,128 @@
+# Render Blueprint — Turtle AI backend
+# Docs: https://render.com/docs/blueprint-spec
+#
+# This deploys the existing Dockerfile as a single, always-on web service with
+# a persistent disk for data/ (SQLite + FAISS). Pushing to `main` auto-deploys.
+#
+# IMPORTANT — single instance only. The routine scheduler, live-socket registry,
+# WebSocket rate limiter, and active-session/confirmation state are per-process
+# in-memory globals (see Dockerfile). Running >1 instance breaks them. The
+# attached disk already forces a single instance on Render, which is exactly
+# what we want — do not add autoscaling or a second instance.
+#
+# A persistent disk requires a paid instance type (Starter or higher). The Free
+# plan has no disk and spins down when idle, which would drop WebSocket
+# connections and lose data/ — not suitable for this server.
+
+services:
+  - type: web
+    name: turtle-ai
+    runtime: docker
+    repo: https://github.com/Shhriyash/Turtle-AI
+    branch: main
+    autoDeploy: true            # CI/CD: every push to main builds + deploys
+    plan: starter               # paid tier required for the persistent disk below
+    region: oregon              # change to your nearest region if desired
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Bind gunicorn to Render's injected $PORT instead of the Dockerfile's
+    # hardcoded 8000. Same command as the Dockerfile CMD otherwise; -w 1 is
+    # mandatory (see note above).
+    dockerCommand: gunicorn -k uvicorn.workers.UvicornWorker -w 1 --bind 0.0.0.0:$PORT --timeout 120 apps.turtle_server:app
+    healthCheckPath: /healthz
+    disk:
+      name: turtle-data
+      mountPath: /app/data      # matches Dockerfile VOLUME /app/data
+      sizeGB: 1                 # grow later if the FAISS index / SQLite outgrow it
+    envVars:
+      # Non-secret operational config (baked in the image too, set here for clarity)
+      - key: TURTLE_DEPLOY
+        value: cloud
+      - key: SERVER_HOST
+        value: 0.0.0.0
+      # PORT is injected by Render automatically — do NOT set it here.
+      #
+      # Secrets & runtime config — sync:false means Render prompts for the value
+      # at Blueprint creation and never stores it in git. Fastest way to fill
+      # these: in the Render dashboard, use "Add from .env" and paste your local
+      # .env, then remove PORT/SERVER_PORT if present.
+      - key: OPEN_ROUTER_MODEL
+        sync: false
+      - key: OPEN_ROUTER_API_KEY_1
+        sync: false
+      - key: OPEN_ROUTER_API_KEY_2
+        sync: false
+      - key: OPEN_ROUTER_API_KEY_3
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        sync: false
+      - key: OPENROUTER_TOOL_FALLBACK_MODEL
+        sync: false
+      - key: OPENROUTER_APP_URL
+        sync: false
+      - key: OPENROUTER_APP_TITLE
+        sync: false
+      - key: GROQ_PRIMARY_MODEL
+        sync: false
+      - key: GROQ_FALLBACK_MODEL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_API_KEY2
+        sync: false
+      - key: STT_MODEL
+        sync: false
+      - key: AZURE_OPENAI_ENDPOINT
+        sync: false
+      - key: AZURE_OPENAI_API_KEY
+        sync: false
+      - key: AZURE_OPENAI_API_VERSION
+        sync: false
+      - key: AZURE_OPENAI_MODEL
+        sync: false
+      - key: COHERE_API_KEY
+        sync: false
+      - key: RAG_FAISS_INDEX_TYPE
+        sync: false
+      - key: RAG_FAISS_HNSW_M
+        sync: false
+      - key: RAG_FAISS_HNSW_EF_SEARCH
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: DEEPGRAM_TTS_MODEL
+        sync: false
+      - key: DEEPGRAM_TTS_ENCODING
+        sync: false
+      - key: DEEPGRAM_TTS_CONTAINER
+        sync: false
+      - key: DEEPGRAM_TTS_SAMPLE_RATE
+        sync: false
+      - key: GROQ_TTS_MODEL
+        sync: false
+      - key: GROQ_TTS_VOICE
+        sync: false
+      - key: GROQ_TTS_FORMAT
+        sync: false
+      - key: TURTLE_EMAIL_NAME
+        sync: false
+      - key: TURTLE_EMAIL_ADDRESS
+        sync: false
+      - key: TURTLE_EMAIL_PASSKEY
+        sync: false
+      - key: TURTLE_PERSONAL_MEMORY_ENABLED
+        sync: false
+      - key: TURTLE_PERSONAL_MEMORY_DREAM_PASS_ENABLED
+        sync: false
+      - key: TURTLE_PERSONAL_MEMORY_STAGE_B_ENABLED
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: GOOGLE_CALENDAR_CREDENTIALS_JSON
+        sync: false
+      - key: GOOGLE_CALENDAR_TOKEN_JSON
+        sync: false
+      - key: LOGFIRE_TOKEN
+        sync: false

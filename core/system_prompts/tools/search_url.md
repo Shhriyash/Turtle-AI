@@ -23,7 +23,7 @@ Fetch and extract the full readable content of a specific web page. Handles both
 Plain text of the page content, truncated to ~3500 chars. Includes page title and main body text.
 
 ## Citation requirement (B6)
-When you summarise or quote content from a URL, always mention the source URL in your response.
+When you summarise or quote content from a URL, always cite it in your response as `[source](https://url)` (the clickable word "source", nothing else as the link text).
 
 ## Common failure modes
 - **Paywalled page**: Returns only the intro paragraph. Inform the user the full article is behind a paywall.

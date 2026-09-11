@@ -68,7 +68,7 @@ export function toggleResponsePanel() {
 export function updateChatToggleUi() {
     const btn = AppState.dom.btnChatToggle;
     if (!btn) return;
-    btn.classList.toggle('hidden', AppState.responsePanelOpen);
+    btn.classList.toggle('active', AppState.responsePanelOpen);
     btn.setAttribute('aria-pressed', AppState.responsePanelOpen ? 'true' : 'false');
 }
 
