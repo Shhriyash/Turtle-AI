@@ -2,7 +2,14 @@
 import queue
 import threading
 import numpy as np
-import sounddevice as sd
+
+# NOTE: `sounddevice` (PortAudio) is imported lazily inside stream_tts(), not at
+# module top level. The web server (apps.turtle_server) imports this package via
+# tools.tts.__init__ -> tools.tts.client, and it synthesizes speech over REST
+# (returns bytes to the browser) — it never plays audio server-side. Importing
+# sounddevice at module load would crash boot on headless containers (e.g. the
+# Render/Docker image) that have no PortAudio library. Playback is only used by
+# the local CLI voice path, which imports it on demand below.
 
 from deepgram.core.events import EventType
 from deepgram.speak.v1.types import SpeakV1Text
@@ -24,6 +31,8 @@ def stream_tts(
     idle_timeout: float = 1.0,
     start_timeout: float = 3.0,
 ) -> bool:
+    import sounddevice as sd  # lazy: PortAudio only needed for local playback
+
     audio_queue: queue.Queue[np.ndarray] = queue.Queue()
     done_event = threading.Event()
     started_audio = threading.Event()
