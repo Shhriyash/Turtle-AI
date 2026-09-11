@@ -1,0 +1,59 @@
+name: deploy
+
+# Runs only after the "tests" workflow finishes on main, and only deploys if
+# that run succeeded — a red test run never reaches the server. This is the
+# CI/CD gate: push to main -> tests run -> on green, this builds the image in
+# Azure Container Registry and points the App Service at the new tag.
+on:
+  workflow_run:
+    workflows: ["tests"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  id-token: write   # required for OIDC login to Azure (no stored client secret)
+  contents: read
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      ACR_NAME: ${{ secrets.AZURE_ACR_NAME }}
+      WEBAPP_NAME: ${{ secrets.AZURE_WEBAPP_NAME }}
+      RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build image in ACR
+        # az acr build ships the Dockerfile to an ACR Task and builds/pushes
+        # it there — no local Docker needed in the runner, no registry
+        # credentials to manage. Tag by commit SHA (immutable, easy rollback
+        # via `az webapp config container set` to a prior tag) and also
+        # update :latest for convenience.
+        run: |
+          az acr build \
+            --registry "$ACR_NAME" \
+            --image "turtle-ai:${{ github.sha }}" \
+            --image "turtle-ai:latest" \
+            .
+
+      - name: Point the Web App at the new image
+        # The Web App pulls via its managed identity (AcrPull role on the
+        # registry, configured once at setup — see the deploy runbook), so no
+        # registry password is stored anywhere here.
+        run: |
+          az webapp config container set \
+            --name "$WEBAPP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --container-image-name "$ACR_NAME.azurecr.io/turtle-ai:${{ github.sha }}"
+          az webapp restart --name "$WEBAPP_NAME" --resource-group "$RESOURCE_GROUP"

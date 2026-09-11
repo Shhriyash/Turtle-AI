@@ -181,3 +181,53 @@ class CalendarListArgs(BaseModel):
         default="",
         description="Only return events after this ISO 8601 datetime. Defaults to now if empty.",
     )
+
+
+class FindPlaceArgs(BaseModel):
+    query: str = Field(
+        min_length=2,
+        max_length=300,
+        description=(
+            "Natural-language place query, e.g. 'Mercure Hotel Dubai' or "
+            "'best coffee near Koramangala'. Include a city or landmark when "
+            "the user mentioned one, so global name-collisions resolve correctly. "
+            "Do NOT paraphrase away user-supplied specifics."
+        ),
+    )
+    max_results: int = Field(
+        default=5, ge=1, le=10, description="How many candidate places (1-10)."
+    )
+    location_bias: str = Field(
+        default="",
+        description=(
+            "Optional city, neighbourhood, or 'lat,lng' hint to bias results "
+            "toward. Leave empty for a global search."
+        ),
+    )
+
+
+class PlaceDetailsArgs(BaseModel):
+    place_id: str = Field(
+        min_length=1,
+        description=(
+            "Google Places place_id returned by an earlier find_place call. "
+            "NEVER invent a place_id — only use one you've seen in a tool result."
+        ),
+    )
+
+
+class GetDirectionsArgs(BaseModel):
+    origin: str = Field(
+        min_length=2,
+        description="Starting address, place name, or 'lat,lng' pair.",
+    )
+    destination: str = Field(
+        min_length=2,
+        description="Ending address, place name, or 'lat,lng' pair.",
+    )
+    travel_mode: str = Field(
+        default="DRIVE",
+        description=(
+            "One of DRIVE, WALK, BICYCLE, TRANSIT, TWO_WHEELER. Default DRIVE."
+        ),
+    )

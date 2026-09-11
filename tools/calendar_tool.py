@@ -30,6 +30,7 @@ When to use (agent-facing docstring, loaded by tool registration):
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -37,6 +38,32 @@ from pydantic import BaseModel, Field
 
 from core.config import settings
 from tools.contracts import ToolResult
+
+
+# Google Calendar's `start.timeZone` is a hint used to render the event and to
+# resolve wall-clock times when the datetime string carries NO offset. When the
+# ISO string DOES carry an offset (`+05:30`, `Z`, ...) the instant is already
+# unambiguous — but a naive `T14:00:00` with `timeZone=UTC` would silently
+# shift a 2 PM IST meeting to 7:30 PM IST. We honour an explicit offset when
+# present and fall back to the user's business timezone otherwise.
+_ISO_OFFSET_RE = re.compile(r"([+-]\d{2}:?\d{2}|Z)$")
+
+# Default when the LLM emits a naive datetime and we have no better signal.
+# For this deployment the operator lives in India; override via env if needed.
+_DEFAULT_TZ = "Asia/Kolkata"
+
+
+def _timezone_for(iso_string: str) -> str:
+    """Pick the timeZone hint to send to Google Calendar for an ISO datetime.
+
+    - Explicit offset (`+05:30`, `-08:00`, `Z`) → 'UTC' (the offset already
+      pins the instant; the tz hint only controls display, and UTC is safe).
+    - Naive (`2026-05-10T14:00:00`) → fall back to the operator's local zone,
+      so the LLM saying "2 PM" lands at 2 PM local rather than 7:30 PM local.
+    """
+    if _ISO_OFFSET_RE.search(iso_string or ""):
+        return "UTC"
+    return _DEFAULT_TZ
 
 
 # ---------------------------------------------------------------------------
@@ -99,14 +126,38 @@ class CalendarListArgs(BaseModel):
 # Credential loading
 # ---------------------------------------------------------------------------
 
-def _load_credentials():
+def _load_token_json(user_id: Optional[str]) -> Optional[str]:
+    """Resolve the OAuth2 user token JSON to use.
+
+    Prefers the per-user token written by the in-app connect flow
+    (apps/calendar_oauth_routes.py, GET /integrations/google_calendar/connect)
+    at personal_memory_dir(user_id)/google_calendar_token.json, so each signed-in
+    user's calendar_create/calendar_list calls act on THEIR OWN calendar.
+
+    Falls back to the legacy global GOOGLE_CALENDAR_TOKEN_JSON env var for
+    single-tenant / dev deployments that predate the per-user connect flow, or
+    when no user_id is available (e.g. a non-web channel not yet resolved to
+    a per-user token).
     """
-    Load Google Calendar credentials from env config.
+    if user_id:
+        try:
+            from core.paths import personal_memory_dir
+            token_path = personal_memory_dir(user_id) / "google_calendar_token.json"
+            if token_path.exists():
+                return token_path.read_text(encoding="utf-8")
+        except Exception:
+            pass  # fall through to the legacy env var
+    return settings.google_calendar_token_json
+
+
+def _load_credentials(user_id: Optional[str] = None):
+    """
+    Load Google Calendar credentials from env config plus, when available,
+    a per-user OAuth token on disk (see _load_token_json).
     Returns a google.oauth2.credentials.Credentials or
     google.oauth2.service_account.Credentials object, or None if unconfigured.
     """
     creds_json = settings.google_calendar_credentials_json
-    token_json = settings.google_calendar_token_json
 
     if not creds_json:
         return None
@@ -126,28 +177,38 @@ def _load_credentials():
         )
 
     # OAuth2 client credentials + user token
+    token_json = _load_token_json(user_id)
     if token_json:
         from google.oauth2.credentials import Credentials  # type: ignore[import]
         token_data = json.loads(token_json)
+        client_block = creds_data.get("installed", creds_data.get("web", creds_data))
         return Credentials(
-            token=token_data.get("token"),
+            # Deliberately omit the short-lived access token (Google's token
+            # endpoint calls it "access_token"; legacy manual configs used
+            # "token") and leave it unset instead. With no access token,
+            # google-auth's Credentials.valid is False, which forces a
+            # refresh via refresh_token on first use every time — simpler and
+            # more robust than tracking each token's real expiry ourselves.
+            token=None,
             refresh_token=token_data.get("refresh_token"),
             token_uri=token_data.get("token_uri", "https://oauth2.googleapis.com/token"),
-            client_id=creds_data.get("installed", creds_data.get("web", creds_data)).get("client_id"),
-            client_secret=creds_data.get("installed", creds_data.get("web", creds_data)).get("client_secret"),
+            client_id=client_block.get("client_id"),
+            client_secret=client_block.get("client_secret"),
         )
 
     return None
 
 
-def _build_service():
+def _build_service(user_id: Optional[str] = None):
     """Build the Google Calendar API service client."""
     from googleapiclient.discovery import build  # type: ignore[import]
-    creds = _load_credentials()
+    creds = _load_credentials(user_id)
     if creds is None:
         raise RuntimeError(
-            "Google Calendar credentials not configured. "
-            "Set GOOGLE_CALENDAR_CREDENTIALS_JSON (and GOOGLE_CALENDAR_TOKEN_JSON for OAuth2)."
+            "Google Calendar credentials not configured. Set "
+            "GOOGLE_CALENDAR_CREDENTIALS_JSON, then connect a calendar via "
+            "GET /integrations/google_calendar/connect (or set the legacy "
+            "GOOGLE_CALENDAR_TOKEN_JSON for a single-tenant deployment)."
         )
     return build("calendar", "v3", credentials=creds)
 
@@ -156,10 +217,16 @@ def _build_service():
 # Tool functions
 # ---------------------------------------------------------------------------
 
-async def create_calendar_event(args: CalendarCreateArgs) -> ToolResult[CalendarEventResult]:
+async def create_calendar_event(
+    args: CalendarCreateArgs, *, user_id: Optional[str] = None
+) -> ToolResult[CalendarEventResult]:
     """
     Create a Google Calendar event and optionally attach a Google Meet link.
     Returns ToolResult[CalendarEventResult] with the event URL and Meet link.
+
+    ``user_id``, when given, selects that user's own connected calendar (see
+    apps/calendar_oauth_routes.py); omit it to use the legacy single-tenant
+    GOOGLE_CALENDAR_TOKEN_JSON env var.
     """
     import asyncio
 
@@ -170,13 +237,13 @@ async def create_calendar_event(args: CalendarCreateArgs) -> ToolResult[Calendar
         )
 
     def _sync_create() -> CalendarEventResult:
-        service = _build_service()
+        service = _build_service(user_id)
 
         body: dict = {
             "summary": args.title,
             "description": args.description,
-            "start": {"dateTime": args.start_iso, "timeZone": "UTC"},
-            "end": {"dateTime": args.end_iso, "timeZone": "UTC"},
+            "start": {"dateTime": args.start_iso, "timeZone": _timezone_for(args.start_iso)},
+            "end": {"dateTime": args.end_iso, "timeZone": _timezone_for(args.end_iso)},
         }
 
         if args.attendee_emails:
@@ -224,8 +291,15 @@ async def create_calendar_event(args: CalendarCreateArgs) -> ToolResult[Calendar
         return ToolResult.upstream_error(str(exc))
 
 
-async def list_upcoming_events(args: CalendarListArgs) -> ToolResult[CalendarEventListResult]:
-    """List upcoming events from the user's primary Google Calendar."""
+async def list_upcoming_events(
+    args: CalendarListArgs, *, user_id: Optional[str] = None
+) -> ToolResult[CalendarEventListResult]:
+    """List upcoming events from the user's primary Google Calendar.
+
+    ``user_id``, when given, selects that user's own connected calendar (see
+    apps/calendar_oauth_routes.py); omit it to use the legacy single-tenant
+    GOOGLE_CALENDAR_TOKEN_JSON env var.
+    """
     import asyncio
 
     if not settings.google_calendar_credentials_json:
@@ -235,7 +309,7 @@ async def list_upcoming_events(args: CalendarListArgs) -> ToolResult[CalendarEve
         )
 
     def _sync_list() -> CalendarEventListResult:
-        service = _build_service()
+        service = _build_service(user_id)
         now = args.time_min_iso or datetime.now(timezone.utc).isoformat()
 
         items = service.events().list(

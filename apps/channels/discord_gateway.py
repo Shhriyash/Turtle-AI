@@ -27,6 +27,14 @@ from __future__ import annotations
 
 from core.config import settings
 
+# Discord natively renders markdown in message content (**bold**, *italic*,
+# `code`, ``` fenced ```, headings, `- ` bullets, `> ` blockquote, links), so
+# the model's markdown reply reaches the user rendered without any conversion
+# here. The only outbound cleanup Discord shares with Telegram is the "no em
+# or en dashes" rule: if a fallback model slips one through, drop it before
+# sending so the user sees the intended punctuation.
+from apps.channels.telegram_gateway import _normalize_dashes
+
 # Guarded import: discord.py is optional. Absence must be a clean no-op, so the
 # app boots and the CI suite passes without it installed.
 try:
@@ -145,7 +153,8 @@ async def start_discord_gateway() -> None:
                 is_private=bool(is_dm),
             )
             response: TurtleResponse = await dispatch_event(turtle_event)
-            await message.channel.send(response.content[:_MAX_REPLY_CHARS])
+            reply_body = _normalize_dashes(response.content or "")
+            await message.channel.send(reply_body[:_MAX_REPLY_CHARS])
             print(f"LOG: discord replied to {message.author} ({len(response.content or '')} chars)", flush=True)
         except Exception as e:
             print(f"LOG: discord gateway on_message error: {e}", flush=True)

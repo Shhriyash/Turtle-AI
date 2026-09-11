@@ -12,6 +12,8 @@ import { startRecording, stopRecording, refreshVoiceButtonUi, interruptReply } f
 import { toggleDevPanel, applyDevConfig, resetDevDefaults } from './devmode.js';
 import { initMemoryUI } from './memory.js';
 import { initAmbient } from './ambient.js';
+import { initDiscordUI } from './discord.js';
+import { initCalendarUI } from './calendar.js';
 
 function isTypingTarget(target) {
     const el = target;
@@ -214,6 +216,8 @@ function init() {
     initAmbient();
     initEvents();
     initMemoryUI();
+    initDiscordUI();
+    initCalendarUI();
     updateVoiceModeUi();
     connectWebSocket();
     startConnectionWatchdog();

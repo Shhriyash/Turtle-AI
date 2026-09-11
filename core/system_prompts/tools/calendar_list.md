@@ -18,5 +18,8 @@ List of upcoming events, each with title, start/end datetime, Google Calendar UR
 On failure: error message with code `credentials_missing` or `upstream_error`.
 
 ## Common failure modes
-- **credentials_missing**: Google Calendar is not configured — tell the user to set `GOOGLE_CALENDAR_CREDENTIALS_JSON`.
+- **credentials_missing**: The tool result includes a connect URL
+  (`/integrations/google_calendar/connect`) — tell the user to open it and
+  sign in with Google to link their calendar. If the URL is missing, Google
+  Calendar isn't configured on this deployment at all; say so plainly.
 - **Empty list**: No upcoming events in the requested window.

@@ -136,7 +136,18 @@ from core.stt_fastrtc import FastRTCSTT
 from core.web_search import format_search_results, search_duckduckgo
 from rag.system.complete_rag import TurtleRAGSystem
 from tools.url_tools import fetch_url_content_async
-from tools.contracts import ToolResult, WebSearchArgs, UrlFetchArgs, EmailArgs, RecallArgs, CalendarCreateArgs, CalendarListArgs
+from tools.contracts import (
+    ToolResult,
+    WebSearchArgs,
+    UrlFetchArgs,
+    EmailArgs,
+    RecallArgs,
+    CalendarCreateArgs,
+    CalendarListArgs,
+    FindPlaceArgs,
+    PlaceDetailsArgs,
+    GetDirectionsArgs,
+)
 
 try:
     import logfire
@@ -326,7 +337,7 @@ def _build_user_greeting_block(user_id: str) -> str:
 def _build_turn_instructions(state: "SharedState") -> str:
     """Per-turn dynamic instructions: greeting, live clock/timezone, and the
     memory block. Runs on every model call (including fallback rungs), so the
-    model always sees the CURRENT memory snapshot exactly once — never baked
+    model always sees the CURRENT memory snapshot exactly once, never baked
     into persisted user turns where stale copies accumulate and contradict
     corrections."""
     import datetime as _dt
@@ -346,10 +357,29 @@ def _build_turn_instructions(state: "SharedState") -> str:
     now_utc = _dt.datetime.now(_dt.UTC).strftime("%A, %d %B %Y, %H:%M UTC")
     parts.append(f"Current date and time: {now_utc}")
     parts.append(f"User timezone: {tz_name}")
+
+    # Channel-aware formatting hint: the static system prompt describes both
+    # the voice rules and the text markdown rules; this line tells the model
+    # which one is active RIGHT NOW so it never fires the wrong ruleset. Voice
+    # channels get plain speakable text; every text/chat channel gets markdown.
+    channel = str(getattr(state, "channel", "") or "").strip() if state is not None else ""
+    if channel in _VOICE_CHANNELS:
+        parts.append(
+            "Output channel: voice. Follow <voice_first_output_rules>: plain "
+            "spoken English, no markdown, no bullet characters, no em/en dashes."
+        )
+    elif channel:
+        parts.append(
+            f"Output channel: {channel} (text). Follow <text_formatting_rules>: "
+            "markdown IS rendered here, use **bold** labels, `- ` bullets and blank "
+            "lines to make multi-part answers scannable. Never use em (—) or en (–) "
+            "dashes anywhere in the reply."
+        )
+
     memory_block = (state.memory_context or "").strip() if state is not None else ""
     if memory_block:
         parts.append(
-            "Current user memory (authoritative; this is the only current copy — "
+            "Current user memory (authoritative; this is the only current copy, "
             "any memory blocks inside older conversation turns are stale snapshots):\n"
             + memory_block
         )
@@ -2349,7 +2379,12 @@ class AgentManager:
                 description=args.description,
                 add_google_meet=args.add_google_meet,
             )
-            result = await create_calendar_event(inner)
+            result = await create_calendar_event(inner, user_id=ctx.deps.user_id)
+            if result.status == "invalid" and result.error_code == "credentials_missing":
+                return (
+                    f"{result.to_agent_string()} Ask the user to connect their calendar at "
+                    f"{settings.public_base_url.rstrip('/')}/integrations/google_calendar/connect"
+                )
             return result.to_agent_string()
 
         async def calendar_list(ctx: RunContext[SharedState], args: CalendarListArgs) -> str:
@@ -2360,7 +2395,69 @@ class AgentManager:
                 max_results=args.max_results,
                 time_min_iso=args.time_min_iso or None,
             )
-            result = await list_upcoming_events(inner)
+            result = await list_upcoming_events(inner, user_id=ctx.deps.user_id)
+            if result.status == "invalid" and result.error_code == "credentials_missing":
+                return (
+                    f"{result.to_agent_string()} Ask the user to connect their calendar at "
+                    f"{settings.public_base_url.rstrip('/')}/integrations/google_calendar/connect"
+                )
+            return result.to_agent_string()
+
+        async def find_place(ctx: RunContext[SharedState], args: FindPlaceArgs) -> str:
+            """Look up real-world places via Google Places. See tool contract for full spec."""
+            from tools.places_tool import (
+                find_place as _find_place,
+                render_find_place,
+                FindPlaceArgs as _FindPlaceArgs,
+            )
+            print(f"\nPLACES: find_place query={args.query!r}")
+            inner = _FindPlaceArgs(
+                query=args.query,
+                max_results=args.max_results,
+                location_bias=args.location_bias,
+            )
+            # Reuse the shared http_client so we inherit the app's pool and timeouts.
+            result = await _find_place(inner, http_client=ctx.deps.http_client)
+            if result.status == "ok" and result.data is not None:
+                rendered = render_find_place(result.data)
+                return _truncate_tool_output(rendered, label="places search")
+            return result.to_agent_string()
+
+        async def place_details(ctx: RunContext[SharedState], args: PlaceDetailsArgs) -> str:
+            """Fetch full details for a Google place_id. See tool contract for full spec."""
+            from tools.places_tool import (
+                place_details as _place_details,
+                render_place_details,
+                PlaceDetailsArgs as _PlaceDetailsArgs,
+            )
+            print(f"\nPLACES: place_details id={args.place_id!r}")
+            inner = _PlaceDetailsArgs(place_id=args.place_id)
+            result = await _place_details(inner, http_client=ctx.deps.http_client)
+            if result.status == "ok" and result.data is not None:
+                rendered = render_place_details(result.data)
+                return _truncate_tool_output(rendered, label="place details")
+            return result.to_agent_string()
+
+        async def get_directions(ctx: RunContext[SharedState], args: GetDirectionsArgs) -> str:
+            """Compute a route between two locations via Google Routes. See tool contract."""
+            from tools.places_tool import (
+                get_directions as _get_directions,
+                render_directions,
+                GetDirectionsArgs as _GetDirectionsArgs,
+            )
+            print(
+                f"\nPLACES: directions {args.origin!r} -> {args.destination!r} "
+                f"mode={args.travel_mode}"
+            )
+            inner = _GetDirectionsArgs(
+                origin=args.origin,
+                destination=args.destination,
+                travel_mode=args.travel_mode,
+            )
+            result = await _get_directions(inner, http_client=ctx.deps.http_client)
+            if result.status == "ok" and result.data is not None:
+                rendered = render_directions(result.data)
+                return _truncate_tool_output(rendered, label="directions")
             return result.to_agent_string()
 
         async def remember(ctx: RunContext[SharedState], args: RememberArgs) -> str:
@@ -2401,6 +2498,9 @@ class AgentManager:
             ("recall", recall),
             ("calendar_create", calendar_create),
             ("calendar_list", calendar_list),
+            ("find_place", find_place),
+            ("place_details", place_details),
+            ("get_directions", get_directions),
             ("remember", remember),
             ("link_account", link_account),
         ]
@@ -2455,6 +2555,32 @@ async def _refuse_forgeable_binding() -> None:
             "is a process-random dev secret. Set AUTH_SECRET_KEY, or bind "
             "127.0.0.1."
         )
+
+
+@app.on_event("startup")
+async def _validate_google_calendar_credentials() -> None:
+    """Fail loudly (but not fatally) at boot if GOOGLE_CALENDAR_CREDENTIALS_JSON
+    is malformed, instead of only surfacing it on the first calendar tool call
+    or OAuth connect attempt.
+
+    Concretely catches the mistake of pasting the bare client-secret string
+    (e.g. "GOCSPX-...") instead of the full OAuth client JSON downloaded from
+    Google Cloud Console — that used to fail silently until a user tried to
+    connect their calendar.
+    """
+    raw = (settings.google_calendar_credentials_json or "").strip()
+    if not raw:
+        return  # Calendar integration is optional; unset is not an error.
+    try:
+        from apps.calendar_oauth_routes import validate_credentials_json
+        ok, message, _config = validate_credentials_json(raw)
+    except Exception as e:
+        print(f"LOG: GOOGLE_CALENDAR_CREDENTIALS_JSON validation skipped: {e}")
+        return
+    if ok:
+        print("LOG: GOOGLE_CALENDAR_CREDENTIALS_JSON is valid (client_id + client_secret present).")
+    else:
+        print(f"LOG: WARNING - GOOGLE_CALENDAR_CREDENTIALS_JSON is misconfigured: {message}")
 
 
 @app.on_event("startup")
@@ -2614,6 +2740,9 @@ app.include_router(_onboarding_router)
 
 from apps.admin_routes import router as _admin_router
 app.include_router(_admin_router)
+
+from apps.calendar_oauth_routes import router as _calendar_oauth_router
+app.include_router(_calendar_oauth_router)
 
 
 # Per-(user_id, channel) SharedState cache. Channels now run through the SAME
