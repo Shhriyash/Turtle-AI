@@ -1,10 +1,10 @@
-version: "3.8"
-
 services:
   turtle-agent:
     build: .
-    ports:
-      - "8000:8000"
+    # Not published to the host directly — Caddy terminates TLS on 80/443 and
+    # proxies to this service over the internal compose network (see below).
+    expose:
+      - "8000"
     volumes:
       - ./data:/app/data
     environment:
@@ -17,24 +17,86 @@ services:
       # public constant that lets anyone forge session cookies. ${VAR:?msg} makes
       # `docker compose up` fail loudly if it is unset.
       - AUTH_SECRET_KEY=${AUTH_SECRET_KEY:?AUTH_SECRET_KEY must be set to a real secret}
-      # Public base URL used to build magic links / forget-me links. Must be the
-      # externally reachable URL of this deployment.
+      # Public base URL used to build magic links / forget-me links / the
+      # Google Calendar OAuth redirect_uri. Must be the externally reachable
+      # HTTPS URL of this deployment (the sslip.io / domain host Caddy serves).
       - TURTLE_PUBLIC_BASE_URL=${TURTLE_PUBLIC_BASE_URL:?TURTLE_PUBLIC_BASE_URL must be set}
       # Admin dashboard gate (/admin, /admin/users, POST /api/config). Optional:
       # when unset the admin endpoints return 503 and config POST stays open.
       - TURTLE_ADMIN_TOKEN=${TURTLE_ADMIN_TOKEN}
       # --- LLM / STT / TTS / RAG providers -------------------------------------
+      - OPEN_ROUTER_MODEL=${OPEN_ROUTER_MODEL}
+      - OPEN_ROUTER_API_KEY_1=${OPEN_ROUTER_API_KEY_1}
+      - OPEN_ROUTER_API_KEY_2=${OPEN_ROUTER_API_KEY_2}
+      - OPEN_ROUTER_API_KEY_3=${OPEN_ROUTER_API_KEY_3}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL}
+      - OPENROUTER_TOOL_FALLBACK_MODEL=${OPENROUTER_TOOL_FALLBACK_MODEL}
+      - OPENROUTER_APP_URL=${OPENROUTER_APP_URL}
+      - OPENROUTER_APP_TITLE=${OPENROUTER_APP_TITLE}
+      - GROQ_PRIMARY_MODEL=${GROQ_PRIMARY_MODEL}
+      - GROQ_FALLBACK_MODEL=${GROQ_FALLBACK_MODEL}
       - GROQ_API_KEY=${GROQ_API_KEY}
       - GROQ_API_KEY2=${GROQ_API_KEY2}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - OPEN_ROUTER_API_KEY_1=${OPEN_ROUTER_API_KEY_1}
+      - STT_MODEL=${STT_MODEL}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION}
+      - AZURE_OPENAI_MODEL=${AZURE_OPENAI_MODEL}
       - COHERE_API_KEY=${COHERE_API_KEY}
+      - RAG_FAISS_INDEX_TYPE=${RAG_FAISS_INDEX_TYPE}
+      - RAG_FAISS_HNSW_M=${RAG_FAISS_HNSW_M}
+      - RAG_FAISS_HNSW_EF_SEARCH=${RAG_FAISS_HNSW_EF_SEARCH}
       - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - DEEPGRAM_TTS_MODEL=${DEEPGRAM_TTS_MODEL}
+      - DEEPGRAM_TTS_ENCODING=${DEEPGRAM_TTS_ENCODING}
+      - DEEPGRAM_TTS_CONTAINER=${DEEPGRAM_TTS_CONTAINER}
+      - DEEPGRAM_TTS_SAMPLE_RATE=${DEEPGRAM_TTS_SAMPLE_RATE}
+      - GROQ_TTS_MODEL=${GROQ_TTS_MODEL}
+      - GROQ_TTS_VOICE=${GROQ_TTS_VOICE}
+      - GROQ_TTS_FORMAT=${GROQ_TTS_FORMAT}
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       # --- Email (magic-link login, routine delivery, forget-me) ---------------
       - TURTLE_EMAIL_NAME=${TURTLE_EMAIL_NAME}
       - TURTLE_EMAIL_ADDRESS=${TURTLE_EMAIL_ADDRESS}
       - TURTLE_EMAIL_PASSKEY=${TURTLE_EMAIL_PASSKEY}
+      # --- Personal memory -------------------------------------------------
+      - TURTLE_PERSONAL_MEMORY_ENABLED=${TURTLE_PERSONAL_MEMORY_ENABLED}
+      - TURTLE_PERSONAL_MEMORY_DREAM_PASS_ENABLED=${TURTLE_PERSONAL_MEMORY_DREAM_PASS_ENABLED}
+      - TURTLE_PERSONAL_MEMORY_STAGE_B_ENABLED=${TURTLE_PERSONAL_MEMORY_STAGE_B_ENABLED}
+      # --- Google Maps (Places / Directions tool) -------------------------
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+      # --- Google Calendar OAuth --------------------------------------------
+      - GOOGLE_CALENDAR_CREDENTIALS_JSON=${GOOGLE_CALENDAR_CREDENTIALS_JSON}
+      - GOOGLE_CALENDAR_TOKEN_JSON=${GOOGLE_CALENDAR_TOKEN_JSON}
+      # --- Discord channel ---------------------------------------------------
+      - DISCORD_APPLICATION_ID=${DISCORD_APPLICATION_ID}
+      - DISCORD_PUBLIC_KEY=${DISCORD_PUBLIC_KEY}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       # --- Optional monitoring -------------------------------------------------
       - LOGFIRE_TOKEN=${LOGFIRE_TOKEN}
     restart: unless-stopped
+
+  # Reverse proxy + automatic HTTPS. TURTLE_TLS_HOST is the public hostname
+  # Caddy requests a Let's Encrypt cert for (must resolve to this VM's public
+  # IP — an sslip.io host works with no domain purchase, e.g.
+  # 203-0-113-10.sslip.io for IP 203.0.113.10). Google Calendar OAuth requires
+  # HTTPS, so this proxy is not optional for that feature to work.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - TURTLE_TLS_HOST=${TURTLE_TLS_HOST:?TURTLE_TLS_HOST must be set, e.g. 203-0-113-10.sslip.io}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - turtle-agent
+
+volumes:
+  caddy_data:
+  caddy_config:

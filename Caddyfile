@@ -1,0 +1,7 @@
+{$TURTLE_TLS_HOST} {
+	# Automatic HTTPS via Let's Encrypt (Caddy issues + renews the cert for
+	# TURTLE_TLS_HOST on its own — nothing else to configure). reverse_proxy
+	# transparently handles WebSocket upgrades (the /ws endpoint) alongside
+	# regular HTTP, so no separate WS block is needed.
+	reverse_proxy turtle-agent:8000
+}

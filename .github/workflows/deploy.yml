@@ -1,0 +1,30 @@
+name: deploy
+
+# Runs only after the "tests" workflow finishes on main, and only deploys if
+# that run succeeded — a red test run never reaches the server. This is the
+# CI/CD gate: push to main -> tests run -> on green, this SSHes into the
+# Oracle VM and redeploys.
+on:
+  workflow_run:
+    workflows: ["tests"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Oracle VM
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/turtle-ai
+            git fetch origin main
+            git reset --hard origin/main
+            docker compose up -d --build --remove-orphans
+            docker image prune -f
