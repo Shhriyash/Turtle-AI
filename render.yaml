@@ -40,6 +40,15 @@ services:
         value: cloud
       - key: SERVER_HOST
         value: 0.0.0.0
+      # Public origin the browser reaches this service at. Used to build the
+      # Google Calendar OAuth redirect_uri and the "connect" links, so it MUST
+      # be the real Render URL (no trailing slash), NOT the localhost default.
+      # Set this to your service URL after the first deploy, e.g.
+      #   https://turtle-ai.onrender.com
+      # and register {this}/integrations/google_calendar/callback as an
+      # authorized redirect URI in the Google Cloud console.
+      - key: TURTLE_PUBLIC_BASE_URL
+        sync: false
       # PORT is injected by Render automatically — do NOT set it here.
       #
       # Secrets & runtime config — sync:false means Render prompts for the value
