@@ -1,10 +1,8 @@
 services:
   turtle-agent:
     build: .
-    # Not published to the host directly — Caddy terminates TLS on 80/443 and
-    # proxies to this service over the internal compose network (see below).
-    expose:
-      - "8000"
+    ports:
+      - "8000:8000"
     volumes:
       - ./data:/app/data
     environment:
@@ -19,7 +17,7 @@ services:
       - AUTH_SECRET_KEY=${AUTH_SECRET_KEY:?AUTH_SECRET_KEY must be set to a real secret}
       # Public base URL used to build magic links / forget-me links / the
       # Google Calendar OAuth redirect_uri. Must be the externally reachable
-      # HTTPS URL of this deployment (the sslip.io / domain host Caddy serves).
+      # HTTPS URL of this deployment.
       - TURTLE_PUBLIC_BASE_URL=${TURTLE_PUBLIC_BASE_URL:?TURTLE_PUBLIC_BASE_URL must be set}
       # Admin dashboard gate (/admin, /admin/users, POST /api/config). Optional:
       # when unset the admin endpoints return 503 and config POST stays open.
@@ -76,27 +74,3 @@ services:
       # --- Optional monitoring -------------------------------------------------
       - LOGFIRE_TOKEN=${LOGFIRE_TOKEN}
     restart: unless-stopped
-
-  # Reverse proxy + automatic HTTPS. TURTLE_TLS_HOST is the public hostname
-  # Caddy requests a Let's Encrypt cert for (must resolve to this VM's public
-  # IP — an sslip.io host works with no domain purchase, e.g.
-  # 203-0-113-10.sslip.io for IP 203.0.113.10). Google Calendar OAuth requires
-  # HTTPS, so this proxy is not optional for that feature to work.
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      - TURTLE_TLS_HOST=${TURTLE_TLS_HOST:?TURTLE_TLS_HOST must be set, e.g. 203-0-113-10.sslip.io}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - turtle-agent
-
-volumes:
-  caddy_data:
-  caddy_config:
