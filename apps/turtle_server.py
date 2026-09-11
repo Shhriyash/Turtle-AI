@@ -326,7 +326,7 @@ def _build_user_greeting_block(user_id: str) -> str:
 def _build_turn_instructions(state: "SharedState") -> str:
     """Per-turn dynamic instructions: greeting, live clock/timezone, and the
     memory block. Runs on every model call (including fallback rungs), so the
-    model always sees the CURRENT memory snapshot exactly once — never baked
+    model always sees the CURRENT memory snapshot exactly once, never baked
     into persisted user turns where stale copies accumulate and contradict
     corrections."""
     import datetime as _dt
@@ -346,10 +346,29 @@ def _build_turn_instructions(state: "SharedState") -> str:
     now_utc = _dt.datetime.now(_dt.UTC).strftime("%A, %d %B %Y, %H:%M UTC")
     parts.append(f"Current date and time: {now_utc}")
     parts.append(f"User timezone: {tz_name}")
+
+    # Channel-aware formatting hint: the static system prompt describes both
+    # the voice rules and the text markdown rules; this line tells the model
+    # which one is active RIGHT NOW so it never fires the wrong ruleset. Voice
+    # channels get plain speakable text; every text/chat channel gets markdown.
+    channel = str(getattr(state, "channel", "") or "").strip() if state is not None else ""
+    if channel in _VOICE_CHANNELS:
+        parts.append(
+            "Output channel: voice. Follow <voice_first_output_rules>: plain "
+            "spoken English, no markdown, no bullet characters, no em/en dashes."
+        )
+    elif channel:
+        parts.append(
+            f"Output channel: {channel} (text). Follow <text_formatting_rules>: "
+            "markdown IS rendered here, use **bold** labels, `- ` bullets and blank "
+            "lines to make multi-part answers scannable. Never use em (—) or en (–) "
+            "dashes anywhere in the reply."
+        )
+
     memory_block = (state.memory_context or "").strip() if state is not None else ""
     if memory_block:
         parts.append(
-            "Current user memory (authoritative; this is the only current copy — "
+            "Current user memory (authoritative; this is the only current copy, "
             "any memory blocks inside older conversation turns are stale snapshots):\n"
             + memory_block
         )
