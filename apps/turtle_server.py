@@ -100,13 +100,9 @@ from core.email_flow import (
     validate_send_email_args,
 )
 from core.output_clean import clean_text_for_model, clean_text_for_tts, clean_text_for_display
-from core.channel_gate import ChannelGateBuffer
 from core.confirmation_gate import ConfirmationGate
-from core.guardrails import (
-    StorageCapExceededError,
-    WebSocketRateLimitExceeded,
-    ws_rate_limiter,
-)
+from core.guardrails import StorageCapExceededError, WebSocketRateLimitExceeded
+from core.storage.factory import get_channel_gate_buffer, get_ws_rate_limiter
 from core.telemetry import emit as emit_event, emit_once as emit_event_once
 from core.memory_journal import JournalStore, make_event
 from core.memory_schema import decide_write_policy, statement_for
@@ -2772,8 +2768,9 @@ _CHANNEL_STATE_IDLE_TTL_S = 10 * 60
 # Channel-native confirmation-gate answer buffer (ISSUE-011) — tracks the one
 # outstanding memory-gate prompt per (user_id, channel) so a plain "yes"/"no"
 # chat reply can answer it. See core/channel_gate.py for the narrow-match
-# rules; this is a process-local singleton, same posture as _CHANNEL_STATES.
-_CHANNEL_GATE_BUFFER = ChannelGateBuffer()
+# rules. Process-local singleton in local mode; Redis-backed (shared across
+# invocations) in cloud mode — see core/storage/factory.get_channel_gate_buffer.
+_CHANNEL_GATE_BUFFER = get_channel_gate_buffer()
 
 
 def _channel_state_lock(key: tuple[str, str]) -> asyncio.Lock:
@@ -3766,7 +3763,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # WebSocketRateLimitExceeded so we can close cleanly.
                 async def _check_user_message_rate() -> bool:
                     try:
-                        ws_rate_limiter.check_and_record(user_id)
+                        get_ws_rate_limiter().check_and_record(user_id)
                         return True
                     except WebSocketRateLimitExceeded as exc:
                         await _ws_send_json(ws, {

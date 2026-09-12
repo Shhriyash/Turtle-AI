@@ -403,6 +403,71 @@ class StorageFactorySelectionTest(unittest.TestCase):
             self.assertIsInstance(store, FAISSVectorStore)
 
 
+class RateLimiterAndGateSelectionTest(unittest.TestCase):
+    """get_ws_rate_limiter/get_channel_gate_buffer must select local vs.
+    Redis off settings.is_cloud, AND cache exactly one instance per process
+    (a fresh instance per call would silently drop every outstanding prompt /
+    rate-limit counter between calls — see core/storage/factory.py's
+    docstring on this)."""
+
+    def setUp(self) -> None:
+        # These two module-level caches persist across tests; reset them so
+        # each test observes only its own patched settings.is_cloud.
+        import core.storage.factory as factory
+
+        self._factory = factory
+        self._orig_rate_limiter = factory._rate_limiter
+        self._orig_gate_buffer = factory._channel_gate_buffer
+        factory._rate_limiter = None
+        factory._channel_gate_buffer = None
+
+    def tearDown(self) -> None:
+        self._factory._rate_limiter = self._orig_rate_limiter
+        self._factory._channel_gate_buffer = self._orig_gate_buffer
+
+    def test_local_mode_returns_local_rate_limiter(self) -> None:
+        with patch("core.storage.factory.settings") as fake_settings:
+            fake_settings.is_cloud = False
+            from core.guardrails import WebSocketRateLimiter
+
+            limiter = self._factory.get_ws_rate_limiter()
+            self.assertIsInstance(limiter, WebSocketRateLimiter)
+
+    def test_cloud_mode_returns_redis_rate_limiter(self) -> None:
+        with patch("core.storage.factory.settings") as fake_settings:
+            fake_settings.is_cloud = True
+            limiter = self._factory.get_ws_rate_limiter()
+            self.assertEqual(type(limiter).__name__, "RedisWebSocketRateLimiter")
+
+    def test_rate_limiter_is_cached_across_calls(self) -> None:
+        with patch("core.storage.factory.settings") as fake_settings:
+            fake_settings.is_cloud = False
+            first = self._factory.get_ws_rate_limiter()
+            second = self._factory.get_ws_rate_limiter()
+            self.assertIs(first, second)
+
+    def test_local_mode_returns_local_channel_gate_buffer(self) -> None:
+        with patch("core.storage.factory.settings") as fake_settings:
+            fake_settings.is_cloud = False
+            from core.channel_gate import ChannelGateBuffer
+
+            buffer = self._factory.get_channel_gate_buffer()
+            self.assertIsInstance(buffer, ChannelGateBuffer)
+
+    def test_cloud_mode_returns_redis_channel_gate_buffer(self) -> None:
+        with patch("core.storage.factory.settings") as fake_settings:
+            fake_settings.is_cloud = True
+            buffer = self._factory.get_channel_gate_buffer()
+            self.assertEqual(type(buffer).__name__, "RedisChannelGateBuffer")
+
+    def test_channel_gate_buffer_is_cached_across_calls(self) -> None:
+        with patch("core.storage.factory.settings") as fake_settings:
+            fake_settings.is_cloud = False
+            first = self._factory.get_channel_gate_buffer()
+            second = self._factory.get_channel_gate_buffer()
+            self.assertIs(first, second)
+
+
 class RedisUrlResolutionTest(unittest.TestCase):
     def test_redis_url_prefers_primary_alias(self) -> None:
         from core.config import TurtleSettings

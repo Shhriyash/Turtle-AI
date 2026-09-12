@@ -52,3 +52,53 @@ def get_vector_store(embedding_dimension: int = 1024) -> VectorStore:
     from core.storage.local.faiss_store import get_faiss_vector_store
 
     return get_faiss_vector_store(embedding_dimension=embedding_dimension)
+
+
+# Process-wide singletons for the rate-limiter/gate classes (BOTH local and
+# cloud paths cache one instance — note_prompt/try_consume_answer and
+# check_and_record only work as a pair because the same object's state is
+# read back across separate calls; a fresh instance per call would silently
+# lose every outstanding prompt / rate-limit counter between calls).
+_rate_limiter: Any = None
+_channel_gate_buffer: Any = None
+
+
+def get_ws_rate_limiter() -> Any:
+    """core.guardrails.ws_rate_limiter locally, Redis-backed in cloud mode.
+    Deliberately NOT branched inside core/guardrails.py itself: the Redis
+    implementation needs WebSocketRateLimitExceeded from that same module, so
+    branching there would be a circular import — this factory sits above
+    both and only one of the two ever gets imported at runtime.
+    """
+    global _rate_limiter
+    if _rate_limiter is not None:
+        return _rate_limiter
+    if settings.is_cloud:
+        from core.storage.cloud.redis_backends import RedisWebSocketRateLimiter
+
+        _rate_limiter = RedisWebSocketRateLimiter()
+    else:
+        from core.guardrails import ws_rate_limiter
+
+        _rate_limiter = ws_rate_limiter
+    return _rate_limiter
+
+
+def get_channel_gate_buffer() -> Any:
+    """core.channel_gate.ChannelGateBuffer locally, Redis-backed in cloud
+    mode. Same circular-import rationale as get_ws_rate_limiter(): the Redis
+    class needs parse_gate_answer/DEFAULT_TTL_SECONDS from core.channel_gate,
+    so the branch lives here rather than in that module.
+    """
+    global _channel_gate_buffer
+    if _channel_gate_buffer is not None:
+        return _channel_gate_buffer
+    if settings.is_cloud:
+        from core.storage.cloud.redis_backends import RedisChannelGateBuffer
+
+        _channel_gate_buffer = RedisChannelGateBuffer()
+    else:
+        from core.channel_gate import ChannelGateBuffer
+
+        _channel_gate_buffer = ChannelGateBuffer()
+    return _channel_gate_buffer

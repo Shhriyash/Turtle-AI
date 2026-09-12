@@ -33,6 +33,8 @@ _pg_sync_pool: Optional[Any] = None
 _redis_client: Optional[Any] = None
 _redis_client_lock: Optional[asyncio.Lock] = None
 
+_redis_sync_client: Optional[Any] = None
+
 
 def _get_pg_lock() -> asyncio.Lock:
     # Lazily created: an asyncio.Lock binds to the running loop, and this
@@ -162,3 +164,37 @@ async def close_redis_client() -> None:
     if _redis_client is not None:
         await _redis_client.aclose()
         _redis_client = None
+
+
+def get_redis_sync_client() -> Any:
+    """Process-wide SYNCHRONOUS Redis client.
+
+    Only for callers that are themselves synchronous and run directly on the
+    event loop thread (core/guardrails.py's WebSocketRateLimiter,
+    core/channel_gate.py's ChannelGateBuffer, tools/idempotency.py — all
+    called with no `await` at their existing call sites, an existing
+    blocking-call pattern this preserves rather than changes, matching
+    get_pg_sync_pool()'s rationale). Everything else in core/storage/cloud
+    uses the async client above.
+    """
+    global _redis_sync_client
+    if _redis_sync_client is not None:
+        return _redis_sync_client
+    url = settings.redis_url
+    if not url:
+        raise CloudBackendUnavailable(
+            "REDIS_URL / UPSTASH_REDIS_URL is not set — cannot create the "
+            "sync Redis client."
+        )
+    import redis  # local import: optional dep
+
+    _redis_sync_client = redis.from_url(url, decode_responses=True)
+    return _redis_sync_client
+
+
+def close_redis_sync_client() -> None:
+    """Close the shared sync client (test teardown / graceful shutdown)."""
+    global _redis_sync_client
+    if _redis_sync_client is not None:
+        _redis_sync_client.close()
+        _redis_sync_client = None
