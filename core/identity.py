@@ -47,22 +47,30 @@ def normalize_email(email: str) -> str:
     return (email or "").strip().lower()
 
 
-def write_account_marker(user_id: str, email: str, verified: bool) -> Path:
-    """Atomically write data/memory/personal/<user_id>/account.json.
-
-    This marker is the durable email->user_id binding that lets resolve_user()
-    self-heal after a users.sqlite reset. It lives *inside* the user's memory
-    dir on purpose: a /forget-me purge rmtrees that dir and the marker dies with
-    it, so a deleted user can never be silently resurrected via rebind.
+def write_account_marker(user_id: str, email: str, verified: bool) -> Optional[Path]:
+    """Persist the durable email->user_id binding that lets resolve_user()
+    self-heal after an identity-store reset: Postgres (account_markers table)
+    in cloud mode, data/memory/personal/<user_id>/account.json locally — the
+    local file lives *inside* the user's memory dir on purpose (a /forget-me
+    purge rmtrees that dir and the marker dies with it, so a deleted user can
+    never be silently resurrected via rebind; the cloud table has its own
+    /forget-me deletion at the same call site for the same reason).
 
     ``verified`` records whether email ownership was proven (magic-link /claim
     click) or merely asserted (dev /start fast-path). Cloud rebind requires
-    verified==True. Returns the marker path.
+    verified==True. Returns the marker path locally, None in cloud mode (no
+    filesystem path exists there — no caller uses the return value).
 
     core.paths is imported lazily so tests that monkeypatch
     core.paths.PERSONAL_MEMORY_DIR are honored, and to keep the import graph
     acyclic.
     """
+    if settings.is_cloud:
+        from core.storage.cloud.identity_store import write_account_marker_pg
+
+        write_account_marker_pg(user_id, email, verified, channel=WEB_EMAIL_CHANNEL)
+        return None
+
     from core import paths  # lazy: honor monkeypatched PERSONAL_MEMORY_DIR
 
     normalized = normalize_email(email)
@@ -343,4 +351,18 @@ class IdentityManager:
             return user_id
         return None
 
-identity_manager = IdentityManager()
+def _make_identity_manager():
+    """Postgres-backed in cloud mode (users.sqlite does not survive a
+    serverless cold start), IdentityManager (aiosqlite) otherwise. Both
+    expose the same async method surface (init_db/mark_token_claimed/
+    link_channel/resolve_user), so every caller's `await identity_manager
+    .resolve_user(...)`-style usage needs no change either way.
+    """
+    if settings.is_cloud:
+        from core.storage.cloud.identity_store import PostgresIdentityManager
+
+        return PostgresIdentityManager()
+    return IdentityManager()
+
+
+identity_manager = _make_identity_manager()
