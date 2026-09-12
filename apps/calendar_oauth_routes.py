@@ -24,6 +24,7 @@ minted for one flow can't be replayed into another.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -59,8 +60,55 @@ def _secret() -> str:
 
 
 def token_path_for_user(user_id: str):
-    """Where a connected user's Calendar OAuth token lives on disk."""
+    """Where a connected user's Calendar OAuth token lives on disk (local
+    mode only — cloud mode stores it in Postgres, see _read_token/_write_token/
+    _delete_token/_token_exists below)."""
     return personal_memory_dir(user_id) / _TOKEN_FILENAME
+
+
+async def _read_token(user_id: str) -> str | None:
+    """Local disk locally; Postgres in cloud mode (survives a cold start,
+    unlike the local file — see core/storage/cloud/calendar_token_store.py).
+    """
+    if settings.is_cloud:
+        from core.storage.cloud.calendar_token_store import get_token_json
+
+        return await asyncio.to_thread(get_token_json, user_id)
+    path = token_path_for_user(user_id)
+    return path.read_text(encoding="utf-8") if path.exists() else None
+
+
+async def _write_token(user_id: str, token_json: str) -> None:
+    if settings.is_cloud:
+        from core.storage.cloud.calendar_token_store import put_token_json
+
+        await asyncio.to_thread(put_token_json, user_id, token_json)
+        return
+    path = token_path_for_user(user_id)
+    path.write_text(token_json, encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass  # best-effort on platforms without POSIX chmod semantics (Windows)
+
+
+async def _delete_token(user_id: str) -> None:
+    if settings.is_cloud:
+        from core.storage.cloud.calendar_token_store import delete_token_json
+
+        await asyncio.to_thread(delete_token_json, user_id)
+        return
+    path = token_path_for_user(user_id)
+    if path.exists():
+        path.unlink()
+
+
+async def _token_exists(user_id: str) -> bool:
+    if settings.is_cloud:
+        from core.storage.cloud.calendar_token_store import token_exists
+
+        return await asyncio.to_thread(token_exists, user_id)
+    return token_path_for_user(user_id).exists()
 
 
 def validate_credentials_json(raw: str) -> tuple[bool, str, dict[str, str] | None]:
@@ -324,12 +372,7 @@ async def callback(req: Request, code: str = "", state: str = "", error: str = "
             "— reconnect will be required once the access token expires", user_id,
         )
 
-    path = token_path_for_user(user_id)
-    path.write_text(json.dumps(token_data, indent=2), encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass  # best-effort on platforms without POSIX chmod semantics (Windows)
+    await _write_token(user_id, json.dumps(token_data, indent=2))
 
     logger.info("calendar oauth: connected Google Calendar for user_id=%s", user_id)
     return _result_page(
@@ -340,16 +383,14 @@ async def callback(req: Request, code: str = "", state: str = "", error: str = "
 
 @router.get("/status")
 async def status(req: Request) -> dict[str, bool]:
-    """Whether the signed-in user currently has a Calendar token on disk."""
+    """Whether the signed-in user currently has a Calendar token stored."""
     user_id = _require_user(req)
-    return {"connected": token_path_for_user(user_id).exists()}
+    return {"connected": await _token_exists(user_id)}
 
 
 @router.post("/disconnect")
 async def disconnect(req: Request) -> dict[str, bool]:
     """Delete the signed-in user's stored Calendar token."""
     user_id = _require_user(req)
-    path = token_path_for_user(user_id)
-    if path.exists():
-        path.unlink()
+    await _delete_token(user_id)
     return {"connected": False}
