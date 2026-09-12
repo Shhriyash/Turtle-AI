@@ -2630,6 +2630,16 @@ async def _start_discord_gateway_hook() -> None:
     import sys
     if "pytest" in sys.modules:
         return
+    if settings.is_cloud:
+        # A persistent Gateway WebSocket cannot survive a serverless cold
+        # start — this connection would be torn down (and re-IDENTIFY'd,
+        # burning Discord's rate-limited session-start allowance) on every
+        # invocation. apps/channels/discord.py's Interactions webhook
+        # (POST /channels/discord) is the serverless-shaped replacement;
+        # register it as the app's Interactions Endpoint URL in the
+        # Developer Portal instead of running this gateway.
+        print("LOG: discord gateway skipped in cloud mode — use the /channels/discord webhook")
+        return
     try:
         from apps.channels.discord_gateway import start_discord_gateway
         # start_discord_gateway spawns the gateway client as its own background
@@ -2659,6 +2669,13 @@ async def _start_telegram_gateway_hook() -> None:
     # from inside a test's app lifespan — one bot session, many test entries.
     import sys
     if "pytest" in sys.modules:
+        return
+    if settings.is_cloud:
+        # A long-poll loop needs a persistent connection, same reasoning as
+        # Discord's gateway above. apps/channels/telegram_webhook.py's
+        # webhook (POST /channels/telegram/webhook) is the serverless-shaped
+        # replacement; register it via Telegram's setWebhook instead.
+        print("LOG: telegram gateway skipped in cloud mode — use the /channels/telegram/webhook endpoint")
         return
     try:
         from apps.channels.telegram_gateway import start_telegram_gateway
@@ -2750,6 +2767,9 @@ app.include_router(_calendar_oauth_router)
 
 from apps.cron_tick_routes import router as _cron_tick_router
 app.include_router(_cron_tick_router)
+
+from apps.channels.telegram_webhook import router as _telegram_webhook_router
+app.include_router(_telegram_webhook_router)
 
 
 # Per-(user_id, channel) SharedState cache. Channels now run through the SAME
