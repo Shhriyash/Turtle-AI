@@ -63,6 +63,11 @@ vector_storage/
 *.log
 tempCodeRunnerFile.py
 
+# Some tests (e.g. test/retrieval_broker_test.py) manage their own tmp dirs
+# under test/_tmp/ instead of pytest's tmp_path fixture, cleaned up per-test
+# in tearDown — an interrupted run can still leave orphaned dirs behind.
+test/_tmp/
+
 # Database files
 *.db
 *.sqlite

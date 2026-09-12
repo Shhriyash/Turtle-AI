@@ -146,7 +146,10 @@ def test_kill_switch_enabled_reaches_store(monkeypatch):
 def test_write_topic_enqueue_gated_by_tenant(monkeypatch, tmp_path):
     monkeypatch.setattr(core_paths, "PERSONAL_MEMORY_DIR", tmp_path / "pm")
     enq = AsyncMock(return_value="job_x")
-    monkeypatch.setattr("core.personal_memory_store.queue_service.enqueue", enq)
+    # write_topic's embed dispatch moved to core.worker.dispatch_embed_personal_memory_job
+    # (Vercel migration: local mode still calls queue_service.enqueue directly;
+    # cloud mode self-invokes an endpoint instead — see that function's docstring).
+    monkeypatch.setattr("core.worker.queue_service.enqueue", enq)
 
     async def run():
         # default tenant -> enqueue skipped
@@ -182,7 +185,7 @@ def test_write_topic_enqueue_gated_by_tenant(monkeypatch, tmp_path):
 def test_str_content_normalized_to_lines_before_enqueue(monkeypatch, tmp_path):
     monkeypatch.setattr(core_paths, "PERSONAL_MEMORY_DIR", tmp_path / "pm")
     enq = AsyncMock(return_value="job_x")
-    monkeypatch.setattr("core.personal_memory_store.queue_service.enqueue", enq)
+    monkeypatch.setattr("core.worker.queue_service.enqueue", enq)
 
     async def run():
         base = tmp_path / "u"

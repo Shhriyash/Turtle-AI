@@ -8,7 +8,6 @@ from typing import Any
 
 from core.config import settings
 from core.io_atomic import atomic_write_text
-from core.worker import queue_service
 from core.guardrails import StorageCapExceededError, enforce_storage_cap
 from core.paths import personal_memory_dir, personal_memory_file
 from core.personal_memory_schema import (
@@ -311,28 +310,10 @@ class PersonalMemoryStore:
         # tenants are usr_*), and embedding for them would land in the SHARED
         # data/memory/personal/default/vector index — cross-tenant collapse.
         if self.user_id and self.user_id not in {"", "default"}:
-            try:
-                import asyncio
-                from core.worker import track_task
-                loop = asyncio.get_running_loop()
-                # Never hand the job a bare string: it would iterate characters.
-                embed_lines = lines.splitlines() if isinstance(lines, str) else lines
-                embed_task = loop.create_task(
-                    queue_service.enqueue(
-                        "embed_personal_memory",
-                        user_id=self.user_id,
-                        topic_name=topic_name,
-                        lines=embed_lines,
-                    )
-                )
-                # Retain the outer task (GC hazard) and surface enqueue
-                # failures. Tag by user_id so account-link merge can drain
-                # this user's in-flight embed before snapshotting the source
-                # (missed in the first drain-writers pass — every write_topic
-                # spawns one of these).
-                track_task(embed_task, user_id=self.user_id)
-            except RuntimeError:
-                pass
+            from core.worker import dispatch_embed_personal_memory_job
+            # Never hand the job a bare string: it would iterate characters.
+            embed_lines = lines.splitlines() if isinstance(lines, str) else lines
+            dispatch_embed_personal_memory_job(self.user_id, topic_name, embed_lines)
 
         return parse_markdown_memory(serialized, default_topic=normalized_metadata["topic"])
 

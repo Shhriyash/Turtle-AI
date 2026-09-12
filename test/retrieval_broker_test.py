@@ -131,11 +131,13 @@ class RetrievalBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.base.mkdir(parents=True, exist_ok=True)
         self.store = _make_store(self.base)
         self.task_store = TaskHistoryStore(self.base / "tasks" / "history.jsonl")
-        # write_topic inside a running loop enqueues embed_personal_memory,
-        # which would hit the live Cohere API and write the real
-        # data/memory/personal/default/vector index. No-op it for tests.
+        # write_topic inside a running loop dispatches embed_personal_memory
+        # (via core.worker.dispatch_embed_personal_memory_job — local mode
+        # calls queue_service.enqueue directly), which would hit the live
+        # Cohere API and write the real data/memory/personal/default/vector
+        # index. No-op it for tests.
         self._embed_patcher = patch(
-            "core.personal_memory_store.queue_service.enqueue", new=AsyncMock()
+            "core.worker.queue_service.enqueue", new=AsyncMock()
         )
         self._embed_patcher.start()
 
