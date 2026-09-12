@@ -11,7 +11,8 @@ import threading
 from typing import Any
 
 from core.worker import task
-from core.storage.local.faiss_store import FAISSVectorStore, get_faiss_vector_store
+from core.storage import VectorStore
+from core.storage.factory import get_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -23,27 +24,29 @@ logger = logging.getLogger(__name__)
 # job hard-skips it.
 _SKIP_TENANTS = {"", "default"}
 
-def _vector_store() -> FAISSVectorStore:
-    """Return the process-wide shared FAISSVectorStore.
+def _vector_store() -> VectorStore:
+    """Return the process-wide shared vector store (FAISS locally, pgvector
+    in cloud mode — see core/storage/factory.py::get_vector_store).
 
-    Sharing ONE FAISSVectorStore means its instance-scoped per-user locks
-    (faiss_store.py) actually serialize concurrent embeds for a single user; a
-    fresh store per job defeated them, letting concurrent embeds interleave
-    _load_tenant -> add -> _save_tenant and clobber index.bin.
+    Sharing ONE store instance means its instance-scoped per-user locks
+    (faiss_store.py, local mode only) actually serialize concurrent embeds for
+    a single user; a fresh store per job defeated them, letting concurrent
+    embeds interleave _load_tenant -> add -> _save_tenant and clobber index.bin.
 
     This used to keep its OWN module-level singleton, which was correct in
     isolation but wrong in aggregate: the WebSocket path built its own store
     per connection, so the background-job store and the request-path store were
     different objects holding different lock registries for the same tenant —
     precisely the interleaving both were written to prevent, just one level up.
-    Both now resolve to the single registry in faiss_store, so there is exactly
-    one lock per tenant in the process.
+    Both now resolve to the single registry in the factory, so there is exactly
+    one lock per tenant in the process (local mode); cloud mode's pgvector
+    table needs no such lock — Postgres serializes the writes itself.
 
     Construction stays deferred to first use (never import time) because
     CohereEmbedding.__init__ requires COHERE_API_KEY — building it at import
     would break keyless environments and the offline test suite.
     """
-    return get_faiss_vector_store()
+    return get_vector_store()
 
 
 @task("embed_personal_memory")

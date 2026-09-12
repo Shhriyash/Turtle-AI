@@ -14,6 +14,7 @@ from collections import OrderedDict
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
+from core.config import settings
 from core.paths import rag_vector_dir, ensure_dirs
 from core.io_atomic import atomic_write_json
 
@@ -438,7 +439,7 @@ _vector_storage_by_user: "OrderedDict[str, VectorStorage]" = OrderedDict()
 _vector_storage_lock = threading.Lock()
 
 
-def get_vector_storage(user_id: str) -> VectorStorage:
+def get_vector_storage(user_id: str):
     """Return the cached VectorStorage for ``user_id`` (constructed on first use).
 
     Locked: FAISS search/upsert run on ``asyncio.to_thread`` worker threads, so
@@ -446,9 +447,22 @@ def get_vector_storage(user_id: str) -> VectorStorage:
     different VectorStorage objects for the same tenant — which then write the
     same index.bin from two in-memory copies. Same class of bug that
     ``FAISSVectorStore._get_lock`` guards against one layer down.
+
+    In cloud mode (TURTLE_DEPLOY=cloud) this returns a PgChunkVectorStore
+    instead — same add_chunks/search_similar/get_storage_stats surface (the
+    only methods rag/system/complete_rag.py's RAGSystem calls), backed by
+    pgvector on Neon rather than a FAISS index file on local disk, which does
+    not survive a serverless cold start. No FAISS index-file cache applies to
+    it (pgvector holds no per-process state to evict), so it bypasses the
+    LRU cache below and is constructed fresh — cheap, since it does no I/O
+    until first used.
     """
     if not user_id:
         raise ValueError("get_vector_storage requires a user_id")
+    if settings.is_cloud:
+        from core.storage.cloud.pgvector_store import PgChunkVectorStore
+
+        return PgChunkVectorStore(user_id=user_id)
     with _vector_storage_lock:
         store = _vector_storage_by_user.get(user_id)
         if store is not None:

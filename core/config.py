@@ -55,6 +55,29 @@ class TurtleSettings(BaseSettings):
     server_reload: bool = Field(default=False, alias="TURTLE_SERVER_RELOAD")
 
     # -----------------------------------------------------------------------
+    # Cloud backends (TURTLE_DEPLOY=cloud). All optional so local mode is
+    # unaffected; the cloud stores validate their own presence at startup.
+    # -----------------------------------------------------------------------
+    # Neon Postgres connection string. Vercel's Neon integration injects several
+    # aliases (DATABASE_URL, POSTGRES_URL, ...); DATABASE_URL is canonical here.
+    # Use the POOLED endpoint (…-pooler.…) on serverless so ephemeral invocations
+    # don't exhaust direct connections.
+    database_url: Optional[SecretStr] = Field(default=None, alias="DATABASE_URL")
+    # Upstash Redis. Accept the standard rediss:// URL (REDIS_URL) or Upstash's
+    # own alias (UPSTASH_REDIS_URL); redis_url resolves whichever is set.
+    redis_url_primary: Optional[SecretStr] = Field(default=None, alias="REDIS_URL")
+    redis_url_upstash: Optional[SecretStr] = Field(default=None, alias="UPSTASH_REDIS_URL")
+    # Shared secret the GitHub-Actions cron-tick workflow presents as a bearer
+    # token to the /internal/cron-tick endpoint (Phase 2). No default: the
+    # endpoint refuses to run without it in cloud.
+    cron_shared_secret: Optional[SecretStr] = Field(default=None, alias="CRON_SHARED_SECRET")
+    # Secret token verified on the Telegram webhook (Phase 4), sent by Telegram
+    # in the X-Telegram-Bot-Api-Secret-Token header (set via setWebhook).
+    telegram_webhook_secret: Optional[SecretStr] = Field(
+        default=None, alias="TELEGRAM_WEBHOOK_SECRET"
+    )
+
+    # -----------------------------------------------------------------------
     # API Keys
     # -----------------------------------------------------------------------
     openrouter_api_key: Optional[SecretStr] = Field(default=None, alias="OPENROUTER_API_KEY")
@@ -244,6 +267,20 @@ class TurtleSettings(BaseSettings):
     def is_cloud(self) -> bool:
         """Returns True if running in cloud deployment mode (enables Arq, strict auth, etc)."""
         return self.deploy_mode.lower() == "cloud"
+
+    @property
+    def redis_url(self) -> Optional[str]:
+        """Resolved Redis connection URL, whichever env alias is set.
+
+        REDIS_URL wins when both are present (an explicit override beats the
+        Marketplace-injected default).
+        """
+        for secret in (self.redis_url_primary, self.redis_url_upstash):
+            if secret is not None:
+                value = secret.get_secret_value().strip()
+                if value:
+                    return value
+        return None
 
 
 # Global singleton

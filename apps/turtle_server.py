@@ -2862,13 +2862,13 @@ async def _build_channel_state(user_id: str, channel: str) -> SharedState:
     task_history_store = TaskHistoryStore(TASK_HISTORY_FILE, user_id=user_id)
     rag_system = TurtleRAGSystem(user_id=user_id)
 
-    from core.storage.local.faiss_store import get_faiss_vector_store
+    from core.storage.factory import get_vector_store
     from core.retrieval_broker import RetrievalBroker
     # Process singleton, not per-connection: the store is already keyed by
     # user_id internally, so a fresh instance per socket duplicated every
     # tenant's index in RAM and split the per-tenant locks. See
-    # core/storage/local/faiss_store.get_faiss_vector_store.
-    vector_store = get_faiss_vector_store()
+    # core/storage/factory.get_vector_store (FAISS locally, pgvector in cloud).
+    vector_store = get_vector_store()
     retrieval_broker = RetrievalBroker(
         store=personal_memory_store,
         task_store=task_history_store,
@@ -3657,10 +3657,10 @@ async def websocket_endpoint(ws: WebSocket):
         rag_system = TurtleRAGSystem(user_id=user_id)
 
         # D4: construct RetrievalBroker for 4-tier memory context retrieval
-        from core.storage.local.faiss_store import get_faiss_vector_store
+        from core.storage.factory import get_vector_store
         from core.retrieval_broker import RetrievalBroker
         # Process singleton — see the channel-state twin above.
-        vector_store = get_faiss_vector_store()
+        vector_store = get_vector_store()
         retrieval_broker = RetrievalBroker(
             store=personal_memory_store,
             task_store=task_history_store,

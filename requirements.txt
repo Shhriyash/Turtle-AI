@@ -50,6 +50,21 @@ sqlalchemy>=2.0
 aiosqlite==0.22.1   # async SQLite — core/identity + session store
 PyJWT==2.12.1       # apps/auth session tokens
 
+# Cloud storage backends (TURTLE_DEPLOY=cloud only). Local/SQLite mode never
+# imports these — the cloud stores under core/storage/cloud/ import them lazily
+# on instantiation, so a local dev box that never installs them still boots and
+# passes the suite. Present in the manifest so the Vercel build installs them.
+asyncpg>=0.30.0     # async Postgres driver (Neon) — cloud session/journal/etc
+pgvector>=0.3.6     # registers the pgvector type on asyncpg AND psycopg
+redis>=5.2.0        # async Redis client (Upstash rediss://) — rate limiter, gates, pub/sub
+# Sync Postgres driver + pool: rag/system/complete_rag.py's TurtleRAGSystem
+# calls vector_store.add_chunks/search_similar SYNCHRONOUSLY, directly on the
+# event loop (no await, no to_thread — apps/turtle_server.py:4443/4668) — an
+# existing blocking-call pattern this migration preserves rather than changes.
+# asyncpg cannot be called that way, so PgChunkVectorStore (the cloud
+# replacement for that one call site) uses psycopg instead.
+psycopg[binary,pool]>=3.2
+
 # Discord gateway (natural DM/@mention bot mode ONLY). The interactions-webhook
 # mode in apps/channels/discord.py needs no extra deps — it verifies Ed25519
 # signatures with `cryptography` (already present above). Not importing this at
