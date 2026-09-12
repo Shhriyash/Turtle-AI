@@ -25,7 +25,6 @@ import shutil
 import unittest
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 
 # Repo root = turtle/ (this file lives in turtle/test/).
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,35 +88,39 @@ except Exception as _e:  # pragma: no cover — optional deps missing in env
     _IMPORT_ERROR = _e
 
 
-def _make_store(base: Path) -> "PersonalMemoryStore":
-    return PersonalMemoryStore(
-        base_dir=base,
-        index_path=base / "MEMORY.md",
-        logs_dir=base / "logs",
-        topic_paths={
-            "identity": base / "identity.md",
-            "preferences": base / "preferences.md",
-            "workflow": base / "workflow.md",
-            "contacts": base / "contacts.md",
-            "projects": base / "projects.md",
-            "corrections": base / "corrections.md",
-        },
-    )
-
-
 @unittest.skipIf(_IMPORT_ERROR is not None, f"server deps missing: {_IMPORT_ERROR}")
 class MemoryEndpointContractTests(unittest.TestCase):
+    """Exercises the endpoints as they actually run in production: each
+    request builds its own ConfirmationGate straight from storage
+    (turtle_server._build_confirmation_gate_for_user), not from a
+    process-cached SharedState — see that function's docstring for why
+    (this is the fix for the documented multi-worker/cross-instance
+    /api/memory/confirm 404). Isolation is via a redirected
+    core.paths.PERSONAL_MEMORY_DIR, matching every other test in this suite
+    that exercises real storage (e.g. test/production_onboarding_test.py),
+    rather than injecting a fake SharedState.
+    """
+
     USER = "local_dev_user"
 
     def setUp(self) -> None:
         self.base = Path("test") / "_tmp" / f"phase2_gate_ui_{uuid.uuid4().hex}"
         self.base.mkdir(parents=True, exist_ok=True)
-        self.store = _make_store(self.base)
-        self.journal = JournalStore(journal_dir=self.base / "journal")
+
+        import core.paths as paths_mod
+        self._orig_personal_dir = paths_mod.PERSONAL_MEMORY_DIR
+        paths_mod.PERSONAL_MEMORY_DIR = self.base / "personal"
+        paths_mod.PERSONAL_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+        # The gate the test queues candidates through directly, resolving to
+        # the SAME storage the endpoint will build its own gate from — both
+        # go through the redirected PERSONAL_MEMORY_DIR.
+        self.journal = JournalStore(user_id=self.USER)
+        self.store = PersonalMemoryStore(user_id=self.USER)
         self.gate = ConfirmationGate(
             journal=self.journal,
             store=self.store,
-            state_path=self.base / "confirmation_state.json",
+            state_path=paths_mod.personal_memory_dir(self.USER) / "confirmation_state.json",
         )
 
         # The endpoints resolve the user via _get_user_id_from_request, which
@@ -130,13 +133,6 @@ class MemoryEndpointContractTests(unittest.TestCase):
         self._orig_dev_anon = turtle_server.settings.dev_anon
         turtle_server.settings.dev_anon = True
 
-        # Inject a minimal active state carrying our real gate. The endpoints
-        # only touch state.confirmation_gate.
-        self._prev_state = turtle_server._ACTIVE_STATES_BY_USER.get(self.USER)
-        turtle_server._ACTIVE_STATES_BY_USER[self.USER] = SimpleNamespace(
-            confirmation_gate=self.gate
-        )
-
         # No lifespan/startup: instantiate the client directly (not as a
         # context manager) so no server startup hooks fire.
         self.client = TestClient(turtle_server.app)
@@ -144,10 +140,8 @@ class MemoryEndpointContractTests(unittest.TestCase):
     def tearDown(self) -> None:
         turtle_server.settings.deploy_mode = self._orig_deploy_mode
         turtle_server.settings.dev_anon = self._orig_dev_anon
-        if self._prev_state is None:
-            turtle_server._ACTIVE_STATES_BY_USER.pop(self.USER, None)
-        else:
-            turtle_server._ACTIVE_STATES_BY_USER[self.USER] = self._prev_state
+        import core.paths as paths_mod
+        paths_mod.PERSONAL_MEMORY_DIR = self._orig_personal_dir
         shutil.rmtree(self.base, ignore_errors=True)
 
     def _queue_candidate(self, *, key: str, value: dict) -> str:
@@ -223,10 +217,11 @@ class MemoryEndpointContractTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
         self.assertIn("error", resp.json())
 
-    def test_pending_empty_when_no_active_session(self) -> None:
-        # Drop the injected state: the endpoint must degrade to an empty list,
-        # never a 500 — the panel relies on this for its empty state.
-        turtle_server._ACTIVE_STATES_BY_USER.pop(self.USER, None)
+    def test_pending_empty_when_nothing_queued(self) -> None:
+        # A user with no queued candidates (and, in particular, no live
+        # SharedState anywhere) must still get a clean empty list, never a
+        # 500 — the endpoint builds its own gate straight from storage now,
+        # so there is no "active session" precondition left to fail.
         resp = self.client.get("/api/memory/pending")
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(resp.json(), {"pending": []})

@@ -84,6 +84,21 @@ def get_ws_rate_limiter() -> Any:
     return _rate_limiter
 
 
+def get_confirmation_state_backend(user_id: str) -> Any:
+    """PostgresConfirmationState in cloud mode, None locally (ConfirmationGate
+    falls back to its own local-JSON-file backend when no explicit backend is
+    passed — see core/confirmation_gate.py's __init__). Not cached as a
+    singleton like the rate limiter/gate buffer above: this is a per-user
+    object with no shared cross-call state of its own (each load/save is a
+    fresh Postgres round trip), so a new instance per call is free.
+    """
+    if settings.is_cloud:
+        from core.storage.cloud.confirmation_state_store import PostgresConfirmationState
+
+        return PostgresConfirmationState(user_id)
+    return None
+
+
 def get_channel_gate_buffer() -> Any:
     """core.channel_gate.ChannelGateBuffer locally, Redis-backed in cloud
     mode. Same circular-import rationale as get_ws_rate_limiter(): the Redis
