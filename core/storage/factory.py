@@ -84,6 +84,30 @@ def get_ws_rate_limiter() -> Any:
     return _rate_limiter
 
 
+def get_link_code_store() -> Any:
+    """core.account_linking.LinkCodeStore(identity_manager.db_path) locally,
+    PostgresLinkCodeStore in cloud mode.
+
+    Not just a Postgres-vs-SQLite swap: identity_manager.db_path (what the
+    local class's constructor needs) only exists on the LOCAL
+    core.identity.IdentityManager — in cloud mode identity_manager is a
+    PostgresIdentityManager with no db_path attribute at all, so the two
+    call sites in apps/turtle_server.py that used to build
+    LinkCodeStore(identity_manager.db_path) directly would raise
+    AttributeError outright. This factory is what lets both call sites stay
+    identical regardless of mode — both store types expose the same
+    issue/peek/reserve/release_reservation/consume/purge_expired surface.
+    """
+    if settings.is_cloud:
+        from core.storage.cloud.account_linking_store import PostgresLinkCodeStore
+
+        return PostgresLinkCodeStore()
+    from core.account_linking import LinkCodeStore
+    from core.identity import identity_manager
+
+    return LinkCodeStore(identity_manager.db_path)
+
+
 def get_confirmation_state_backend(user_id: str) -> Any:
     """PostgresConfirmationState in cloud mode, None locally (ConfirmationGate
     falls back to its own local-JSON-file backend when no explicit backend is

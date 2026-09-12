@@ -2341,10 +2341,10 @@ class AgentManager:
                     "message and I'll set it up there."
                 ).to_agent_string()
             try:
-                from core.account_linking import LINK_CODE_TTL_MINUTES, LinkCodeStore
-                from core.identity import identity_manager
+                from core.account_linking import LINK_CODE_TTL_MINUTES
+                from core.storage.factory import get_link_code_store
 
-                store = LinkCodeStore(identity_manager.db_path)
+                store = get_link_code_store()
                 issued = await asyncio.to_thread(
                     store.issue,
                     channel=channel,
@@ -3507,11 +3507,12 @@ async def link_account_redeem(request: Request):
         return JSONResponse({"error": "code is required"}, status_code=400)
 
     from core.account_linking import (
-        LinkCodeStore, mark_consumed, merge_memory, release_reservation, reserve,
+        mark_consumed, merge_memory, release_reservation, reserve,
     )
     from core.identity import identity_manager
+    from core.storage.factory import get_link_code_store
 
-    store = LinkCodeStore(identity_manager.db_path)
+    store = get_link_code_store()
 
     # ── ORDERING (post-Codex-verification-pass):
     #   1. RESERVE the code atomically for THIS target user_id. Same-target
