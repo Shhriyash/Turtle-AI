@@ -1,0 +1,120 @@
+name: deploy-vercel
+
+# The single, test-gated path to both production and preview deploys for
+# this monolith. Triggered off the "tests" workflow's completion (same
+# workflow_run pattern the old Azure deploy.yml used) rather than directly on
+# push/pull_request, so a red test run can NEVER reach either environment —
+# not "GitHub Actions ran deploy anyway", the deploy job's `if:` literally
+# requires workflow_run.conclusion == 'success'.
+#
+# IMPORTANT — this is the ONLY deploy path. Vercel's own dashboard Git
+# integration (if connected) auto-deploys on every push/PR independent of
+# this workflow, which would race it and let an untested commit reach
+# production anyway. Either leave the repo DISCONNECTED from Vercel's Git
+# integration entirely (recommended — this workflow is then the sole way
+# anything reaches Vercel), or if you connect it for its preview-comment UI,
+# go to Project Settings -> Git and disable "Automatically deploy commits
+# pushed to main" so production only ever happens through this gate.
+on:
+  workflow_run:
+    workflows: ["tests"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write   # only used by deploy-preview to comment the URL
+
+jobs:
+  deploy-production:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest
+
+      - name: Pull Vercel project settings (production)
+        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Build
+        run: vercel build --prod --token="$VERCEL_TOKEN"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy to production
+        id: deploy
+        run: |
+          url=$(vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "### Deployed to production" >> "$GITHUB_STEP_SUMMARY"
+          echo "$url" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+  deploy-preview:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest
+
+      - name: Pull Vercel project settings (preview)
+        run: vercel pull --yes --environment=preview --token="$VERCEL_TOKEN"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Build
+        run: vercel build --token="$VERCEL_TOKEN"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy preview
+        id: deploy
+        run: |
+          url=$(vercel deploy --prebuilt --token="$VERCEL_TOKEN")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "### Preview deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "$url" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Comment preview URL on the PR
+        # workflow_run only carries pull_requests[] when the run and the PR
+        # share the same repo (not for forks — GitHub withholds it there for
+        # security). Skip quietly rather than fail when it's absent; the URL
+        # is still in the job summary either way.
+        if: ${{ github.event.workflow_run.pull_requests[0].number }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
+            --body "Preview deployed: $PREVIEW_URL"
