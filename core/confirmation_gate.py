@@ -317,10 +317,11 @@ class ConfirmationGate:
         if event_count < self.first_session_event_threshold:
             return True
         try:
-            ctime = self.journal.journal_dir.stat().st_ctime
-            account_age_hours = (datetime.now(UTC).timestamp() - ctime) / 3600
-            if account_age_hours < self.first_session_account_age_hours:
-                return True
+            ctime = self.journal.get_created_at_timestamp()
+            if ctime is not None:
+                account_age_hours = (datetime.now(UTC).timestamp() - ctime) / 3600
+                if account_age_hours < self.first_session_account_age_hours:
+                    return True
         except Exception:
             pass
         return False
