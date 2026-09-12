@@ -1,0 +1,18 @@
+# requirements-local.txt
+# ------------------------
+# Local-only voice-hardware / desktop tooling for rtc_vad/ (standalone mic
+# capture + VAD experimentation) — NOT imported anywhere in the server's own
+# import chain (apps/turtle_server.py) and NOT exercised by the test suite.
+# Deliberately kept OUT of requirements.txt: Vercel's Python build auto-detects
+# and installs from requirements.txt with no apt/system-package access, and
+# pyaudio in particular needs system PortAudio headers to build from source
+# (this repo's own CI apt-installs portaudio19-dev before pip install for
+# exactly that reason — a step Vercel's build has no equivalent of).
+#
+# Install with: pip install -r requirements.txt -r requirements-local.txt
+
+-r requirements.txt
+
+pyaudio==0.2.14
+fastrtc==0.0.34
+keyboard==0.13.5

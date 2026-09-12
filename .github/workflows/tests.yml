@@ -23,16 +23,12 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install system libraries
-        # pyaudio builds a C extension against PortAudio; ubuntu-latest ships
-        # neither the headers (portaudio.h) nor the lib, so its wheel build
-        # fails and aborts `pip install` before any test runs. pyaudio is used
-        # only by the standalone VAD/TTS scripts (rtc_vad/, tools/tts/),
-        # not by the app or the test suite — but it's pinned in requirements.txt,
-        # so the install must be able to build it.
-        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
-
       - name: Install dependencies
+        # pyaudio (and the rest of rtc_vad/'s standalone local-mic tooling)
+        # moved to requirements-local.txt — it's not imported anywhere in the
+        # app or the test suite, and needs system PortAudio headers to build
+        # from source, which is why it's no longer in requirements.txt at all
+        # (see that file's comment). No apt step needed here anymore.
         # pytest is a test-only dependency, deliberately not in requirements.txt
         # (the app doesn't need it at runtime). Install it here so the suite can
         # run. Pinned to match local dev.
