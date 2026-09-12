@@ -6,9 +6,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from core.config import settings
 from core.io_atomic import atomic_write_text
 from core.worker import queue_service
-from core.guardrails import enforce_storage_cap
+from core.guardrails import StorageCapExceededError, enforce_storage_cap
 from core.paths import personal_memory_dir, personal_memory_file
 from core.personal_memory_schema import (
     MarkdownMemoryDocument,
@@ -45,6 +46,141 @@ class PersonalMemoryIndexEntry:
     summary: str
 
 
+# ---------------------------------------------------------------------------
+# Storage backends
+# ---------------------------------------------------------------------------
+# Extracted so a cloud counterpart (core/storage/cloud/personal_memory_store.py
+# ::PostgresPersonalMemoryBackend) can drop in behind the same 7-method
+# surface without PersonalMemoryStore's business logic (frontmatter
+# serialization, no-op write elision, storage-cap enforcement, the embed-job
+# enqueue) needing to know which one it's talking to. This is what closes a
+# real gap found in a post-migration audit: the local file backend has ZERO
+# is_cloud awareness in its constructor path (personal_memory_dir/
+# personal_memory_file), so the topic markdown that
+# core/personal_memory_prompt.py actually renders into every chat turn's
+# prompt was silently vanishing on every serverless cold start.
+
+
+class _LocalPersonalMemoryBackend:
+    """Original file-based implementation, unchanged in behavior."""
+
+    def __init__(self, base_dir: Path, index_path: Path, logs_dir: Path) -> None:
+        self.base_dir = base_dir
+        self.index_path = index_path
+        self.logs_dir = logs_dir
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        if not self.index_path.exists():
+            atomic_write_text(self.index_path, "")
+
+    def read_topic(self, topic_path: Path) -> str | None:
+        if not topic_path.exists():
+            return None
+        return topic_path.read_text(encoding="utf-8")
+
+    def write_topic(self, topic_path: Path, content: str) -> None:
+        topic_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(topic_path, content)
+
+    def delete_topic(self, topic_path: Path) -> bool:
+        if topic_path.exists():
+            topic_path.unlink()
+            return True
+        return False
+
+    def topic_exists(self, topic_path: Path) -> bool:
+        return topic_path.exists()
+
+    def topic_size_bytes(self, topic_path: Path) -> int:
+        try:
+            return topic_path.stat().st_size if topic_path.exists() else 0
+        except OSError:
+            return 0
+
+    def read_index(self) -> str | None:
+        if not self.index_path.exists():
+            return None
+        return self.index_path.read_text(encoding="utf-8")
+
+    def write_index(self, content: str) -> None:
+        atomic_write_text(self.index_path, content)
+
+    def read_daily_log(self, log_path: Path) -> str | None:
+        if not log_path.exists():
+            return None
+        return log_path.read_text(encoding="utf-8")
+
+    def write_daily_log(self, log_path: Path, content: str) -> None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(log_path, content)
+
+    def enforce_cap(self, user_id: str, *, incoming_bytes: int) -> None:
+        enforce_storage_cap(user_id, self.base_dir, incoming_bytes=incoming_bytes)
+
+
+class _CloudPersonalMemoryBackend:
+    """Adapts core.storage.cloud.personal_memory_store.PostgresPersonalMemoryBackend
+    (which is keyed by plain topic-name strings) to the Path-shaped interface
+    _LocalPersonalMemoryBackend uses, so PersonalMemoryStore's methods don't
+    need an is_cloud branch of their own at every call site — only in
+    __init__, choosing which backend to build.
+    """
+
+    def __init__(self, user_id: str) -> None:
+        from core.storage.cloud.personal_memory_store import PostgresPersonalMemoryBackend
+
+        self._pg = PostgresPersonalMemoryBackend(user_id)
+        self.user_id = user_id
+
+    @staticmethod
+    def _topic_key(topic_path: Path) -> str:
+        # Paths here are always base_dir/<topic>.md — stem is the topic name.
+        return topic_path.stem
+
+    def read_topic(self, topic_path: Path) -> str | None:
+        return self._pg.read_topic(self._topic_key(topic_path))
+
+    def write_topic(self, topic_path: Path, content: str) -> None:
+        self._pg.write_topic(self._topic_key(topic_path), content)
+
+    def delete_topic(self, topic_path: Path) -> bool:
+        return self._pg.delete_topic(self._topic_key(topic_path))
+
+    def topic_exists(self, topic_path: Path) -> bool:
+        return self._pg.read_topic(self._topic_key(topic_path)) is not None
+
+    def topic_size_bytes(self, topic_path: Path) -> int:
+        content = self._pg.read_topic(self._topic_key(topic_path))
+        return len(content.encode("utf-8")) if content else 0
+
+    def read_index(self) -> str | None:
+        return self._pg.read_index()
+
+    def write_index(self, content: str) -> None:
+        self._pg.write_index(content)
+
+    def read_daily_log(self, log_path: Path) -> str | None:
+        return self._pg.read_daily_log(self._log_key(log_path))
+
+    def write_daily_log(self, log_path: Path, content: str) -> None:
+        self._pg.write_daily_log(self._log_key(log_path), content)
+
+    @staticmethod
+    def _log_key(log_path: Path) -> str:
+        # Local layout is logs_dir/YYYY/MM/YYYY-MM-DD.md; the date stem alone
+        # is already a unique, sortable key without the directory nesting.
+        return log_path.stem
+
+    def enforce_cap(self, user_id: str, *, incoming_bytes: int) -> None:
+        cap_mb = int(settings.user_storage_cap_mb)
+        if cap_mb <= 0:
+            return
+        cap_bytes = cap_mb * 1024 * 1024
+        used = self._pg.total_bytes() + max(0, incoming_bytes)
+        if used > cap_bytes:
+            raise StorageCapExceededError(user_id, used, cap_bytes)
+
+
 class PersonalMemoryStore:
     def __init__(
         self,
@@ -59,7 +195,7 @@ class PersonalMemoryStore:
         self.base_dir = base_dir or personal_memory_dir(user_id)
         self.index_path = index_path or personal_memory_file(user_id, "MEMORY.md")
         self.logs_dir = logs_dir or (self.base_dir / "logs")
-        
+
         self.DEFAULT_TOPICS = {
             "identity": personal_memory_file(user_id, "identity.md"),
             "preferences": personal_memory_file(user_id, "preferences.md"),
@@ -76,13 +212,23 @@ class PersonalMemoryStore:
         self.topic_paths = dict(self.DEFAULT_TOPICS)
         if topic_paths:
             self.topic_paths.update({self._normalize_topic_name(key): value for key, value in topic_paths.items()})
-        self._ensure_layout()
+
+        # An explicit base_dir/index_path/etc. always forces the local
+        # backend (test isolation must survive cloud mode unchanged, same
+        # rule JournalStore/ConfirmationGate use elsewhere in this
+        # migration); otherwise settings.is_cloud picks Postgres vs local.
+        explicit_paths = base_dir is not None or index_path is not None or logs_dir is not None
+        if not explicit_paths and settings.is_cloud and user_id and user_id not in {"", "default"}:
+            self._backend = _CloudPersonalMemoryBackend(user_id)
+        else:
+            self._backend = _LocalPersonalMemoryBackend(self.base_dir, self.index_path, self.logs_dir)
 
     def load_index(self) -> list[PersonalMemoryIndexEntry]:
-        if not self.index_path.exists():
+        raw = self._backend.read_index()
+        if not raw:
             return []
         entries: list[PersonalMemoryIndexEntry] = []
-        for raw_line in self.index_path.read_text(encoding="utf-8").splitlines():
+        for raw_line in raw.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
@@ -108,17 +254,18 @@ class PersonalMemoryStore:
             f"- [{entry.title}]({entry.file_name}) - {entry.summary}"
             for entry in ordered
         ]
-        atomic_write_text(self.index_path, "\n".join(lines).rstrip() + ("\n" if lines else ""))
+        self._backend.write_index("\n".join(lines).rstrip() + ("\n" if lines else ""))
 
     def load_topic(self, name: str) -> MarkdownMemoryDocument:
         topic_name = self._normalize_topic_name(name)
         path = self.get_topic_path(topic_name)
-        if not path.exists():
+        raw = self._backend.read_topic(path)
+        if raw is None:
             return MarkdownMemoryDocument(
                 metadata={"topic": self._topic_to_schema_type(topic_name), "updated_at": _utc_now()},
                 lines=[],
             )
-        return parse_markdown_memory(path.read_text(encoding="utf-8"), default_topic=self._topic_to_schema_type(topic_name))
+        return parse_markdown_memory(raw, default_topic=self._topic_to_schema_type(topic_name))
 
     def write_topic(
         self,
@@ -128,7 +275,6 @@ class PersonalMemoryStore:
     ) -> MarkdownMemoryDocument:
         topic_name = self._normalize_topic_name(name)
         path = self.get_topic_path(topic_name)
-        path.parent.mkdir(parents=True, exist_ok=True)
 
         merged_metadata = {"topic": self._topic_to_schema_type(topic_name), "updated_at": _utc_now()}
         if metadata:
@@ -140,28 +286,24 @@ class PersonalMemoryStore:
 
         # NO-OP WRITE ELISION. `updated_at` is stamped fresh on every call, so a
         # byte comparison always differs and every replay rewrote every topic
-        # file — an atomic_write_text (temp file + fsync on the file AND its
-        # parent dir) per topic, per replay. replay() runs on every fact-storing
-        # turn, so this was pure fsync latency on the hot path for content that
-        # had not changed. Compare the BODY (everything after the frontmatter);
-        # if it is identical, keep the existing file and skip the write.
-        # Side benefit: the rendered projection is now content-deterministic —
-        # replaying the same journal twice no longer produces differing bytes.
-        if path.exists():
+        # file — a write per topic, per replay. replay() runs on every
+        # fact-storing turn, so this was pure write latency on the hot path
+        # for content that had not changed. Compare the BODY (everything
+        # after the frontmatter); if it is identical, keep the existing
+        # content and skip the write.
+        existing_raw = self._backend.read_topic(path)
+        if existing_raw is not None:
             try:
-                if _body_of(path.read_text(encoding="utf-8")) == _body_of(serialized):
-                    return parse_markdown_memory(path.read_text(encoding="utf-8"))
+                if _body_of(existing_raw) == _body_of(serialized):
+                    return parse_markdown_memory(existing_raw)
             except Exception:
                 pass  # unreadable/corrupt — fall through and rewrite
 
         # Phase 6: enforce per-user storage cap before writing.
-        try:
-            existing_size = path.stat().st_size if path.exists() else 0
-        except OSError:
-            existing_size = 0
+        existing_size = self._backend.topic_size_bytes(path)
         delta = max(0, len(serialized.encode("utf-8")) - existing_size)
-        enforce_storage_cap(self.user_id, self.base_dir, incoming_bytes=delta)
-        atomic_write_text(path, serialized)
+        self._backend.enforce_cap(self.user_id, incoming_bytes=delta)
+        self._backend.write_topic(path, serialized)
 
         # D5/G3: Enqueue embedding job.
         # Skip the enqueue entirely for the un-scoped default/empty tenant:
@@ -194,10 +336,26 @@ class PersonalMemoryStore:
 
         return parse_markdown_memory(serialized, default_topic=normalized_metadata["topic"])
 
+    def delete_topic(self, name: str) -> bool:
+        """Remove a topic entirely (used when replay() finds no live facts
+        left for it). Returns True if something was actually deleted.
+        Previously callers (core/memory_replayer.py) did this by reaching
+        into store.get_topic_path(...) and calling Path.unlink() directly —
+        a no-op in cloud mode, silently leaving stale content behind forever
+        since there is no local file to unlink there."""
+        topic_name = self._normalize_topic_name(name)
+        path = self.get_topic_path(topic_name)
+        return self._backend.delete_topic(path)
+
+    def topic_exists(self, name: str) -> bool:
+        topic_name = self._normalize_topic_name(name)
+        path = self.get_topic_path(topic_name)
+        return self._backend.topic_exists(path)
+
     def update_index_entry(self, name: str, summary_line: str, *, title: str | None = None) -> list[PersonalMemoryIndexEntry]:
         topic_name = self._normalize_topic_name(name)
         path = self.get_topic_path(topic_name)
-        if not path.exists():
+        if not self._backend.topic_exists(path):
             raise FileNotFoundError(f"Cannot index missing topic file: {path}")
 
         file_name = path.name
@@ -219,18 +377,16 @@ class PersonalMemoryStore:
         resolved_timestamp = timestamp or _utc_now()
         dt = datetime.fromisoformat(resolved_timestamp.replace("Z", "+00:00"))
         log_path = self.logs_dir / f"{dt.year:04d}" / f"{dt.month:02d}" / f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}.md"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
 
         prefix = f"- {resolved_timestamp}"
         if session_id:
             prefix = f"{prefix} [session:{session_id}]"
         new_line = f"{prefix} {line}"
 
-        existing = ""
-        if log_path.exists():
-            existing = log_path.read_text(encoding="utf-8").rstrip()
+        existing_raw = self._backend.read_daily_log(log_path)
+        existing = existing_raw.rstrip() if existing_raw else ""
         combined = f"{existing}\n{new_line}\n" if existing else f"{new_line}\n"
-        atomic_write_text(log_path, combined)
+        self._backend.write_daily_log(log_path, combined)
         return log_path
 
     def get_topic_path(self, name: str) -> Path:
@@ -336,12 +492,6 @@ class PersonalMemoryStore:
         profile["tool_preferences"]["tools"] = tools
 
         return profile
-
-    def _ensure_layout(self) -> None:
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        if not self.index_path.exists():
-            atomic_write_text(self.index_path, "")
 
     @staticmethod
     def _parse_routine_line(content: str) -> dict[str, Any] | None:
