@@ -115,20 +115,10 @@ class RoutineScheduler:
         so re-registering replaces the previous job in the SQLite store.
         """
         try:
-            journal = JournalStore(user_id=user_id)
+            latest_by_key = get_active_routines_for_user(user_id)
         except Exception as e:
             print(f"LOG: RoutineScheduler skip user {user_id} (journal init failed: {e})")
             return 0
-
-        # Resolve latest event per (topic, key) so a rejected/superseded
-        # routine doesn't keep firing.
-        latest_by_key: dict[str, MemoryEvent] = {}
-        for event in journal.iter_events():
-            if event.topic != "workflow" or not is_routine_key(event.key):
-                continue
-            prev = latest_by_key.get(event.key)
-            if prev is None or event.observed_at > prev.observed_at:
-                latest_by_key[event.key] = event
 
         registered = 0
         for key, event in latest_by_key.items():
@@ -197,6 +187,27 @@ class RoutineScheduler:
 # Module-level helpers — top-level so APScheduler can pickle job refs
 # across restarts via the SQLAlchemy jobstore.
 # ────────────────────────────────────────────────────────────────────────
+
+def get_active_routines_for_user(user_id: str) -> dict[str, MemoryEvent]:
+    """Resolve the latest applied-or-not workflow.* routine event per key from
+    a user's journal — the single source of truth both the local APScheduler
+    path (register_for_user, above) and the cloud cron-tick endpoint
+    (core/routine_cron_tick.py) build on, so the two never disagree about
+    which routines exist. Callers filter rejected/unapplied entries
+    themselves (register_for_user removes their job; cron-tick simply skips
+    them) — this function returns every latest-by-key entry unfiltered so
+    either caller can tell "never existed" apart from "existed, now retracted".
+    """
+    journal = JournalStore(user_id=user_id)
+    latest_by_key: dict[str, MemoryEvent] = {}
+    for event in journal.iter_events():
+        if event.topic != "workflow" or not is_routine_key(event.key):
+            continue
+        prev = latest_by_key.get(event.key)
+        if prev is None or event.observed_at > prev.observed_at:
+            latest_by_key[event.key] = event
+    return latest_by_key
+
 
 def _job_id_for(user_id: str, key: str) -> str:
     safe_key = key.replace("/", "_").replace(":", "_")

@@ -42,6 +42,20 @@ _CREATE_INDEX_SQL = (
 )
 
 
+def list_user_ids_pg() -> list[str]:
+    """Every user_id with at least one journal event — the cloud counterpart
+    of core.routine_scheduler.RoutineScheduler._scan_and_register_all_users'
+    PERSONAL_MEMORY_DIR.iterdir() walk (there is no shared local disk to walk
+    in cloud mode). Used by apps/cron_tick_routes.py to know which users to
+    check for due routines.
+    """
+    pool = get_pg_sync_pool()
+    with pool.connection() as conn:
+        conn.execute(_CREATE_TABLE_SQL)
+        rows = conn.execute("SELECT DISTINCT user_id FROM journal_events").fetchall()
+    return [row[0] for row in rows]
+
+
 class PostgresJournalBackend:
     """Drop-in for core.memory_journal.JournalStore's internal storage: one
     row per event, keyed by (user_id, event_id) exactly like the local

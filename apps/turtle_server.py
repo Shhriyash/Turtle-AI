@@ -2588,6 +2588,14 @@ async def _start_routine_scheduler() -> None:
         _APP_LOOP = asyncio.get_running_loop()
     except RuntimeError:
         _APP_LOOP = None
+    if settings.is_cloud:
+        # Cloud mode has no persistent process to hold a live scheduler in —
+        # the periodic GitHub Actions cron-tick (apps/cron_tick_routes.py)
+        # replaces it. Starting RoutineScheduler here too would double-fire
+        # every routine (both paths would append the same scheduled_fire
+        # event and push the same delivery).
+        print("LOG: RoutineScheduler skipped in cloud mode — see apps/cron_tick_routes.py")
+        return
     try:
         from core.routine_scheduler import RoutineScheduler
         _routine_scheduler = RoutineScheduler()
@@ -2739,6 +2747,9 @@ app.include_router(_admin_router)
 
 from apps.calendar_oauth_routes import router as _calendar_oauth_router
 app.include_router(_calendar_oauth_router)
+
+from apps.cron_tick_routes import router as _cron_tick_router
+app.include_router(_cron_tick_router)
 
 
 # Per-(user_id, channel) SharedState cache. Channels now run through the SAME
