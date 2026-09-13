@@ -55,11 +55,35 @@ SESSIONS_DIR = DATA_DIR / "sessions"
 ACTIVE_SESSION_DIR = SESSIONS_DIR / "active"
 SESSION_ARCHIVE_DIR = SESSIONS_DIR / "archive"
 
+def _mkdir_unless_cloud(path: Path) -> None:
+    """mkdir(parents=True, exist_ok=True), skipped in cloud mode.
+
+    Mirrors ensure_dirs()'s own guard below: Vercel's function filesystem is
+    read-only outside /tmp, and in cloud mode nothing should be writing to
+    these local paths anyway (core/storage/cloud/* replaces every one of
+    them with Postgres/Redis). Without this guard, callers like
+    PersonalMemoryStore.__init__ that compute a default path via
+    personal_memory_dir()/personal_memory_file() before checking
+    settings.is_cloud themselves would mkdir unconditionally and crash with
+    "OSError: Read-only file system" even when the cloud backend was about
+    to be selected anyway (found 2026-09-13 on the first real onboarding
+    claim against a cloud deploy).
+
+    core.config is imported lazily for the same acyclic-import reason
+    ensure_dirs() documents.
+    """
+    from core.config import settings
+
+    if settings.is_cloud:
+        return
+    path.mkdir(parents=True, exist_ok=True)
+
+
 def personal_memory_dir(user_id: str) -> Path:
     if not user_id:
         raise ValueError("user_id is required")
     path = PERSONAL_MEMORY_DIR / user_id
-    path.mkdir(parents=True, exist_ok=True)
+    _mkdir_unless_cloud(path)
     return path
 
 def personal_memory_file(user_id: str, filename: str) -> Path:
@@ -67,12 +91,12 @@ def personal_memory_file(user_id: str, filename: str) -> Path:
 
 def personal_journal_dir(user_id: str) -> Path:
     path = personal_memory_dir(user_id) / "journal"
-    path.mkdir(parents=True, exist_ok=True)
+    _mkdir_unless_cloud(path)
     return path
 
 def rag_vector_dir(user_id: str) -> Path:
     path = RAG_DATA_DIR / user_id / "vector"
-    path.mkdir(parents=True, exist_ok=True)
+    _mkdir_unless_cloud(path)
     return path
 RAG_SESSION_FILE = RAG_DATA_DIR / "current_session.json"
 SESSIONS_DIR = DATA_DIR / "sessions"
