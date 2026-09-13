@@ -43,6 +43,25 @@ class TaskHistoryStore:
         # scoping is per-instance, so each SharedState gets its own owner view.
         self.user_id = str(user_id or "").strip()
         self.history_path = history_path
+
+        # This store predates the Vercel migration and was never given a
+        # cloud (Postgres) backend -- history.jsonl/.sqlite is a single file
+        # pair, meant to be shared by every user on one filesystem, which
+        # doesn't fit serverless at all: /var/task is read-only and /tmp is
+        # per-instance-ephemeral, so writes would either crash (found live:
+        # every /ws connect 500'd immediately with "OSError: Read-only file
+        # system", closing the socket right after "WebSocket client
+        # connected") or silently vanish per-instance. Degrade to a no-op
+        # store in cloud mode instead -- operational task history/search is
+        # not user data, so losing it beats taking down every WebSocket
+        # connection. Tracked for a real Postgres-backed replacement.
+        from core.config import settings
+
+        self._cloud_noop = settings.is_cloud
+        if self._cloud_noop:
+            self._index = None
+            return
+
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.history_path.exists():
             self.history_path.touch()
@@ -78,6 +97,8 @@ class TaskHistoryStore:
             user_id=str(user_id if user_id is not None else self.user_id or "").strip(),
         )
         payload_record = _record_to_payload(record)
+        if self._cloud_noop:
+            return record
         with self.history_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(payload_record, ensure_ascii=False) + "\n")
         self._index.insert_record(payload_record)
@@ -85,7 +106,7 @@ class TaskHistoryStore:
 
     def load_records(self) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
-        if not self.history_path.exists():
+        if self._cloud_noop or not self.history_path.exists():
             return records
         with self.history_path.open("r", encoding="utf-8") as file:
             for line in file:
@@ -101,12 +122,16 @@ class TaskHistoryStore:
         return records
 
     def list_by_session(self, session_id: str) -> list[dict[str, Any]]:
+        if self._cloud_noop:
+            return []
         target = str(session_id).strip()
         return self._index.list_by_session(target, user_id=self.user_id)
 
     def search(
         self, query: str, *, max_results: int = 5, user_id: str | None = None
     ) -> list[dict[str, Any]]:
+        if self._cloud_noop:
+            return []
         return self._index.search(
             query,
             max_results=max_results,
