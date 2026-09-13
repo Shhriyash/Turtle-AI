@@ -1,6 +1,17 @@
 # Core
-pydantic-ai==1.67.0
+# pydantic-ai-slim (not the full pydantic-ai meta-package) with ONLY the
+# providers this app actually uses (core/llm_client.py: Google, Groq,
+# OpenRouter). The full pydantic-ai package transitively installs every
+# provider's SDK unconditionally — anthropic, mistralai, temporalio,
+# botocore (~155MB combined) — none of which this app calls. Found while
+# trimming the Vercel deploy bundle under its 500MB function-size limit.
+pydantic-ai-slim[openai,google,groq]==1.67.0
 pydantic-settings==2.13.1   # core/config settings (imported directly)
+# pydantic's EmailStr (apps/onboarding_routes.py, apps/admin_routes.py) lazily
+# imports this at schema-build time; not a transitive dep of pydantic itself.
+# Missing on the first Vercel deploy: "ImportError: email-validator is not
+# installed" crashed server boot the moment onboarding_routes was imported.
+email-validator>=2.0
 openai==2.26.0
 python-dotenv==1.2.2
 httpx==0.28.1
@@ -14,8 +25,14 @@ opentelemetry-api==1.39.1  # pinned: google-api-core wants >=1.44 but logfire's 
 # RAG / Embeddings
 cohere==5.20.7
 numpy==2.4.2
-faiss-cpu==1.13.2
 langchain-text-splitters==1.1.1
+# faiss-cpu moved to requirements-local.txt (~75MB installed, incl. bundled
+# native libs): in cloud mode (TURTLE_DEPLOY=cloud), get_vector_store()/
+# get_vector_storage() never construct a FAISS-backed store at all (pgvector
+# replaces it — core/storage/factory.py, rag/storage/vector_storage.py), and
+# every faiss import in this codebase is now lazy specifically so this
+# removal is safe (see rag/storage/vector_storage.py's module docstring).
+# Trimmed while fitting the Vercel deploy under its 500MB function-size limit.
 
 # Web parsing
 beautifulsoup4==4.14.3
@@ -42,6 +59,12 @@ audioop-lts==0.2.2; python_version >= "3.13"
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
 websockets>=15.0
+# apps/channels/whatsapp.py's Twilio-style webhook route takes form-encoded
+# POST bodies; FastAPI needs this to parse them (Request.form()). Was always
+# a real runtime dependency, just never declared — surfaced on the first
+# Vercel deploy (a genuinely fresh install), not something the migration
+# introduced.
+python-multipart>=0.0.9
 
 # Observability
 logfire==4.27.0
@@ -69,13 +92,11 @@ redis>=5.2.0        # async Redis client (Upstash rediss://) — rate limiter, g
 # replacement for that one call site) uses psycopg instead.
 psycopg[binary,pool]>=3.2
 
-# Discord gateway (natural DM/@mention bot mode ONLY). The interactions-webhook
-# mode in apps/channels/discord.py needs no extra deps — it verifies Ed25519
-# signatures with `cryptography` (already present above). Not importing this at
-# module load: apps/channels/discord_gateway.py guards the import so the app and
-# test suite run cleanly without it installed.
-discord.py>=2.3
-
-# Telegram gateway (long-polling bot mode). Optional; the adapter guards the
-# import so the app and test suite run cleanly without it installed.
-python-telegram-bot>=21.0
+# discord.py / python-telegram-bot moved to requirements-local.txt: both are
+# needed ONLY by the local long-polling/gateway adapters
+# (apps/channels/discord_gateway.py, apps/channels/telegram_gateway.py),
+# which are gated off in cloud mode (see apps/turtle_server.py's
+# _start_discord_gateway_hook/_start_telegram_gateway_hook) in favor of the
+# webhook adapters (apps/channels/discord.py, apps/channels/telegram_webhook.py)
+# — both zero-extra-dependency by design. ~15MB combined, trimmed while
+# fitting the Vercel deploy under its 500MB function-size limit.

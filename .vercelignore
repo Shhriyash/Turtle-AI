@@ -1,0 +1,49 @@
+# .vercelignore
+# ---------------
+# Controls what gets UPLOADED to Vercel's build servers (vercel.json's
+# functions.excludeFiles only trims the post-build FUNCTION bundle, not the
+# upload — found the hard way: an 808MB initial upload and a 1.4GB reported
+# bundle size for a project whose actual Python source is only a few MB,
+# because this file didn't exist and the local venv/ (which accumulates
+# dev-only packages like gradio/playwright/faiss over time — see
+# requirements-local.txt) was being uploaded wholesale.
+
+venv/
+.venv/
+env/
+ENV/
+**/venv/
+**/.venv/
+
+.git/
+.github/
+
+data/
+output/
+rag_data/
+vector_storage/
+test/_tmp/
+
+docs/
+design/
+review/
+turtle_vault/
+.obsidian/
+
+node_modules/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+.env
+.env.*
+!.env.example
+.env.local
+
+*.log
+*.sqlite
+*.sqlite3
+*.db

@@ -24,16 +24,22 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies
-        # pyaudio (and the rest of rtc_vad/'s standalone local-mic tooling)
-        # moved to requirements-local.txt — it's not imported anywhere in the
-        # app or the test suite, and needs system PortAudio headers to build
-        # from source, which is why it's no longer in requirements.txt at all
-        # (see that file's comment). No apt step needed here anymore.
+        # requirements.txt alone is what the Vercel deploy installs (kept
+        # lean — pydantic-ai-slim with only the providers this app uses,
+        # faiss-cpu/discord.py/python-telegram-bot moved out — to fit its
+        # 500MB function-size limit). The test suite exercises the LOCAL-mode
+        # code paths that need faiss-cpu (core/storage/local/faiss_store.py,
+        # rag/storage/vector_storage.py) and the Discord/Telegram gateway
+        # modules directly, so install just those three extras from
+        # requirements-local.txt here — not pyaudio/fastrtc/keyboard, which
+        # need system PortAudio headers to build and nothing in the app or
+        # test suite imports.
         # pytest is a test-only dependency, deliberately not in requirements.txt
         # (the app doesn't need it at runtime). Install it here so the suite can
         # run. Pinned to match local dev.
         run: |
           pip install -r requirements.txt
+          pip install faiss-cpu==1.13.2 "discord.py>=2.3" "python-telegram-bot>=21.0"
           pip install pytest==9.0.3
 
       - name: Run test suite

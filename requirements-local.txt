@@ -1,13 +1,12 @@
 # requirements-local.txt
 # ------------------------
-# Local-only voice-hardware / desktop tooling for rtc_vad/ (standalone mic
-# capture + VAD experimentation) — NOT imported anywhere in the server's own
-# import chain (apps/turtle_server.py) and NOT exercised by the test suite.
-# Deliberately kept OUT of requirements.txt: Vercel's Python build auto-detects
-# and installs from requirements.txt with no apt/system-package access, and
-# pyaudio in particular needs system PortAudio headers to build from source
-# (this repo's own CI apt-installs portaudio19-dev before pip install for
-# exactly that reason — a step Vercel's build has no equivalent of).
+# Local-only tooling not needed by a cloud (Vercel) deploy: standalone
+# voice-hardware experimentation (rtc_vad/), and the long-polling/gateway
+# channel adapters (local dev convenience — cloud mode uses the webhook
+# adapters instead, which need neither package). Deliberately kept OUT of
+# requirements.txt so the Vercel build (a) never needs apt access to build
+# pyaudio against system PortAudio headers, and (b) stays under the 500MB
+# function-size limit.
 #
 # Install with: pip install -r requirements.txt -r requirements-local.txt
 
@@ -16,3 +15,13 @@
 pyaudio==0.2.14
 fastrtc==0.0.34
 keyboard==0.13.5
+
+# Discord/Telegram gateway (natural DM/@mention bot mode) — optional, local
+# dev only. The webhook adapters (apps/channels/discord.py,
+# apps/channels/telegram_webhook.py) need neither package.
+discord.py>=2.3
+python-telegram-bot>=21.0
+
+# Local-mode FAISS vector stores (core/storage/local/faiss_store.py,
+# rag/storage/vector_storage.py) — cloud mode uses pgvector instead.
+faiss-cpu==1.13.2

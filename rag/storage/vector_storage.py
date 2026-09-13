@@ -3,13 +3,22 @@ FAISS Vector Storage for RAG System
 
 This module handles vector storage and retrieval using FAISS (Facebook AI Similarity Search).
 Provides efficient similarity search for conversation chunks.
+
+faiss is imported LAZILY inside VectorStorage's methods rather than at module
+level: in cloud mode (TURTLE_DEPLOY=cloud), get_vector_storage() below never
+constructs a VectorStorage at all (it returns a PgChunkVectorStore instead —
+see core/storage/cloud/pgvector_store.py), but this module is still imported
+at server startup via rag/system/complete_rag.py's top-level
+`from rag.storage.vector_storage import get_vector_storage`. A module-level
+`import faiss` would therefore force faiss-cpu (~75MB installed, including
+its bundled native libs) into the deployed bundle even though cloud mode
+never touches it — found while chasing Vercel's 500MB function-size limit.
 """
 
 import os
 import json
 import threading
 import numpy as np
-import faiss
 from collections import OrderedDict
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -67,6 +76,8 @@ class VectorStorage:
     
     def _initialize_index(self):
         """Initialize FAISS index"""
+        import faiss
+
         if self.index_path.exists():
             try:
                 # Load existing index
@@ -76,9 +87,11 @@ class VectorStorage:
                 self._create_new_index()
         else:
             self._create_new_index()
-    
+
     def _create_new_index(self):
         """Create a new FAISS index"""
+        import faiss
+
         if self.index_mode == "hnsw":
             index = faiss.IndexHNSWFlat(self.embedding_dimension, self.hnsw_m, faiss.METRIC_INNER_PRODUCT)
             index.hnsw.efSearch = self.hnsw_ef_search
@@ -184,6 +197,8 @@ class VectorStorage:
     def _save_index(self):
         """Save FAISS index to disk"""
         if self.faiss_index:
+            import faiss
+
             temp_path = self.storage_dir / f".{self.index_path.name}.tmp"
             faiss.write_index(self.faiss_index, str(temp_path))
             os.replace(temp_path, self.index_path)

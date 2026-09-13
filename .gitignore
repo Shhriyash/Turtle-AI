@@ -88,3 +88,5 @@ GoogleService-Info.plist
 id_rsa*
 !*.example
 .claude/
+.vercel
+.env*.local
