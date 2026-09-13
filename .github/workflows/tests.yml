@@ -34,13 +34,15 @@ jobs:
         # requirements-local.txt here — not pyaudio/fastrtc/keyboard, which
         # need system PortAudio headers to build and nothing in the app or
         # test suite imports.
-        # pytest is a test-only dependency, deliberately not in requirements.txt
-        # (the app doesn't need it at runtime). Install it here so the suite can
+        # pytest and fakeredis are test-only dependencies, deliberately not in
+        # requirements.txt (the app doesn't need them at runtime) — fakeredis
+        # mocks Upstash Redis for test/redis_backends_test.py and
+        # test/live_delivery_cloud_test.py. Install them here so the suite can
         # run. Pinned to match local dev.
         run: |
           pip install -r requirements.txt
           pip install faiss-cpu==1.13.2 "discord.py>=2.3" "python-telegram-bot>=21.0"
-          pip install pytest==9.0.3
+          pip install pytest==9.0.3 fakeredis==2.38.0
 
       - name: Run test suite
         # Phase 2 W5 made test/evals genuinely offline — no ignore needed.
