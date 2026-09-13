@@ -2525,6 +2525,46 @@ _APP_LOOP: "asyncio.AbstractEventLoop | None" = None
 
 
 @app.on_event("startup")
+async def _warn_on_vercel_deploy_mode_mismatch() -> None:
+    """Loudly flag it when TURTLE_DEPLOY isn't "cloud" on a real Vercel deploy.
+
+    Found 2026-09-13: TURTLE_DEPLOY was configured as an empty string in the
+    Vercel production environment (not "cloud", not unset — an explicit blank
+    value some earlier migration step left behind). settings.is_cloud gates
+    the Postgres/Redis storage backends, core/paths.py's read-only-filesystem
+    mkdir skip, and the Discord/embed self-invoke dispatch — with it False on
+    Vercel, the app runs against local SQLite/FAISS paths on a filesystem
+    that's read-only outside /tmp (core/paths.py:ensure_dirs already documents
+    the resulting OSError crash) while the real Postgres/Redis sit unused.
+    Warn (don't hard-fail) so a still-misconfigured deploy stays diagnosable
+    in logs instead of silently doing the wrong thing AND instead of taking
+    the whole app down if this check itself lands before the env var is fixed.
+    """
+    if os.environ.get("VERCEL") and not settings.is_cloud:
+        print(
+            f"LOG: MISCONFIGURED DEPLOY - running on Vercel (VERCEL env set) but "
+            f"TURTLE_DEPLOY={settings.deploy_mode!r} (not 'cloud'). Storage will "
+            f"use local SQLite/FAISS paths instead of the provisioned "
+            f"Postgres/Redis, and filesystem writes outside /tmp WILL crash "
+            f"with 'Read-only file system'. Set TURTLE_DEPLOY=cloud in the "
+            f"Vercel project's environment variables.",
+            flush=True,
+        )
+    if os.environ.get("VERCEL") and settings.public_base_url.rstrip("/") in (
+        "http://127.0.0.1:8765",
+        "http://localhost:8765",
+    ):
+        print(
+            f"LOG: MISCONFIGURED DEPLOY - running on Vercel but "
+            f"TURTLE_PUBLIC_BASE_URL is unset (defaulting to "
+            f"{settings.public_base_url!r}). Magic-link/forget-me emails and "
+            f"the Google Calendar OAuth redirect_uri will point at localhost. "
+            f"Set TURTLE_PUBLIC_BASE_URL to the deployed domain.",
+            flush=True,
+        )
+
+
+@app.on_event("startup")
 async def _refuse_forgeable_binding() -> None:
     """Refuse to serve a network-reachable interface without a real AUTH_SECRET_KEY.
 
