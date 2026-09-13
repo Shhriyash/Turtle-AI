@@ -106,10 +106,8 @@ def replay(
 
     for topic in ALL_TOPICS:
         lines = _sort_lines(topic_lines[topic])
-        path = store.get_topic_path(topic)
         if not lines:
-            if path.exists():
-                path.unlink()
+            if store.delete_topic(topic):
                 cleared.append(topic)
             continue
 
@@ -184,13 +182,12 @@ def _is_decayed(event: MemoryEvent, reference_time: datetime) -> bool:
 
 
 def _prune_stale_index_entries(store: PersonalMemoryStore, written_topics: list[str]) -> None:
-    """Remove index entries whose topic file no longer exists."""
+    """Remove index entries whose topic no longer exists."""
     entries = store.load_index()
     kept = []
     written_files = {store.get_topic_path(topic).name for topic in written_topics}
     for entry in entries:
-        path = store.base_dir / entry.file_name
-        if entry.file_name in written_files or path.exists():
+        if entry.file_name in written_files or store.topic_exists(entry.file_name):
             kept.append(entry)
     if len(kept) != len(entries):
         store.save_index(kept)

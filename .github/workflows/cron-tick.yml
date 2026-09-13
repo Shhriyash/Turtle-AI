@@ -1,0 +1,41 @@
+name: cron-tick
+
+# Vercel migration Phase 2: serverless has no persistent process to hold the
+# local RoutineScheduler (core/routine_scheduler.py) in, so a periodic
+# external trigger stands in for it — see apps/cron_tick_routes.py's module
+# docstring for the full "why". This workflow is the trigger.
+#
+# GitHub Actions' `schedule` cron does not guarantee to-the-minute execution
+# (it queues on shared runners and can be delayed under load), which is
+# exactly why apps/cron_tick_routes.py evaluates a due WINDOW (5 minutes,
+# TICK_INTERVAL_MINUTES) rather than a single instant, and de-dupes each
+# scheduled occurrence in Postgres (core/storage/cloud/routine_last_fired_store.py)
+# so a late or doubled-up run can never double-fire a routine.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}  # manual trigger for testing/debugging a stuck routine
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the cron-tick endpoint
+        env:
+          CRON_TICK_URL: ${{ secrets.CRON_TICK_URL }}
+          CRON_SHARED_SECRET: ${{ secrets.CRON_SHARED_SECRET }}
+        run: |
+          if [ -z "$CRON_TICK_URL" ] || [ -z "$CRON_SHARED_SECRET" ]; then
+            echo "CRON_TICK_URL or CRON_SHARED_SECRET secret is not set — skipping." >&2
+            exit 1
+          fi
+          status=$(curl -sS -o /tmp/cron_tick_response.json -w "%{http_code}" \
+            -X POST "$CRON_TICK_URL" \
+            -H "Authorization: Bearer $CRON_SHARED_SECRET")
+          echo "HTTP status: $status"
+          cat /tmp/cron_tick_response.json
+          echo ""
+          if [ "$status" -ge 300 ]; then
+            echo "cron-tick request failed with status $status" >&2
+            exit 1
+          fi

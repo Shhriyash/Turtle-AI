@@ -153,3 +153,111 @@ if settings.is_cloud:
     queue_service: Queue = LocalWorkerQueue()
 else:
     queue_service: Queue = LocalWorkerQueue()
+
+
+def dispatch_embed_personal_memory_job(user_id: str, topic_name: str, lines: list[str]) -> None:
+    """Fire the embed_personal_memory job for a topic write, without making
+    core.personal_memory_store.PersonalMemoryStore.write_topic() (a plain
+    sync method, called from ~5 places including inside a journal replay
+    that is itself called synchronously) become async just to await it.
+
+    Local mode: an in-process detached asyncio task running the job to
+    completion — a genuinely long-lived process, proven fine there.
+
+    Cloud mode: found in a post-migration audit to carry the SAME risk
+    already fixed for Discord's deferred interaction processing — a
+    detached asyncio.create_task has no confirmed guarantee of surviving
+    past this invocation's response on Vercel's Python runtime (whose
+    documented post-response background-work API, waitUntil()/after(), is
+    JS-only). The embed job itself does a live Cohere HTTP call plus a
+    pgvector upsert — exactly the kind of multi-step work that could get cut
+    off mid-flight. So cloud mode's detached task does NOT run the job
+    directly; it self-invokes POST /internal/embed-personal-memory
+    (apps/cron_tick_routes.py) as an independent request instead, the same
+    pattern apps/channels/discord.py's _kick_off_deferred_processing uses —
+    the detached task's own job shrinks to "reliably kick off a second,
+    independently-completing invocation", bounded to how long it takes to
+    send one HTTP request rather than an embed+upsert round trip, and the
+    second invocation runs to completion with its own normal timeout budget
+    with no ambiguity.
+
+    Best-effort either way: no running event loop (e.g. an offline script)
+    is a silent no-op, matching the original inline behavior in write_topic.
+
+    Residual trade-off worth naming: track_task's user_id tag (below) exists
+    so drain_user_tasks(user_id) can wait for in-flight embeds before an
+    account-link merge snapshots a source journal. In cloud mode, what gets
+    tracked here is only the SELF-INVOKE task (milliseconds — send the
+    request and return), not the actual embed+upsert running on the separate
+    invocation it triggered, which this process has no handle on. A merge
+    could therefore still race a just-triggered cloud embed. Narrower than
+    the bug this fixes, though: the journal event (the source of truth) is
+    already durably in Postgres either way, and the vector store is a
+    rebuildable search INDEX over it — the same posture already given to the
+    SQLite FTS5 read-model cache elsewhere in this migration — so the worst
+    case is a fact temporarily missing from RAG search until the next write
+    to that topic re-triggers its embed, not a fact lost.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    if settings.is_cloud:
+        task_obj = loop.create_task(
+            _self_invoke_embed_job(user_id=user_id, topic_name=topic_name, lines=lines)
+        )
+    else:
+        task_obj = loop.create_task(
+            queue_service.enqueue(
+                "embed_personal_memory", user_id=user_id, topic_name=topic_name, lines=lines
+            )
+        )
+    track_task(task_obj, user_id=user_id)
+
+
+async def _self_invoke_embed_job(user_id: str, topic_name: str, lines: list[str]) -> None:
+    """Cloud-mode body of dispatch_embed_personal_memory_job — see its
+    docstring. Mirrors apps/channels/discord.py's
+    _kick_off_deferred_processing: a short read timeout paired with a
+    generous connect/write timeout guarantees the request was fully SENT
+    (so the target invocation is genuinely dispatched) without waiting for
+    it to finish.
+    """
+    import httpx
+
+    secret = settings.cron_shared_secret.get_secret_value() if settings.cron_shared_secret else ""
+    if not secret:
+        # No internal-automation secret configured — run the job in this
+        # same detached task rather than silently dropping the embed. Less
+        # robust on serverless, but strictly no worse than before this fix,
+        # and one env var away from the safe path.
+        logger.warning(
+            "CRON_SHARED_SECRET unset — embedding %s/%s in-process (detached task)",
+            user_id, topic_name,
+        )
+        func = _REGISTRY.get("embed_personal_memory")
+        if func is not None:
+            await func(user_id=user_id, topic_name=topic_name, lines=lines)
+        return
+
+    url = f"{settings.public_base_url.rstrip('/')}/internal/embed-personal-memory"
+    payload = {"user_id": user_id, "topic_name": topic_name, "lines": lines}
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                url,
+                json=payload,
+                headers={"Authorization": f"Bearer {secret}"},
+                timeout=httpx.Timeout(connect=5.0, read=0.1, write=5.0, pool=5.0),
+            )
+    except httpx.ReadTimeout:
+        pass  # Expected: the request was sent; we deliberately don't await its reply.
+    except Exception as exc:
+        logger.error(
+            "self-invoke for embed_personal_memory failed user=%s topic=%s: %s",
+            user_id, topic_name, exc,
+        )
+        func = _REGISTRY.get("embed_personal_memory")
+        if func is not None:
+            await func(user_id=user_id, topic_name=topic_name, lines=lines)

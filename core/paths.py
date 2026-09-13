@@ -85,7 +85,25 @@ TEMP_AUDIO_DIR = OUTPUT_DIR / "audio"
 
 
 def ensure_dirs() -> None:
-    """Create standard runtime directories if they do not exist."""
+    """Create standard runtime directories if they do not exist.
+
+    No-op in cloud mode (TURTLE_DEPLOY=cloud): Vercel's function filesystem
+    is READ-ONLY outside /tmp, so an unconditional mkdir() here crashed the
+    server at import time (apps/turtle_server.py calls this at module load)
+    with "OSError: [Errno 30] Read-only file system: '/var/task/data'" —
+    found on the first real deploy. Nothing in cloud mode should be writing
+    to these local paths anyway (core/storage/cloud/* replaces every one of
+    them with Postgres/Redis), so skipping the mkdir entirely is correct,
+    not just a crash workaround.
+
+    core.config is imported lazily (not at module level) so this leaf
+    module's own import graph stays acyclic — same rationale
+    tools/idempotency.py documents for the identical lazy import.
+    """
+    from core.config import settings
+
+    if settings.is_cloud:
+        return
     for path in [
         DATA_DIR,
         OUTPUT_DIR,

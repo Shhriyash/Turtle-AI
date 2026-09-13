@@ -23,22 +23,26 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install system libraries
-        # pyaudio builds a C extension against PortAudio; ubuntu-latest ships
-        # neither the headers (portaudio.h) nor the lib, so its wheel build
-        # fails and aborts `pip install` before any test runs. pyaudio is used
-        # only by the standalone VAD/TTS scripts (rtc_vad/, tools/tts/),
-        # not by the app or the test suite — but it's pinned in requirements.txt,
-        # so the install must be able to build it.
-        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
-
       - name: Install dependencies
-        # pytest is a test-only dependency, deliberately not in requirements.txt
-        # (the app doesn't need it at runtime). Install it here so the suite can
+        # requirements.txt alone is what the Vercel deploy installs (kept
+        # lean — pydantic-ai-slim with only the providers this app uses,
+        # faiss-cpu/discord.py/python-telegram-bot moved out — to fit its
+        # 500MB function-size limit). The test suite exercises the LOCAL-mode
+        # code paths that need faiss-cpu (core/storage/local/faiss_store.py,
+        # rag/storage/vector_storage.py) and the Discord/Telegram gateway
+        # modules directly, so install just those three extras from
+        # requirements-local.txt here — not pyaudio/fastrtc/keyboard, which
+        # need system PortAudio headers to build and nothing in the app or
+        # test suite imports.
+        # pytest and fakeredis are test-only dependencies, deliberately not in
+        # requirements.txt (the app doesn't need them at runtime) — fakeredis
+        # mocks Upstash Redis for test/redis_backends_test.py and
+        # test/live_delivery_cloud_test.py. Install them here so the suite can
         # run. Pinned to match local dev.
         run: |
           pip install -r requirements.txt
-          pip install pytest==9.0.3
+          pip install faiss-cpu==1.13.2 "discord.py>=2.3" "python-telegram-bot>=21.0"
+          pip install pytest==9.0.3 fakeredis==2.38.0
 
       - name: Run test suite
         # Phase 2 W5 made test/evals genuinely offline — no ignore needed.

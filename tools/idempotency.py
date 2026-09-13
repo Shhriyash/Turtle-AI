@@ -127,7 +127,18 @@ def is_duplicate_invocation(idempotency_key: str) -> Optional[str]:
     """Return the cached result string if this key was seen in the last 60 s.
 
     Returns None if the invocation is new (caller should proceed).
+
+    In cloud mode (TURTLE_DEPLOY=cloud), delegates to the Redis-backed
+    implementation instead: the SQLite file below does not survive a
+    serverless cold start, silently disabling dedup on every fresh
+    invocation. See core/storage/cloud/redis_backends.py.
     """
+    from core.config import settings
+
+    if settings.is_cloud:
+        from core.storage.cloud.redis_backends import redis_is_duplicate_invocation
+
+        return redis_is_duplicate_invocation(idempotency_key)
     try:
         conn = _ensure_db()
         cutoff = time.time() - _IDEMPOTENCY_WINDOW_S
@@ -145,7 +156,18 @@ def is_duplicate_invocation(idempotency_key: str) -> Optional[str]:
 
 
 def record_invocation(idempotency_key: str, result: str) -> None:
-    """Persist the result of a completed tool invocation."""
+    """Persist the result of a completed tool invocation.
+
+    In cloud mode, delegates to the Redis-backed implementation — see
+    is_duplicate_invocation's docstring for why.
+    """
+    from core.config import settings
+
+    if settings.is_cloud:
+        from core.storage.cloud.redis_backends import redis_record_invocation
+
+        redis_record_invocation(idempotency_key, result)
+        return
     if not str(result).startswith("Email sent successfully"):
         # Only successful sends are idempotency-cached; a failure must not
         # no-op the user's retry.

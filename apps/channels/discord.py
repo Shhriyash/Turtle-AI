@@ -44,6 +44,7 @@ Required env vars:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 
 import httpx
@@ -146,6 +147,87 @@ async def _send_followup(interaction_token: str, text: str) -> None:
         print(f"[Discord] follow-up edit error: {e}")
 
 
+async def _process_deferred_interaction(payload: dict) -> None:
+    """The actual interaction processing: resolve identity, dispatch through
+    the pipeline, PATCH the deferred response with the real reply.
+
+    Guards the whole body: if resolve/dispatch raises, the deferred "Turtle
+    is thinking…" placeholder would otherwise hang until Discord's timeout.
+    Deliver a graceful message instead. Shared by both execution paths (see
+    _kick_off_deferred_processing) — the payload dict is exactly what
+    discord_interactions built, so this function is identical either way.
+    """
+    interaction_token = payload["interaction_token"]
+    try:
+        discord_user_id = payload["discord_user_id"]
+        user_id = await identity_manager.resolve_user("discord", discord_user_id)
+        turtle_event = TurtleEvent(
+            user_id=user_id,
+            channel="discord",
+            modality="text",
+            content=payload["text"],
+            message_id=payload["interaction_id"],
+            thread_id=payload["channel_id"],
+            sender_name=payload.get("sender_name", ""),
+            channel_user_id=discord_user_id,
+            is_private=bool(payload.get("is_private", False)),
+        )
+        response: TurtleResponse = await dispatch_event(turtle_event)
+        await _send_followup(interaction_token, response.content or "…")
+    except Exception as e:
+        print(f"[Discord] interaction processing failed: {e}")
+        await _send_followup(interaction_token, "Sorry — something went wrong handling that.")
+
+
+async def _kick_off_deferred_processing(payload: dict) -> None:
+    """Start the real (slower-than-3s) processing for a deferred interaction.
+
+    Local mode: a detached asyncio task in this same process, tracked so it
+    can't be GC'd mid-flight — proven correct there (a long-lived server
+    process). Cloud mode: Vercel's docs describe post-response background
+    work surviving ONLY when explicitly scheduled via its JS waitUntil()/
+    after() API (@vercel/functions) — there is no documented Python
+    equivalent, so relying on a bare detached asyncio.create_task here would
+    be betting on unconfirmed platform behavior for exactly the feature this
+    migration is meant to make reliable. Instead, cloud mode SELF-INVOKES a
+    second, independent HTTP request to POST /channels/discord/process
+    carrying this payload — Vercel runs that as a completely normal request
+    with its own full timeout budget, so there is no ambiguity about it
+    completing. We only need to know the request was SENT before this
+    invocation's own response goes out, not that it finished — the short
+    read timeout below (paired with a generous connect/write timeout) is
+    exactly that: send fully, then stop waiting for a reply we don't need.
+    """
+    if not settings.is_cloud:
+        _track(asyncio.create_task(_process_deferred_interaction(payload)))
+        return
+
+    secret = settings.cron_shared_secret.get_secret_value() if settings.cron_shared_secret else ""
+    if not secret:
+        # No internal-automation secret configured — degrade to the
+        # in-process task rather than silently dropping the interaction.
+        # Less robust on serverless, but strictly no worse than before this
+        # fix existed, and it's a one-line env var away from the safe path.
+        print("[Discord] CRON_SHARED_SECRET unset — falling back to in-process deferred task")
+        _track(asyncio.create_task(_process_deferred_interaction(payload)))
+        return
+
+    url = f"{settings.public_base_url.rstrip('/')}/channels/discord/process"
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                url,
+                json=payload,
+                headers={"Authorization": f"Bearer {secret}"},
+                timeout=httpx.Timeout(connect=5.0, read=0.1, write=5.0, pool=5.0),
+            )
+    except httpx.ReadTimeout:
+        pass  # Expected: the request was sent; we deliberately don't await its reply.
+    except Exception as e:
+        print(f"[Discord] self-invoke for deferred processing failed: {e}")
+        _track(asyncio.create_task(_process_deferred_interaction(payload)))
+
+
 def _extract_command_text(data: dict) -> str:
     """Pull the user's text out of an APPLICATION_COMMAND payload.
 
@@ -220,45 +302,56 @@ async def discord_interactions(request: Request):
                 "data": {"content": "Send me a message with the command.", "flags": 64},
             }
 
-        # 3-second ACK: cannot run the pipeline inline. Defer, then finish on a
-        # background task that edits the original response with the real reply.
-        async def _process() -> None:
-            # Guard the whole body: if resolve/dispatch raises, the deferred
-            # "Turtle is thinking…" placeholder would otherwise hang until
-            # Discord's timeout. Deliver a graceful message instead.
-            try:
-                user_id = await identity_manager.resolve_user("discord", discord_user_id)
-                sender_name = str(
-                    user_obj.get("global_name")
-                    or user_obj.get("username")
-                    or ""
-                )
-                turtle_event = TurtleEvent(
-                    user_id=user_id,
-                    channel="discord",
-                    modality="text",
-                    content=text,
-                    message_id=interaction_id,
-                    thread_id=channel_id,
-                    sender_name=sender_name,
-                    channel_user_id=discord_user_id,
-                    # A guild interaction carries "member"; a DM carries only
-                    # "user". The deferred follow-up here is NOT ephemeral, so
-                    # a guild reply is readable by everyone in the channel —
-                    # treat it as public and let secret-bearing tools refuse.
-                    is_private=not bool(payload.get("member")),
-                )
-                response: TurtleResponse = await dispatch_event(turtle_event)
-                await _send_followup(interaction_token, response.content or "…")
-            except Exception as e:
-                print(f"[Discord] interaction processing failed: {e}")
-                await _send_followup(interaction_token, "Sorry — something went wrong handling that.")
-
-        _track(asyncio.create_task(_process()))
+        # 3-second ACK: cannot run the pipeline inline. Defer, then finish the
+        # real work out-of-band — see _kick_off_deferred_processing for how
+        # that differs between local and cloud mode.
+        deferred_payload = {
+            "interaction_token": interaction_token,
+            "interaction_id": interaction_id,
+            "channel_id": channel_id,
+            "discord_user_id": discord_user_id,
+            "text": text,
+            "sender_name": str(user_obj.get("global_name") or user_obj.get("username") or ""),
+            # A guild interaction carries "member"; a DM carries only "user".
+            # The deferred follow-up here is NOT ephemeral, so a guild reply
+            # is readable by everyone in the channel — treat it as public and
+            # let secret-bearing tools refuse.
+            "is_private": not bool(payload.get("member")),
+        }
+        await _kick_off_deferred_processing(deferred_payload)
         return {"type": _RESPONSE_DEFERRED_CHANNEL_MESSAGE}
 
     # Anything else — acknowledge with a harmless PONG-shaped 200.
     return {"type": _RESPONSE_PONG}
+
+
+@router.post("/process")
+async def discord_process_deferred(request: Request):
+    """Internal-only: runs the deferred interaction processing as its OWN
+    independent request — see _kick_off_deferred_processing's docstring for
+    why cloud mode self-invokes this instead of a detached background task.
+
+    Never called by Discord itself (it has no idea this route exists) —
+    protected by the shared internal-automation secret (CRON_SHARED_SECRET,
+    the same one apps/cron_tick_routes.py uses), not a Discord signature.
+    """
+    secret = settings.cron_shared_secret.get_secret_value() if settings.cron_shared_secret else ""
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else ""
+    if not secret or not token or not hmac.compare_digest(token, secret):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    required = {"interaction_token", "discord_user_id", "text", "interaction_id", "channel_id"}
+    if not required.issubset(payload):
+        raise HTTPException(status_code=400, detail=f"Missing required field(s): {required - set(payload)}")
+
+    await _process_deferred_interaction(payload)
+    return {"ok": True}
 
 
 async def register_slash_commands() -> None:

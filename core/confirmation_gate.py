@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from core.io_atomic import atomic_write_json
 from core.memory_journal import JournalStore, MemoryEvent, make_event
@@ -13,6 +13,45 @@ from core.personal_memory_store import PersonalMemoryStore
 
 if TYPE_CHECKING:
     from core.memory_sqlite import MemoryEventRow, MemorySQLiteIndex
+
+
+class ConfirmationStateBackend(Protocol):
+    """Storage seam for ConfirmationGate's one piece of mutable state: the
+    pending-candidate queue (``{"pending": [event_id, ...]}``). Kept as a
+    tiny Protocol — rather than importing core.storage.cloud directly here —
+    so this module stays free of any storage-backend-specific code, matching
+    its own docstring's "unit-testable in isolation" design goal. Local mode
+    uses _JsonFileConfirmationState (below); cloud mode's Postgres-backed
+    implementation lives in core/storage/cloud/confirmation_state_store.py
+    and is selected by core/storage/factory.get_confirmation_state_backend.
+    """
+
+    def load(self) -> dict[str, Any]: ...
+    def save(self, state: dict[str, Any]) -> None: ...
+
+
+class _JsonFileConfirmationState:
+    """Default local-mode backend: the original single-file-per-user JSON
+    blob this class always used before the backend seam was introduced."""
+
+    def __init__(self, state_path: Path) -> None:
+        self.state_path = state_path
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def load(self) -> dict[str, Any]:
+        if not self.state_path.exists():
+            return {"pending": []}
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"pending": []}
+        pending = payload.get("pending") if isinstance(payload, dict) else None
+        if not isinstance(pending, list):
+            pending = []
+        return {"pending": [str(item) for item in pending if item]}
+
+    def save(self, state: dict[str, Any]) -> None:
+        atomic_write_json(self.state_path, {"pending": list(state.get("pending", []))})
 
 
 DEFAULT_SILENCE_DAYS = 14
@@ -74,7 +113,8 @@ class ConfirmationGate:
         *,
         journal: JournalStore,
         store: PersonalMemoryStore,
-        state_path: Path,
+        state_path: Path | None = None,
+        state_backend: ConfirmationStateBackend | None = None,
         silence_days: int = DEFAULT_SILENCE_DAYS,
         first_session_window_minutes: int = DEFAULT_FIRST_SESSION_WINDOW_MINUTES,
         first_session_event_threshold: int = DEFAULT_FIRST_SESSION_EVENT_THRESHOLD,
@@ -83,6 +123,17 @@ class ConfirmationGate:
     ) -> None:
         self.journal = journal
         self.store = store
+        # An explicit state_backend wins (cloud mode passes a Postgres-backed
+        # one via core.storage.factory.get_confirmation_state_backend);
+        # otherwise state_path builds the original local JSON-file backend —
+        # every existing call site (tests, scripts) that only ever passed
+        # state_path keeps working unchanged.
+        if state_backend is not None:
+            self._backend: ConfirmationStateBackend = state_backend
+        elif state_path is not None:
+            self._backend = _JsonFileConfirmationState(state_path)
+        else:
+            raise ValueError("ConfirmationGate requires state_path or state_backend")
         self.state_path = state_path
         # Optional read model (Phase 2 W3). When wired — it must be the same
         # index the journal write-throughs to via on_append — the hot-path
@@ -95,7 +146,6 @@ class ConfirmationGate:
         self.first_session_window_minutes = int(first_session_window_minutes)
         self.first_session_event_threshold = int(first_session_event_threshold)
         self.first_session_account_age_hours = int(first_session_account_age_hours)
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self._state = self._load_state()
 
     def queue_candidate(self, event: MemoryEvent) -> bool:
@@ -317,10 +367,11 @@ class ConfirmationGate:
         if event_count < self.first_session_event_threshold:
             return True
         try:
-            ctime = self.journal.journal_dir.stat().st_ctime
-            account_age_hours = (datetime.now(UTC).timestamp() - ctime) / 3600
-            if account_age_hours < self.first_session_account_age_hours:
-                return True
+            ctime = self.journal.get_created_at_timestamp()
+            if ctime is not None:
+                account_age_hours = (datetime.now(UTC).timestamp() - ctime) / 3600
+                if account_age_hours < self.first_session_account_age_hours:
+                    return True
         except Exception:
             pass
         return False
@@ -427,19 +478,10 @@ class ConfirmationGate:
             self._save_state()
 
     def _load_state(self) -> dict[str, Any]:
-        if not self.state_path.exists():
-            return {"pending": []}
-        try:
-            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except Exception:
-            return {"pending": []}
-        pending = payload.get("pending") if isinstance(payload, dict) else None
-        if not isinstance(pending, list):
-            pending = []
-        return {"pending": [str(item) for item in pending if item]}
+        return self._backend.load()
 
     def _save_state(self) -> None:
-        atomic_write_json(self.state_path, {"pending": list(self._state["pending"])})
+        self._backend.save(self._state)
 
 
 def _parse_iso(value: str) -> datetime | None:

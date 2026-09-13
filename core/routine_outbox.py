@@ -27,6 +27,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from core.config import settings
 from core.io_atomic import atomic_write_json
 from core.paths import personal_memory_dir
 
@@ -49,6 +50,10 @@ def load_outbox(user_id: str) -> list[dict[str, Any]] | None:
     but a transient I/O failure (permissions, AV lock) returns ``None`` so the
     caller knows NOT to clear a file it never actually read. Never raises.
     """
+    if settings.is_cloud:
+        from core.storage.cloud.routine_outbox_store import load_outbox_pg
+
+        return load_outbox_pg(user_id)
     try:
         path = _outbox_path(user_id)
         if not path.exists():
@@ -78,6 +83,11 @@ def save_outbox(user_id: str, frames: list[dict[str, Any]]) -> None:
     a ``StorageCapExceededError`` bubbling from the storage layer — is LOGged and
     swallowed; delivery then falls back to the in-memory queue only.
     """
+    if settings.is_cloud:
+        from core.storage.cloud.routine_outbox_store import save_outbox_pg
+
+        save_outbox_pg(user_id, frames, max_frames=_MAX_FRAMES)
+        return
     try:
         path = _outbox_path(user_id)
         if not frames:

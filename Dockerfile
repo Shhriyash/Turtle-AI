@@ -6,12 +6,13 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libsqlite3-dev \
-    portaudio19-dev \
     && rm -rf /var/lib/apt/lists/*
-# portaudio19-dev: pyaudio (in requirements.txt, used by the local CLI voice
-# path) builds/links against PortAudio. The web server never plays audio
-# server-side and imports sounddevice lazily, but pyaudio must still install
-# cleanly during the image build, so the headers must be present here.
+# No portaudio19-dev here (Vercel migration, Phase 5): pyaudio moved to
+# requirements-local.txt (rtc_vad/'s standalone local-mic tooling — never
+# imported by the server, and a headless container has no microphone to
+# capture from anyway). sounddevice stays in requirements.txt and installs
+# fine without system PortAudio headers (its wheel bundles the library); the
+# web server never plays audio server-side and imports it lazily regardless.
 
 COPY requirements.txt .
 

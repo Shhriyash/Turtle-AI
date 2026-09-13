@@ -33,6 +33,58 @@ from pydantic_ai.messages import (
 load_env()
 
 
+class _LocalSessionStaging:
+    """Original file-based staging backend, unchanged in behavior. Extracted
+    so a cloud counterpart (core/storage/cloud/rag_session_staging_store.py)
+    can drop in behind the same 4-method surface — see TurtleRAGSystem's
+    __init__ for why: the local file is read back ACROSS requests to recover
+    a crashed/previous run's accumulated conversations, which does not
+    survive a serverless cold start."""
+
+    def __init__(self, temp_session_file: Path) -> None:
+        self.temp_session_file = temp_session_file
+
+    def read(self) -> dict | None:
+        if not self.temp_session_file.exists():
+            return None
+        try:
+            return json.loads(self.temp_session_file.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def write(self, session_data: dict) -> None:
+        with open(self.temp_session_file, "w", encoding="utf-8") as f:
+            json.dump(session_data, f, indent=2, ensure_ascii=False)
+
+    def clear(self) -> None:
+        self.temp_session_file.unlink(missing_ok=True)
+
+    def exists(self) -> bool:
+        return self.temp_session_file.exists()
+
+
+class _CloudSessionStaging:
+    """Adapts core.storage.cloud.rag_session_staging_store.PostgresRagSessionStaging
+    to _LocalSessionStaging's surface."""
+
+    def __init__(self, user_id: str) -> None:
+        from core.storage.cloud.rag_session_staging_store import PostgresRagSessionStaging
+
+        self._pg = PostgresRagSessionStaging(user_id)
+
+    def read(self) -> dict | None:
+        return self._pg.read()
+
+    def write(self, session_data: dict) -> None:
+        self._pg.write(session_data)
+
+    def clear(self) -> None:
+        self._pg.clear()
+
+    def exists(self) -> bool:
+        return self._pg.read() is not None
+
+
 class TurtleRAGSystem:
     """Complete RAG system for Turtle conversation history"""
     
@@ -55,8 +107,17 @@ class TurtleRAGSystem:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.user_id = user_id
 
-        # Temp JSON file for current session
+        # Temp JSON file for current session (local mode) / Postgres row
+        # (cloud mode) — see _LocalSessionStaging / _CloudSessionStaging.
+        # An explicit storage_dir always forces local (test isolation must
+        # survive cloud mode unchanged, same rule as every other backend in
+        # this migration); "default"/no-user_id stays local too, matching
+        # this class's own existing single-tenant-vector-store fallback.
         self.temp_session_file = self.storage_dir / "current_session.json"
+        if storage_dir is None and settings.is_cloud and user_id:
+            self._staging = _CloudSessionStaging(user_id)
+        else:
+            self._staging = _LocalSessionStaging(self.temp_session_file)
 
         # Initialize components
         self.embedder = get_embedding_model()
@@ -73,17 +134,17 @@ class TurtleRAGSystem:
         self.session_conversations = []
 
     def _clear_temp_session_file(self, expected_session_id: str | None = None) -> None:
-        if not self.temp_session_file.exists():
+        if not self._staging.exists():
             return
         if expected_session_id is None:
-            self.temp_session_file.unlink(missing_ok=True)
+            self._staging.clear()
             return
-        try:
-            session_data = json.loads(self.temp_session_file.read_text(encoding="utf-8"))
-            if session_data.get("session_id") == expected_session_id:
-                self.temp_session_file.unlink(missing_ok=True)
-        except Exception:
-            self.temp_session_file.unlink(missing_ok=True)
+        session_data = self._staging.read()
+        # None means "unreadable/corrupt" here (exists() already confirmed a
+        # row/file is present) — clear it just like the original file-based
+        # logic did, rather than leaving a stuck, unparseable entry forever.
+        if session_data is None or session_data.get("session_id") == expected_session_id:
+            self._staging.clear()
 
     def _index_session_conversations(
         self,
@@ -419,9 +480,11 @@ class TurtleRAGSystem:
     
     async def start_session(self, session_id: str | None = None) -> str:
         """Start a new conversation session"""
-        if self.temp_session_file.exists():
-            try:
-                session_data = json.loads(self.temp_session_file.read_text(encoding="utf-8"))
+        import asyncio
+
+        try:
+            session_data = await asyncio.to_thread(self._staging.read)
+            if session_data is not None:
                 existing_session_id = session_data.get("session_id")
                 if existing_session_id and (session_id is None or session_id == existing_session_id):
                     self.current_session_id = existing_session_id
@@ -434,27 +497,25 @@ class TurtleRAGSystem:
                     self.current_session_id = existing_session_id
                     self.session_conversations = session_data.get("conversations", [])
                     await self.end_session()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         # Process any existing in-memory session first
         if self.current_session_id and self.current_session_id != session_id:
             await self.end_session()
-        
+
         # Create new session
         self.current_session_id = session_id or f"turtle_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.session_conversations = []
-        
-        # Initialize temp JSON
+
+        # Initialize staging
         session_data = {
             "session_id": self.current_session_id,
             "creation_time": datetime.now().isoformat(),
             "conversations": []
         }
-        
-        with open(self.temp_session_file, 'w', encoding='utf-8') as f:
-            json.dump(session_data, f, indent=2, ensure_ascii=False)
-        
+        await asyncio.to_thread(self._staging.write, session_data)
+
         return self.current_session_id
     
     def add_conversation(self, user_query: str, turtle_response: str):
@@ -472,26 +533,26 @@ class TurtleRAGSystem:
         
         # Add to memory
         self.session_conversations.append(conversation)
-        
-        # Update temp JSON file
-        if self.temp_session_file.exists():
-            with open(self.temp_session_file, 'r', encoding='utf-8') as f:
-                session_data = json.load(f)
-        else:
+
+        # Update staging (sync, matching this method's own established
+        # blocking-call convention — it already touched local disk directly
+        # here with no asyncio.to_thread wrapper, so this is parity, not a
+        # new regression, in cloud mode too).
+        session_data = self._staging.read()
+        if session_data is None:
             session_data = {
                 "session_id": self.current_session_id,
                 "creation_time": datetime.now().isoformat(),
                 "conversations": []
             }
-        
+
         # Ensure session metadata matches current session
         session_data["session_id"] = self.current_session_id
         session_data.setdefault("creation_time", datetime.now().isoformat())
-        
+
         session_data["conversations"] = self.session_conversations
-        
-        with open(self.temp_session_file, 'w', encoding='utf-8') as f:
-            json.dump(session_data, f, indent=2, ensure_ascii=False)
+
+        self._staging.write(session_data)
     
     async def query_history(self, user_query: str) -> str:
         """
@@ -535,35 +596,39 @@ class TurtleRAGSystem:
     
     async def end_session(self):
         """End current session and process conversations to vector database"""
+        import asyncio
+
         if not self.current_session_id or not self.session_conversations:
             return True
-        
+
         try:
             self._index_session_conversations(
                 session_id=self.current_session_id,
                 conversations=self.session_conversations,
                 creation_time=datetime.now().isoformat(),
             )
-            
+
             # Clean up
             self.current_session_id = None
             self.session_conversations = []
-            
-            # Remove temp file
-            self.temp_session_file.unlink(missing_ok=True)
+
+            # Remove staging
+            await asyncio.to_thread(self._staging.clear)
             return True
-                
+
         except Exception as e:
             print(f"LOG: RAG end_session failed: {e}")
             return False
-    
+
     async def get_session_summary(self) -> Dict[str, Any]:
         """Get summary of current session"""
+        import asyncio
+
         return {
             "current_session_id": self.current_session_id,
             "conversations_count": len(self.session_conversations),
             "vector_store_stats": self.vector_store.get_storage_stats(),
-            "temp_file_exists": self.temp_session_file.exists()
+            "temp_file_exists": await asyncio.to_thread(self._staging.exists),
         }
     
     def get_system_stats(self) -> Dict[str, Any]:

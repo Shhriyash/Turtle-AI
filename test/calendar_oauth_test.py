@@ -28,6 +28,7 @@ def test_load_token_json_prefers_per_user_file(tmp_path, monkeypatch):
     import tools.calendar_tool as ct
 
     fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = False
     fake_settings.google_calendar_token_json = '{"refresh_token": "global-legacy"}'
     monkeypatch.setattr(ct, "settings", fake_settings)
 
@@ -51,6 +52,7 @@ def test_load_token_json_falls_back_to_global_when_no_per_user_file(tmp_path, mo
     import tools.calendar_tool as ct
 
     fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = False
     fake_settings.google_calendar_token_json = '{"refresh_token": "global-legacy"}'
     monkeypatch.setattr(ct, "settings", fake_settings)
 
@@ -70,6 +72,7 @@ def test_load_token_json_falls_back_when_no_user_id(monkeypatch):
     import tools.calendar_tool as ct
 
     fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = False
     fake_settings.google_calendar_token_json = '{"refresh_token": "global-legacy"}'
     monkeypatch.setattr(ct, "settings", fake_settings)
 
@@ -82,6 +85,7 @@ def test_load_credentials_omits_access_token_to_force_refresh(tmp_path, monkeypa
     import tools.calendar_tool as ct
 
     fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = False
     fake_settings.google_calendar_credentials_json = json.dumps(
         {"installed": {"client_id": "cid", "client_secret": "csecret"}}
     )
@@ -102,6 +106,7 @@ def test_load_credentials_none_without_creds_json(monkeypatch):
     import tools.calendar_tool as ct
 
     fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = False
     fake_settings.google_calendar_credentials_json = None
     monkeypatch.setattr(ct, "settings", fake_settings)
 
@@ -113,6 +118,7 @@ def test_create_calendar_event_threads_user_id(monkeypatch):
     import tools.calendar_tool as ct
 
     fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = False
     fake_settings.google_calendar_credentials_json = "{}"
     monkeypatch.setattr(ct, "settings", fake_settings)
 
@@ -170,6 +176,7 @@ def test_client_config_parses_installed_block(monkeypatch):
     import apps.calendar_oauth_routes as oauth_routes
 
     fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = False
     fake_settings.google_calendar_credentials_json = json.dumps(
         {"installed": {"client_id": "cid", "client_secret": "csecret"}}
     )
@@ -185,6 +192,7 @@ def test_client_config_missing_raises_503(monkeypatch):
     import apps.calendar_oauth_routes as oauth_routes
 
     fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = False
     fake_settings.google_calendar_credentials_json = None
     monkeypatch.setattr(oauth_routes, "settings", fake_settings)
 
@@ -233,3 +241,88 @@ def test_validate_credentials_json_empty():
     ok, message, config = oauth_routes.validate_credentials_json("")
     assert ok is False
     assert config is None
+
+
+# ---------------------------------------------------------------------------
+# Cloud-mode token storage (Vercel migration Phase 1c): _read_token/
+# _write_token/_delete_token/_token_exists must route through Postgres
+# instead of local disk when settings.is_cloud is True.
+# ---------------------------------------------------------------------------
+
+@pytestmark_fastapi
+def test_read_token_uses_postgres_in_cloud_mode(monkeypatch):
+    import apps.calendar_oauth_routes as oauth_routes
+
+    fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = True
+    monkeypatch.setattr(oauth_routes, "settings", fake_settings)
+
+    with mock.patch(
+        "core.storage.cloud.calendar_token_store.get_token_json",
+        return_value='{"refresh_token": "cloud-token"}',
+    ) as fake_get:
+        resolved = asyncio.run(oauth_routes._read_token("usr_a"))
+    assert resolved == '{"refresh_token": "cloud-token"}'
+    fake_get.assert_called_once_with("usr_a")
+
+
+@pytestmark_fastapi
+def test_write_token_uses_postgres_in_cloud_mode(monkeypatch):
+    import apps.calendar_oauth_routes as oauth_routes
+
+    fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = True
+    monkeypatch.setattr(oauth_routes, "settings", fake_settings)
+
+    with mock.patch(
+        "core.storage.cloud.calendar_token_store.put_token_json"
+    ) as fake_put:
+        asyncio.run(oauth_routes._write_token("usr_a", '{"refresh_token": "x"}'))
+    fake_put.assert_called_once_with("usr_a", '{"refresh_token": "x"}')
+
+
+@pytestmark_fastapi
+def test_delete_token_uses_postgres_in_cloud_mode(monkeypatch):
+    import apps.calendar_oauth_routes as oauth_routes
+
+    fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = True
+    monkeypatch.setattr(oauth_routes, "settings", fake_settings)
+
+    with mock.patch(
+        "core.storage.cloud.calendar_token_store.delete_token_json"
+    ) as fake_delete:
+        asyncio.run(oauth_routes._delete_token("usr_a"))
+    fake_delete.assert_called_once_with("usr_a")
+
+
+@pytestmark_fastapi
+def test_token_exists_uses_postgres_in_cloud_mode(monkeypatch):
+    import apps.calendar_oauth_routes as oauth_routes
+
+    fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = True
+    monkeypatch.setattr(oauth_routes, "settings", fake_settings)
+
+    with mock.patch(
+        "core.storage.cloud.calendar_token_store.token_exists", return_value=True
+    ) as fake_exists:
+        result = asyncio.run(oauth_routes._token_exists("usr_a"))
+    assert result is True
+    fake_exists.assert_called_once_with("usr_a")
+
+
+@pytestmark_fastapi
+def test_read_token_uses_local_disk_when_not_cloud(tmp_path, monkeypatch):
+    import apps.calendar_oauth_routes as oauth_routes
+
+    fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = False
+    monkeypatch.setattr(oauth_routes, "settings", fake_settings)
+    monkeypatch.setattr(
+        oauth_routes, "token_path_for_user", lambda uid: tmp_path / f"{uid}.json"
+    )
+
+    (tmp_path / "usr_a.json").write_text('{"refresh_token": "local"}', encoding="utf-8")
+    resolved = asyncio.run(oauth_routes._read_token("usr_a"))
+    assert resolved == '{"refresh_token": "local"}'

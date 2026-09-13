@@ -100,13 +100,9 @@ from core.email_flow import (
     validate_send_email_args,
 )
 from core.output_clean import clean_text_for_model, clean_text_for_tts, clean_text_for_display
-from core.channel_gate import ChannelGateBuffer
 from core.confirmation_gate import ConfirmationGate
-from core.guardrails import (
-    StorageCapExceededError,
-    WebSocketRateLimitExceeded,
-    ws_rate_limiter,
-)
+from core.guardrails import StorageCapExceededError, WebSocketRateLimitExceeded
+from core.storage.factory import get_channel_gate_buffer, get_ws_rate_limiter
 from core.telemetry import emit as emit_event, emit_once as emit_event_once
 from core.memory_journal import JournalStore, make_event
 from core.memory_schema import decide_write_policy, statement_for
@@ -451,21 +447,16 @@ class SharedState:
 # Robust shutdown wiring (Phase 3)
 # ---------------------------------------------------------------------------
 _ACTIVE_STATES: dict[int, "SharedState"] = {}
-_ACTIVE_STATES_BY_USER: dict[str, "SharedState"] = {}
 _SHUTDOWN_LOCK = threading.Lock()
 _SHUTDOWN_REQUESTED = False
 
 
 def _register_shutdown_state(state: "SharedState") -> None:
     _ACTIVE_STATES[id(state)] = state
-    if state.user_id:
-        _ACTIVE_STATES_BY_USER[state.user_id] = state
 
 
 def _unregister_shutdown_state(state: "SharedState") -> None:
     _ACTIVE_STATES.pop(id(state), None)
-    if state.user_id:
-        _ACTIVE_STATES_BY_USER.pop(state.user_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1063,7 @@ def _journal_and_queue_candidates(
             if result.written_topics:
                 print(f"LOG: Per-turn memory applied for {session_id}: {result.written_topics}")
                 if "workflow" in result.written_topics:
-                    _register_user_routines_safe(state)
+                    _register_user_routines_safe(state.user_id)
     except StorageCapExceededError:
         # Distinct boundary from the append (Codex R1#2): the journal HAS the
         # events; only the rendered projection hit the cap. Notify but keep
@@ -1418,22 +1409,27 @@ async def _sync_personal_memory_from_archive(
         print(f"LOG: Stage B session extractor failed for {session_id}: {e}")
 
 
-def _register_user_routines_safe(state: "SharedState") -> None:
+def _register_user_routines_safe(user_id: str) -> None:
     """Phase 4 / E1: re-scan + register a user's routines after a write.
 
     Idempotent — APScheduler replaces existing job ids on re-registration.
+    In cloud mode get_routine_scheduler() is always None (RoutineScheduler is
+    gated off there — see the cloud branch in _start_routine_scheduler), so
+    this is a correct no-op: the cron-tick endpoint discovers routines fresh
+    on every tick (core.routine_scheduler.get_active_routines_for_user)
+    without any registration step to re-run.
     """
-    if not state.user_id:
+    if not user_id:
         return
     try:
         sched = get_routine_scheduler()
         if sched is None:
             return
-        n = sched.register_for_user(state.user_id)
+        n = sched.register_for_user(user_id)
         if n:
-            print(f"LOG: Re-registered {n} routine(s) for {state.user_id}")
+            print(f"LOG: Re-registered {n} routine(s) for {user_id}")
     except Exception as e:
-        print(f"LOG: routine registration failed for {state.user_id}: {e}")
+        print(f"LOG: routine registration failed for {user_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1700,7 +1696,7 @@ def _apply_explicit_facts_from_turn(
         if result.written_topics:
             print(f"LOG: Per-turn memory applied for {session_id}: {result.written_topics}")
             if "workflow" in result.written_topics:
-                _register_user_routines_safe(state)
+                _register_user_routines_safe(state.user_id)
     except StorageCapExceededError:
         # The write funnel hit the per-user storage cap. Tell the user their
         # memory is full instead of swallowing it as a generic failure below.
@@ -2345,10 +2341,10 @@ class AgentManager:
                     "message and I'll set it up there."
                 ).to_agent_string()
             try:
-                from core.account_linking import LINK_CODE_TTL_MINUTES, LinkCodeStore
-                from core.identity import identity_manager
+                from core.account_linking import LINK_CODE_TTL_MINUTES
+                from core.storage.factory import get_link_code_store
 
-                store = LinkCodeStore(identity_manager.db_path)
+                store = get_link_code_store()
                 issued = await asyncio.to_thread(
                     store.issue,
                     channel=channel,
@@ -2592,6 +2588,14 @@ async def _start_routine_scheduler() -> None:
         _APP_LOOP = asyncio.get_running_loop()
     except RuntimeError:
         _APP_LOOP = None
+    if settings.is_cloud:
+        # Cloud mode has no persistent process to hold a live scheduler in —
+        # the periodic GitHub Actions cron-tick (apps/cron_tick_routes.py)
+        # replaces it. Starting RoutineScheduler here too would double-fire
+        # every routine (both paths would append the same scheduled_fire
+        # event and push the same delivery).
+        print("LOG: RoutineScheduler skipped in cloud mode — see apps/cron_tick_routes.py")
+        return
     try:
         from core.routine_scheduler import RoutineScheduler
         _routine_scheduler = RoutineScheduler()
@@ -2626,6 +2630,16 @@ async def _start_discord_gateway_hook() -> None:
     import sys
     if "pytest" in sys.modules:
         return
+    if settings.is_cloud:
+        # A persistent Gateway WebSocket cannot survive a serverless cold
+        # start — this connection would be torn down (and re-IDENTIFY'd,
+        # burning Discord's rate-limited session-start allowance) on every
+        # invocation. apps/channels/discord.py's Interactions webhook
+        # (POST /channels/discord) is the serverless-shaped replacement;
+        # register it as the app's Interactions Endpoint URL in the
+        # Developer Portal instead of running this gateway.
+        print("LOG: discord gateway skipped in cloud mode — use the /channels/discord webhook")
+        return
     try:
         from apps.channels.discord_gateway import start_discord_gateway
         # start_discord_gateway spawns the gateway client as its own background
@@ -2655,6 +2669,13 @@ async def _start_telegram_gateway_hook() -> None:
     # from inside a test's app lifespan — one bot session, many test entries.
     import sys
     if "pytest" in sys.modules:
+        return
+    if settings.is_cloud:
+        # A long-poll loop needs a persistent connection, same reasoning as
+        # Discord's gateway above. apps/channels/telegram_webhook.py's
+        # webhook (POST /channels/telegram/webhook) is the serverless-shaped
+        # replacement; register it via Telegram's setWebhook instead.
+        print("LOG: telegram gateway skipped in cloud mode — use the /channels/telegram/webhook endpoint")
         return
     try:
         from apps.channels.telegram_gateway import start_telegram_gateway
@@ -2744,6 +2765,12 @@ app.include_router(_admin_router)
 from apps.calendar_oauth_routes import router as _calendar_oauth_router
 app.include_router(_calendar_oauth_router)
 
+from apps.cron_tick_routes import router as _cron_tick_router
+app.include_router(_cron_tick_router)
+
+from apps.channels.telegram_webhook import router as _telegram_webhook_router
+app.include_router(_telegram_webhook_router)
+
 
 # Per-(user_id, channel) SharedState cache. Channels now run through the SAME
 # turn pipeline as the WebSocket path, so their conversation of record lives in
@@ -2772,8 +2799,9 @@ _CHANNEL_STATE_IDLE_TTL_S = 10 * 60
 # Channel-native confirmation-gate answer buffer (ISSUE-011) — tracks the one
 # outstanding memory-gate prompt per (user_id, channel) so a plain "yes"/"no"
 # chat reply can answer it. See core/channel_gate.py for the narrow-match
-# rules; this is a process-local singleton, same posture as _CHANNEL_STATES.
-_CHANNEL_GATE_BUFFER = ChannelGateBuffer()
+# rules. Process-local singleton in local mode; Redis-backed (shared across
+# invocations) in cloud mode — see core/storage/factory.get_channel_gate_buffer.
+_CHANNEL_GATE_BUFFER = get_channel_gate_buffer()
 
 
 def _channel_state_lock(key: tuple[str, str]) -> asyncio.Lock:
@@ -2830,13 +2858,20 @@ async def _build_channel_state(user_id: str, channel: str) -> SharedState:
     # Personal memory lives under personal_memory_dir(user_id); there is no
     # single-tenant store to construct.
     personal_memory_store = PersonalMemoryStore(user_id=user_id)
-    from core.memory_sqlite import MemorySQLiteIndex
-    # Same derived-read-model None-degrade as the WS path.
-    try:
-        sqlite_index = MemorySQLiteIndex(user_id=user_id)
-    except Exception as exc:
-        print(f"LOG: SQLite memory index unavailable for {user_id}: {exc}; falling back to journal scans")
-        sqlite_index = None
+    # The read-model index is a local SQLite file — pointless to build on
+    # ephemeral serverless disk every cold start (it would just be rebuilt
+    # from scratch next invocation), and every consumer already accepts
+    # sqlite_index=None (falls back to a plain journal scan, which in cloud
+    # mode already reads from Postgres — see core/memory_journal.py).
+    sqlite_index = None
+    if not settings.is_cloud:
+        from core.memory_sqlite import MemorySQLiteIndex
+        # Same derived-read-model None-degrade as the WS path.
+        try:
+            sqlite_index = MemorySQLiteIndex(user_id=user_id)
+        except Exception as exc:
+            print(f"LOG: SQLite memory index unavailable for {user_id}: {exc}; falling back to journal scans")
+            sqlite_index = None
     journal_store = JournalStore(
         user_id=user_id,
         on_append=sqlite_index.index_event if sqlite_index is not None else None,
@@ -2846,10 +2881,12 @@ async def _build_channel_state(user_id: str, channel: str) -> SharedState:
             sqlite_index.backfill_from_journal(journal_store)
         except Exception as exc:
             print(f"LOG: SQLite memory index backfill failed for {user_id}: {exc}")
+    from core.storage.factory import get_confirmation_state_backend
     confirmation_gate = ConfirmationGate(
         journal=journal_store,
         store=personal_memory_store,
         state_path=personal_memory_dir(user_id) / "confirmation_state.json",
+        state_backend=get_confirmation_state_backend(user_id),
         sqlite_index=sqlite_index,
     )
     personal_memory_prompt = PersonalMemoryPromptBuilder(
@@ -2862,13 +2899,13 @@ async def _build_channel_state(user_id: str, channel: str) -> SharedState:
     task_history_store = TaskHistoryStore(TASK_HISTORY_FILE, user_id=user_id)
     rag_system = TurtleRAGSystem(user_id=user_id)
 
-    from core.storage.local.faiss_store import get_faiss_vector_store
+    from core.storage.factory import get_vector_store
     from core.retrieval_broker import RetrievalBroker
     # Process singleton, not per-connection: the store is already keyed by
     # user_id internally, so a fresh instance per socket duplicated every
     # tenant's index in RAM and split the per-tenant locks. See
-    # core/storage/local/faiss_store.get_faiss_vector_store.
-    vector_store = get_faiss_vector_store()
+    # core/storage/factory.get_vector_store (FAISS locally, pgvector in cloud).
+    vector_store = get_vector_store()
     retrieval_broker = RetrievalBroker(
         store=personal_memory_store,
         task_store=task_history_store,
@@ -3353,6 +3390,39 @@ def _get_user_id_from_request(request: Request) -> str | None:
     return None
 
 
+def _build_confirmation_gate_for_user(user_id: str) -> "ConfirmationGate":
+    """Construct a ConfirmationGate fresh from durable storage (journal +
+    confirmation state), with no dependency on a currently-live SharedState.
+
+    This replaces looking the gate up in _ACTIVE_STATES_BY_USER (a
+    process-local cache populated only while a WebSocket/channel turn for
+    this user is live IN THIS PROCESS). That lookup is the documented root
+    cause of a real bug: on a multi-worker deploy (the Dockerfile's own -w 1
+    comment says this already happens at -w 2 today) a POST landing on a
+    different worker than the one holding the user's SharedState found
+    nothing and 404'd, even though the pending candidate genuinely existed in
+    the journal. Building the gate straight from storage on every request
+    makes that structurally impossible — the journal and confirmation state
+    are the same store from every process/instance, cloud or not.
+
+    Deliberately lightweight: unlike _build_channel_state, this does NOT
+    construct a SessionStore (no start_or_restore side effect — a mere
+    "check my pending confirmations" GET must never mutate session state),
+    RAG system, or retrieval broker. It builds only what ConfirmationGate
+    itself needs.
+    """
+    from core.storage.factory import get_confirmation_state_backend
+
+    personal_memory_store = PersonalMemoryStore(user_id=user_id)
+    journal_store = JournalStore(user_id=user_id)
+    return ConfirmationGate(
+        journal=journal_store,
+        store=personal_memory_store,
+        state_path=personal_memory_dir(user_id) / "confirmation_state.json",
+        state_backend=get_confirmation_state_backend(user_id),
+    )
+
+
 @app.get("/api/memory/pending")
 async def get_pending_memory(request: Request):
     """Return all queued memory candidates awaiting user confirmation."""
@@ -3360,12 +3430,8 @@ async def get_pending_memory(request: Request):
     if not user_id:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
-    state = _ACTIVE_STATES_BY_USER.get(user_id)
-    if state is None:
-        return JSONResponse({"pending": []})
-
     from core.confirmation_gate import _render_question  # noqa: PLC0415
-    gate = state.confirmation_gate
+    gate = _build_confirmation_gate_for_user(user_id)
     pending_ids = gate.get_pending_ids()
     items = []
     for event_id in pending_ids:
@@ -3400,11 +3466,8 @@ async def confirm_memory(request: Request):
     if not isinstance(accepted, bool):
         return JSONResponse({"error": "accepted (bool) required"}, status_code=400)
 
-    state = _ACTIVE_STATES_BY_USER.get(user_id)
-    if state is None:
-        return JSONResponse({"error": "No active session for user"}, status_code=404)
-
-    result = state.confirmation_gate.record_response(event_id, accepted=accepted)
+    gate = _build_confirmation_gate_for_user(user_id)
+    result = gate.record_response(event_id, accepted=accepted)
     if result is None:
         return JSONResponse({"error": "event_id not found in pending queue"}, status_code=404)
     # This panel is now the ONLY confirmation surface (chat-text confirmation
@@ -3412,12 +3475,9 @@ async def confirm_memory(request: Request):
     # here: routine registration on a workflow accept, and the first-confirm
     # telemetry event.
     if accepted:
-        # getattr-defensive: endpoint tests drive this with partial state stubs.
-        confirm_user = getattr(state, "user_id", "")
-        if confirm_user:
-            emit_event_once(confirm_user, "memory_first_confirmed", topic=result.topic)
+        emit_event_once(user_id, "memory_first_confirmed", topic=result.topic)
         if result.topic == "workflow":
-            _register_user_routines_safe(state)
+            _register_user_routines_safe(user_id)
     return JSONResponse({"status": "ok", "applied": accepted})
 
 
@@ -3447,11 +3507,12 @@ async def link_account_redeem(request: Request):
         return JSONResponse({"error": "code is required"}, status_code=400)
 
     from core.account_linking import (
-        LinkCodeStore, mark_consumed, merge_memory, release_reservation, reserve,
+        mark_consumed, merge_memory, release_reservation, reserve,
     )
     from core.identity import identity_manager
+    from core.storage.factory import get_link_code_store
 
-    store = LinkCodeStore(identity_manager.db_path)
+    store = get_link_code_store()
 
     # ── ORDERING (post-Codex-verification-pass):
     #   1. RESERVE the code atomically for THIS target user_id. Same-target
@@ -3620,15 +3681,22 @@ async def websocket_endpoint(ws: WebSocket):
         # Personal memory lives under personal_memory_dir(user_id); there is no
         # single-tenant store to construct.
         personal_memory_store = PersonalMemoryStore(user_id=user_id)
-        from core.memory_sqlite import MemorySQLiteIndex
-        # The index is a derived read model — if it can't open (locked file,
-        # failed column migration), degrade to journal scans rather than kill
-        # the session. Every consumer below accepts sqlite_index=None.
-        try:
-            sqlite_index = MemorySQLiteIndex(user_id=user_id)
-        except Exception as exc:
-            print(f"LOG: SQLite memory index unavailable for {user_id}: {exc}; falling back to journal scans")
-            sqlite_index = None
+        # The read-model index is a local SQLite file — pointless to build on
+        # ephemeral serverless disk every cold start (rebuilt from scratch
+        # next invocation anyway), and every consumer below already accepts
+        # sqlite_index=None (falls back to a plain journal scan, which in
+        # cloud mode already reads from Postgres — core/memory_journal.py).
+        sqlite_index = None
+        if not settings.is_cloud:
+            from core.memory_sqlite import MemorySQLiteIndex
+            # The index is a derived read model — if it can't open (locked file,
+            # failed column migration), degrade to journal scans rather than kill
+            # the session. Every consumer below accepts sqlite_index=None.
+            try:
+                sqlite_index = MemorySQLiteIndex(user_id=user_id)
+            except Exception as exc:
+                print(f"LOG: SQLite memory index unavailable for {user_id}: {exc}; falling back to journal scans")
+                sqlite_index = None
         journal_store = JournalStore(
             user_id=user_id,
             on_append=sqlite_index.index_event if sqlite_index is not None else None,
@@ -3639,10 +3707,12 @@ async def websocket_endpoint(ws: WebSocket):
                 sqlite_index.backfill_from_journal(journal_store)
             except Exception as exc:
                 print(f"LOG: SQLite memory index backfill failed for {user_id}: {exc}")
+        from core.storage.factory import get_confirmation_state_backend
         confirmation_gate = ConfirmationGate(
             journal=journal_store,
             store=personal_memory_store,
             state_path=personal_memory_dir(user_id) / "confirmation_state.json",
+            state_backend=get_confirmation_state_backend(user_id),
             # Phase 2 W3: indexed hot-path lookups instead of O(n) journal scans.
             sqlite_index=sqlite_index,
         )
@@ -3657,10 +3727,10 @@ async def websocket_endpoint(ws: WebSocket):
         rag_system = TurtleRAGSystem(user_id=user_id)
 
         # D4: construct RetrievalBroker for 4-tier memory context retrieval
-        from core.storage.local.faiss_store import get_faiss_vector_store
+        from core.storage.factory import get_vector_store
         from core.retrieval_broker import RetrievalBroker
         # Process singleton — see the channel-state twin above.
-        vector_store = get_faiss_vector_store()
+        vector_store = get_vector_store()
         retrieval_broker = RetrievalBroker(
             store=personal_memory_store,
             task_store=task_history_store,
@@ -3690,6 +3760,18 @@ async def websocket_endpoint(ws: WebSocket):
         # Phase 5 (W2): expose this socket to the routine scheduler so a fire can
         # reach the user live. Symmetrically discarded in the teardown finally.
         _register_live_socket(user_id, ws)
+
+        # Cloud mode only: subscribe to this user's Redis live-delivery
+        # channel so a routine fired by a DIFFERENT instance (almost always
+        # true in serverless — see deliver_routine_notice's docstring) can
+        # still reach this socket live instead of waiting for the outbox to
+        # drain on next connect. Cancelled in the teardown finally below,
+        # symmetrically with _register_live_socket/_discard_live_socket.
+        redis_relay_task: "asyncio.Task | None" = None
+        if settings.is_cloud:
+            redis_relay_task = asyncio.create_task(
+                _relay_redis_live_frames(user_id, ws), name=f"redis_relay_{user_id}"
+            )
 
         # Process pending sessions from previous runs (personal memory finalization).
         # list_pending_finalization_archives now returns (session_id, message_history)
@@ -3766,7 +3848,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # WebSocketRateLimitExceeded so we can close cleanly.
                 async def _check_user_message_rate() -> bool:
                     try:
-                        ws_rate_limiter.check_and_record(user_id)
+                        get_ws_rate_limiter().check_and_record(user_id)
                         return True
                     except WebSocketRateLimitExceeded as exc:
                         await _ws_send_json(ws, {
@@ -3893,6 +3975,13 @@ async def websocket_endpoint(ws: WebSocket):
             print(f"LOG: WebSocket error: {e}")
             traceback.print_exc()
         finally:
+            # Symmetric with the redis_relay_task startup above.
+            if redis_relay_task is not None:
+                redis_relay_task.cancel()
+                try:
+                    await redis_relay_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             # Tear down any live/finishing streaming-STT session so its worker
             # threads and websocket don't leak when the client drops.
             if mic_session is not None:
@@ -4176,25 +4265,84 @@ async def _drain_pending_routines_on_loop(user_id: str) -> None:
             return
 
 
+async def _relay_redis_live_frames(user_id: str, ws: WebSocket) -> None:
+    """Cloud-mode WS task: forward this user's Redis live-delivery channel
+    straight to their socket for the life of the connection.
+
+    Started once per WS connect (websocket_endpoint) and cancelled on
+    disconnect. This is what makes deliver_routine_notice's cross-instance
+    Redis publish actually reach a browser tab: the publish alone only tells
+    Redis "someone wants this," an active subscriber is what turns that into
+    a delivered frame. Runs until cancelled; any error (Redis hiccup,
+    connection drop) ends the loop quietly — a lost live push still has the
+    Postgres outbox as a correctness backstop, so this task failing is a UX
+    degrade, never a data-loss bug.
+    """
+    try:
+        from core.storage.cloud.live_delivery import open_user_subscription
+
+        pubsub = await open_user_subscription(user_id)
+    except Exception as e:
+        print(f"LOG: redis live relay subscribe failed user={user_id}: {e}")
+        return
+    try:
+        async for message in pubsub.listen():
+            if message.get("type") != "message":
+                continue  # subscribe/unsubscribe confirmations, not a payload
+            try:
+                frame = json.loads(message["data"])
+            except Exception:
+                continue
+            await _ws_send_json(ws, frame)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"LOG: redis live relay error user={user_id}: {e}")
+    finally:
+        try:
+            await pubsub.unsubscribe()
+            await pubsub.aclose()
+        except Exception:
+            pass
+
+
 def deliver_routine_notice(user_id: str, frame: dict[str, Any]) -> bool:
     """Push a routine frame to the user's live socket(s), or queue it.
 
-    Called from the routine scheduler's worker thread when a routine fires. The
-    ONLY safe cross-thread bridge is asyncio.run_coroutine_threadsafe against the
-    captured app loop (_APP_LOOP) — we never create_task/get_running_loop from
-    this thread, and never block on the returned future's .result(). The bridged
-    coroutine verifies each send and stashes the frame itself when no socket
-    accepted it, so a stale registry entry cannot lose a fire.
+    Called from the routine scheduler's worker thread when a routine fires
+    (local mode) or from apps/cron_tick_routes.py's cron-tick request thread
+    (cloud mode — see core.routine_scheduler._fire_routine). The ONLY safe
+    cross-thread bridge for THIS process's own sockets is
+    asyncio.run_coroutine_threadsafe against the captured app loop
+    (_APP_LOOP) — we never create_task/get_running_loop from this thread, and
+    never block on the returned future's .result(). The bridged coroutine
+    verifies each send and stashes the frame itself when no socket accepted
+    it, so a stale registry entry cannot lose a fire.
 
-    Returns True when the delivery attempt was scheduled onto the app loop;
-    False when it was stashed directly (no live socket / no captured loop /
-    closed loop). Never raises — a delivery failure must never affect the
+    In cloud mode, the firing process and the process holding the user's live
+    WebSocket are almost always DIFFERENT instances — _LIVE_SOCKETS is
+    process-local and cannot see across that boundary. Before falling back to
+    the durable outbox, cloud mode first PUBLISHES to the user's Redis
+    channel (core.storage.cloud.live_delivery); any OTHER instance with that
+    socket open is subscribed and relays it live (see the WebSocket handler's
+    _redis_live_relay task). A publish reaching zero subscribers (nobody has
+    the socket open anywhere) still falls through to the outbox exactly as
+    before — never lost, just delivered on next connect instead of live.
+
+    Returns True when the delivery attempt was scheduled onto the app loop OR
+    published to at least one cross-instance subscriber; False when it was
+    stashed directly. Never raises — a delivery failure must never affect the
     journal write that already happened upstream.
     """
     try:
         loop = _APP_LOOP
         with _LIVE_SOCKETS_LOCK:
             has_sockets = bool(_LIVE_SOCKETS.get(user_id))
+        if not has_sockets and settings.is_cloud:
+            from core.storage.cloud.live_delivery import publish_routine_frame_sync
+
+            if publish_routine_frame_sync(user_id, frame) > 0:
+                return True  # delivered live by a different instance
         if loop is not None and not loop.is_closed() and has_sockets:
             try:
                 asyncio.run_coroutine_threadsafe(

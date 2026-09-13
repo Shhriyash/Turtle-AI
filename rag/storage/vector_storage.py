@@ -3,17 +3,27 @@ FAISS Vector Storage for RAG System
 
 This module handles vector storage and retrieval using FAISS (Facebook AI Similarity Search).
 Provides efficient similarity search for conversation chunks.
+
+faiss is imported LAZILY inside VectorStorage's methods rather than at module
+level: in cloud mode (TURTLE_DEPLOY=cloud), get_vector_storage() below never
+constructs a VectorStorage at all (it returns a PgChunkVectorStore instead —
+see core/storage/cloud/pgvector_store.py), but this module is still imported
+at server startup via rag/system/complete_rag.py's top-level
+`from rag.storage.vector_storage import get_vector_storage`. A module-level
+`import faiss` would therefore force faiss-cpu (~75MB installed, including
+its bundled native libs) into the deployed bundle even though cloud mode
+never touches it — found while chasing Vercel's 500MB function-size limit.
 """
 
 import os
 import json
 import threading
 import numpy as np
-import faiss
 from collections import OrderedDict
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
+from core.config import settings
 from core.paths import rag_vector_dir, ensure_dirs
 from core.io_atomic import atomic_write_json
 
@@ -66,6 +76,8 @@ class VectorStorage:
     
     def _initialize_index(self):
         """Initialize FAISS index"""
+        import faiss
+
         if self.index_path.exists():
             try:
                 # Load existing index
@@ -75,9 +87,11 @@ class VectorStorage:
                 self._create_new_index()
         else:
             self._create_new_index()
-    
+
     def _create_new_index(self):
         """Create a new FAISS index"""
+        import faiss
+
         if self.index_mode == "hnsw":
             index = faiss.IndexHNSWFlat(self.embedding_dimension, self.hnsw_m, faiss.METRIC_INNER_PRODUCT)
             index.hnsw.efSearch = self.hnsw_ef_search
@@ -183,6 +197,8 @@ class VectorStorage:
     def _save_index(self):
         """Save FAISS index to disk"""
         if self.faiss_index:
+            import faiss
+
             temp_path = self.storage_dir / f".{self.index_path.name}.tmp"
             faiss.write_index(self.faiss_index, str(temp_path))
             os.replace(temp_path, self.index_path)
@@ -438,7 +454,7 @@ _vector_storage_by_user: "OrderedDict[str, VectorStorage]" = OrderedDict()
 _vector_storage_lock = threading.Lock()
 
 
-def get_vector_storage(user_id: str) -> VectorStorage:
+def get_vector_storage(user_id: str):
     """Return the cached VectorStorage for ``user_id`` (constructed on first use).
 
     Locked: FAISS search/upsert run on ``asyncio.to_thread`` worker threads, so
@@ -446,9 +462,22 @@ def get_vector_storage(user_id: str) -> VectorStorage:
     different VectorStorage objects for the same tenant — which then write the
     same index.bin from two in-memory copies. Same class of bug that
     ``FAISSVectorStore._get_lock`` guards against one layer down.
+
+    In cloud mode (TURTLE_DEPLOY=cloud) this returns a PgChunkVectorStore
+    instead — same add_chunks/search_similar/get_storage_stats surface (the
+    only methods rag/system/complete_rag.py's RAGSystem calls), backed by
+    pgvector on Neon rather than a FAISS index file on local disk, which does
+    not survive a serverless cold start. No FAISS index-file cache applies to
+    it (pgvector holds no per-process state to evict), so it bypasses the
+    LRU cache below and is constructed fresh — cheap, since it does no I/O
+    until first used.
     """
     if not user_id:
         raise ValueError("get_vector_storage requires a user_id")
+    if settings.is_cloud:
+        from core.storage.cloud.pgvector_store import PgChunkVectorStore
+
+        return PgChunkVectorStore(user_id=user_id)
     with _vector_storage_lock:
         store = _vector_storage_by_user.get(user_id)
         if store is not None:

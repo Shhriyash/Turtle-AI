@@ -130,23 +130,40 @@ def _load_token_json(user_id: Optional[str]) -> Optional[str]:
     """Resolve the OAuth2 user token JSON to use.
 
     Prefers the per-user token written by the in-app connect flow
-    (apps/calendar_oauth_routes.py, GET /integrations/google_calendar/connect)
-    at personal_memory_dir(user_id)/google_calendar_token.json, so each signed-in
-    user's calendar_create/calendar_list calls act on THEIR OWN calendar.
+    (apps/calendar_oauth_routes.py, GET /integrations/google_calendar/connect):
+    Postgres in cloud mode (TURTLE_DEPLOY=cloud — the local disk path below
+    does not survive a serverless cold start), personal_memory_dir(user_id)/
+    google_calendar_token.json locally. Either way, each signed-in user's
+    calendar_create/calendar_list calls act on THEIR OWN calendar.
 
     Falls back to the legacy global GOOGLE_CALENDAR_TOKEN_JSON env var for
     single-tenant / dev deployments that predate the per-user connect flow, or
     when no user_id is available (e.g. a non-web channel not yet resolved to
     a per-user token).
+
+    Safe to call synchronously here: every caller in this module reaches
+    _load_token_json via asyncio.to_thread (see create_calendar_event/
+    list_calendar_events's _sync_* helpers), so the Postgres read below
+    (psycopg, sync) never blocks the event loop.
     """
     if user_id:
-        try:
-            from core.paths import personal_memory_dir
-            token_path = personal_memory_dir(user_id) / "google_calendar_token.json"
-            if token_path.exists():
-                return token_path.read_text(encoding="utf-8")
-        except Exception:
-            pass  # fall through to the legacy env var
+        if settings.is_cloud:
+            try:
+                from core.storage.cloud.calendar_token_store import get_token_json
+
+                token_json = get_token_json(user_id)
+                if token_json:
+                    return token_json
+            except Exception:
+                pass  # fall through to the legacy env var
+        else:
+            try:
+                from core.paths import personal_memory_dir
+                token_path = personal_memory_dir(user_id) / "google_calendar_token.json"
+                if token_path.exists():
+                    return token_path.read_text(encoding="utf-8")
+            except Exception:
+                pass  # fall through to the legacy env var
     return settings.google_calendar_token_json
 
 

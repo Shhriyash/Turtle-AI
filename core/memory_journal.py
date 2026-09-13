@@ -9,7 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
-from core.guardrails import enforce_storage_cap
+from core.config import settings
+from core.guardrails import StorageCapExceededError, enforce_storage_cap
 from core.memory_schema import ALLOWED_TOPICS
 from core.paths import personal_journal_dir, personal_memory_dir
 
@@ -107,23 +108,19 @@ def validate_event(event: MemoryEvent) -> None:
         raise ValueError("value must be a dict")
 
 
-class JournalStore:
-    """Append-only JSONL journal, sharded by month, idempotent by event_id."""
+class _LocalJournalBackend:
+    """Append-only JSONL journal, sharded by month, idempotent by event_id.
 
-    def __init__(
-        self,
-        user_id: str = "default",
-        journal_dir: Path | None = None,
-        *,
-        on_append: Callable[[MemoryEvent], None] | None = None,
-    ) -> None:
-        self.user_id = user_id
-        self.journal_dir = journal_dir or personal_journal_dir(user_id)
+    Extracted from JournalStore's original single-backend implementation so
+    the cloud counterpart (core/storage/cloud/journal_store.PostgresJournalBackend)
+    can drop in behind the same 4-method surface without JournalStore's
+    business logic (validation, dedup, cap enforcement, the on_append hook)
+    needing to know which one it's talking to.
+    """
+
+    def __init__(self, journal_dir: Path) -> None:
+        self.journal_dir = journal_dir
         self.journal_dir.mkdir(parents=True, exist_ok=True)
-        # Optional write-through hook (e.g. SQLite FTS5 index). Wrapped in
-        # try/except at the call site so a failing index never blocks the
-        # journal write — the journal is the source of truth.
-        self.on_append = on_append
 
     def _shard_path_for(self, observed_at: str) -> Path:
         try:
@@ -134,19 +131,15 @@ class JournalStore:
         shard.mkdir(parents=True, exist_ok=True)
         return shard / "events.jsonl"
 
-    def append(self, event: MemoryEvent) -> MemoryEvent:
-        validate_event(event)
-        if self._event_exists(event.event_id):
-            return event
+    def event_exists(self, event_id: str) -> bool:
+        for existing in self.iter_events():
+            if existing.event_id == event_id:
+                return True
+        return False
+
+    def append_line(self, event: MemoryEvent) -> None:
         path = self._shard_path_for(event.observed_at)
         line = json.dumps(event.to_payload(), ensure_ascii=False, sort_keys=True)
-        # Phase 6: enforce per-user storage cap before appending.
-        if self.user_id and self.user_id != "default":
-            enforce_storage_cap(
-                self.user_id,
-                personal_memory_dir(self.user_id),
-                incoming_bytes=len(line.encode("utf-8")) + 1,
-            )
         with path.open("a", encoding="utf-8") as file:
             file.write(line + "\n")
             file.flush()
@@ -154,12 +147,147 @@ class JournalStore:
                 os.fsync(file.fileno())
             except Exception:
                 pass
+
+    def iter_events(self) -> Iterator[MemoryEvent]:
+        if not self.journal_dir.exists():
+            return
+        shard_files: list[Path] = []
+        for shard_dir in sorted(self.journal_dir.iterdir()):
+            if not shard_dir.is_dir():
+                continue
+            path = shard_dir / "events.jsonl"
+            if path.exists():
+                shard_files.append(path)
+        for path in shard_files:
+            with path.open("r", encoding="utf-8") as file:
+                for raw in file:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    try:
+                        yield MemoryEvent.from_payload(payload)
+                    except Exception:
+                        continue
+
+    def total_bytes(self) -> int:
+        total = 0
+        try:
+            for entry in self.journal_dir.rglob("*"):
+                if entry.is_file():
+                    try:
+                        total += entry.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return total
+
+    def created_at_timestamp(self) -> float | None:
+        try:
+            return self.journal_dir.stat().st_ctime
+        except OSError:
+            return None
+
+    def flush(self) -> None:
+        if not self.journal_dir.exists():
+            return
+        for shard_dir in sorted(self.journal_dir.iterdir()):
+            if not shard_dir.is_dir():
+                continue
+            path = shard_dir / "events.jsonl"
+            if not path.exists():
+                continue
+            try:
+                with path.open("a", encoding="utf-8") as file:
+                    file.flush()
+                    try:
+                        os.fsync(file.fileno())
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
+
+class JournalStore:
+    """Append-only journal, idempotent by event_id.
+
+    Local mode: JSONL sharded by month (see _LocalJournalBackend). Cloud mode
+    (TURTLE_DEPLOY=cloud): Postgres, one row per event (see
+    core/storage/cloud/journal_store.PostgresJournalBackend) — the local
+    JSONL files do not survive a serverless cold start.
+
+    An explicit ``journal_dir`` always forces the local backend regardless of
+    settings.is_cloud — this is how the test suite gets an isolated,
+    disposable journal per test, and that isolation must keep working
+    unchanged in a cloud-mode CI run.
+    """
+
+    def __init__(
+        self,
+        user_id: str = "default",
+        journal_dir: Path | None = None,
+        *,
+        on_append: Callable[[MemoryEvent], None] | None = None,
+    ) -> None:
+        self.user_id = user_id
+        # Optional write-through hook (e.g. SQLite FTS5 index). Wrapped in
+        # try/except at the call site so a failing index never blocks the
+        # journal write — the journal is the source of truth.
+        self.on_append = on_append
+
+        if journal_dir is not None:
+            self._backend = _LocalJournalBackend(journal_dir)
+        elif settings.is_cloud:
+            from core.storage.cloud.journal_store import PostgresJournalBackend
+
+            self._backend = PostgresJournalBackend(user_id)
+        else:
+            self._backend = _LocalJournalBackend(personal_journal_dir(user_id))
+
+    def append(self, event: MemoryEvent) -> MemoryEvent:
+        validate_event(event)
+        if self._backend.event_exists(event.event_id):
+            return event
+        line_bytes = len(
+            json.dumps(event.to_payload(), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ) + 1
+        # Phase 6: enforce per-user storage cap before appending.
+        if self.user_id and self.user_id != "default":
+            self._enforce_cap(incoming_bytes=line_bytes)
+        self._backend.append_line(event)
         if self.on_append is not None:
             try:
                 self.on_append(event)
             except Exception as exc:
                 print(f"LOG: JournalStore on_append hook failed for {event.event_id}: {exc}")
         return event
+
+    def _enforce_cap(self, *, incoming_bytes: int) -> None:
+        """Same guardrail as core.guardrails.enforce_storage_cap, sourced from
+        whichever backend is active: local disk usage under
+        personal_memory_dir(user_id) locally, this user's total journal row
+        size in Postgres in cloud mode (there is no shared local disk there
+        for a runaway writer to fill, but an unbounded per-user table is its
+        own cost/quota concern worth guarding the same way).
+        """
+        cap_mb = int(settings.user_storage_cap_mb)
+        if cap_mb <= 0:
+            return
+        if isinstance(self._backend, _LocalJournalBackend):
+            enforce_storage_cap(
+                self.user_id, personal_memory_dir(self.user_id), incoming_bytes=incoming_bytes
+            )
+            return
+        cap_bytes = cap_mb * 1024 * 1024
+        used = self._backend.total_bytes() + max(0, incoming_bytes)
+        if used > cap_bytes:
+            raise StorageCapExceededError(self.user_id, used, cap_bytes)
 
     def append_many(self, events: Iterable[MemoryEvent]) -> list[MemoryEvent]:
         # Dedup-on-append: skip only TRUE no-ops — an incoming event whose
@@ -243,60 +371,30 @@ class JournalStore:
         return self.append(tombstone)
 
     def iter_events(self) -> Iterator[MemoryEvent]:
-        if not self.journal_dir.exists():
-            return
-        shard_files: list[Path] = []
-        for shard_dir in sorted(self.journal_dir.iterdir()):
-            if not shard_dir.is_dir():
-                continue
-            path = shard_dir / "events.jsonl"
-            if path.exists():
-                shard_files.append(path)
-        for path in shard_files:
-            with path.open("r", encoding="utf-8") as file:
-                for raw in file:
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except Exception:
-                        continue
-                    if not isinstance(payload, dict):
-                        continue
-                    try:
-                        yield MemoryEvent.from_payload(payload)
-                    except Exception:
-                        continue
+        return self._backend.iter_events()
 
     def load_all(self) -> list[MemoryEvent]:
         return list(self.iter_events())
 
     def _event_exists(self, event_id: str) -> bool:
-        for existing in self.iter_events():
-            if existing.event_id == event_id:
-                return True
-        return False
+        return self._backend.event_exists(event_id)
+
+    def get_created_at_timestamp(self) -> float | None:
+        """Epoch seconds this journal was first created, or None when
+        unavailable. Local mode: the journal directory's ctime. Cloud mode:
+        the earliest journal event's observed_at (there is no filesystem
+        ctime; a user's first journal write happens moments after their
+        journal would have been created locally, so this is a faithful
+        substitute). Used by core/confirmation_gate.py's first-session
+        heuristic, which already treats an exception/None as "can't tell,
+        fall through to the event-count check alone".
+        """
+        return self._backend.created_at_timestamp()
 
     def flush(self) -> None:
-        """Best-effort fsync for existing journal shards."""
-        if not self.journal_dir.exists():
-            return
-        for shard_dir in sorted(self.journal_dir.iterdir()):
-            if not shard_dir.is_dir():
-                continue
-            path = shard_dir / "events.jsonl"
-            if not path.exists():
-                continue
-            try:
-                with path.open("a", encoding="utf-8") as file:
-                    file.flush()
-                    try:
-                        os.fsync(file.fileno())
-                    except Exception:
-                        pass
-            except Exception:
-                continue
+        """Best-effort fsync for existing journal shards (local mode) / no-op
+        (cloud mode — Postgres commits are already durable)."""
+        self._backend.flush()
 
 
 def make_event(

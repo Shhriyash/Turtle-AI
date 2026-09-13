@@ -165,8 +165,15 @@ async def onboarding_start(req: Request, body: OnboardingStartRequest) -> JSONRe
     if not _is_valid_email(email):
         raise HTTPException(status_code=400, detail="Invalid email address.")
 
-    await identity_manager.init_db()
-    user_id = await identity_manager.resolve_user("web_email", email)
+    try:
+        await identity_manager.init_db()
+        user_id = await identity_manager.resolve_user("web_email", email)
+    except Exception:
+        logger.exception("onboarding/start: identity resolution failed for email=%s", email)
+        raise HTTPException(
+            status_code=500,
+            detail="Could not start onboarding (identity store unavailable). Try again shortly.",
+        )
 
     # Seed identity.md immediately on form submission so the user's name is
     # known even before they click the magic link. The /claim handler will

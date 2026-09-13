@@ -14,7 +14,7 @@ from pydantic_ai import ModelMessagesTypeAdapter
 from pydantic_ai.messages import ModelMessage
 
 from core.storage import Session, SessionStoreProtocol
-from core.storage.local.sqlite_store import SQLiteSessionStore
+from core.storage.factory import get_session_store_backend
 
 
 # A completed session's messages blob only ever grows (real rows reached ~18KB
@@ -75,7 +75,10 @@ class SessionStore:
     def __init__(
         self, backend: SessionStoreProtocol | None = None, *, user_id: str = ""
     ) -> None:
-        self.backend = backend or SQLiteSessionStore()
+        # Explicit backend (tests, custom callers) always wins; otherwise the
+        # factory picks SQLite locally / Postgres in cloud mode off
+        # settings.is_cloud (core/storage/factory.py).
+        self.backend = backend or get_session_store_backend()
         # Sessions are tenant-scoped; empty string = legacy/unowned.
         self.user_id = user_id
         self.session_id: str | None = None
