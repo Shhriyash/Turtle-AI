@@ -104,7 +104,6 @@ class TurtleRAGSystem:
             # Per-user staging: one global staging file destroyed each user's
             # previous session on every start (and interleaved tenants).
             self.storage_dir = RAG_DATA_DIR / user_id if user_id else RAG_DATA_DIR
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.user_id = user_id
 
         # Temp JSON file for current session (local mode) / Postgres row
@@ -113,8 +112,18 @@ class TurtleRAGSystem:
         # survive cloud mode unchanged, same rule as every other backend in
         # this migration); "default"/no-user_id stays local too, matching
         # this class's own existing single-tenant-vector-store fallback.
+        use_cloud_staging = storage_dir is None and settings.is_cloud and user_id
+        # mkdir only when local staging will actually read/write under
+        # storage_dir — Vercel's filesystem is read-only outside /tmp, so
+        # this used to crash the cloud path too (it computed
+        # temp_session_file's directory unconditionally before checking
+        # which staging backend it was about to pick — found live: every
+        # /ws connect 500'd in TurtleRAGSystem.__init__ right after the
+        # onboarding/task-history fixes cleared the same crash elsewhere).
+        if not use_cloud_staging:
+            self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.temp_session_file = self.storage_dir / "current_session.json"
-        if storage_dir is None and settings.is_cloud and user_id:
+        if use_cloud_staging:
             self._staging = _CloudSessionStaging(user_id)
         else:
             self._staging = _LocalSessionStaging(self.temp_session_file)
