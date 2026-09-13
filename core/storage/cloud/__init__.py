@@ -69,6 +69,13 @@ async def get_pg_pool() -> Any:
         from pgvector.asyncpg import register_vector
 
         async def _init_connection(conn: "asyncpg.Connection") -> None:
+            # Neon databases don't have the pgvector extension enabled by
+            # default; register_vector() raises ("vector type not found") if
+            # it's missing, which took down every Postgres-backed route
+            # (identity resolution included, since they all share this one
+            # pool) rather than just the RAG vector-store paths that actually
+            # need it. Idempotent and cheap, so just always ensure it here.
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             await register_vector(conn)
 
         _pg_pool = await asyncpg.create_pool(
