@@ -50,7 +50,7 @@
 .bubble-glow {
     position: relative;
     width: 340px;
-    height: 300px;
+    height: 320px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -146,7 +146,7 @@
     flex-direction: column;
     align-items: center;
     gap: 10px;
-    margin-top: -18px;
+    margin-top: 10px;
 }
 
 .bubble-wordmark {
@@ -322,7 +322,7 @@
 /* ── Compact viewports ────────────────────────────────────── */
 @media (max-height: 700px) {
     .bubble-greeting { font-size: 30px; min-height: 34px; }
-    .bubble-glow { width: 280px; height: 240px; }
+    .bubble-glow { width: 280px; height: 262px; }
     .ring-ambient.r1 { width: 220px; height: 220px; }
     .ring-ambient.r2 { width: 164px; height: 164px; }
     .ring-ambient.r3 { width: 112px; height: 112px; }
