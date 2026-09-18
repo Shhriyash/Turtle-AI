@@ -15,10 +15,30 @@ name: deploy-vercel
 # anything reaches Vercel), or if you connect it for its preview-comment UI,
 # go to Project Settings -> Git and disable "Automatically deploy commits
 # pushed to main" so production only ever happens through this gate.
+#
+# AUTOMATIC DEPLOYS ARE CURRENTLY OFF. This workflow has never completed a
+# successful deploy — its first and only real attempt died at `vercel build`
+# ("uv is required but was not found in PATH"), and every run since was
+# skipped by the branch gate, so `vercel build` has never been proven to work
+# for this project. Until a manual run goes green here and the build is
+# verified locally, the workflow is dispatch-only: pick an environment and
+# run it by hand from the Actions tab. To restore the test-gated automatic
+# deploy afterwards, put back the trigger this replaced —
+#   on:
+#     workflow_run:
+#       workflows: ["tests"]
+#       types: [completed]
+# — and re-gate the two jobs on github.event.workflow_run (conclusion ==
+# 'success', event == 'push'/'pull_request', head_branch == 'main' for
+# production) plus `ref: github.event.workflow_run.head_sha` on checkout.
 on:
-  workflow_run:
-    workflows: ["tests"]
-    types: [completed]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which environment to deploy"
+        type: choice
+        options: [preview, production]
+        default: preview
 
 permissions:
   contents: read
@@ -26,20 +46,23 @@ permissions:
 
 jobs:
   deploy-production:
-    if: >
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main'
+    if: inputs.target == 'production'
     runs-on: ubuntu-latest
     environment: production
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      # `vercel build` runs the Python builder on this runner rather than on
+      # Vercel's infra, and that builder shells out to `uv` to resolve
+      # requirements.txt. Vercel's own builders ship uv preinstalled; a GitHub
+      # runner does not, which is what killed the only real deploy attempt:
+      #   Error: uv is required but was not found in PATH.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
 
       - name: Install Vercel CLI
         run: npm install -g vercel@latest
@@ -67,18 +90,17 @@ jobs:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 
   deploy-preview:
-    if: >
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'pull_request'
+    if: inputs.target == 'preview'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
 
       - name: Install Vercel CLI
         run: npm install -g vercel@latest
