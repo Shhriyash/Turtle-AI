@@ -8,13 +8,20 @@ name: cron-tick
 # GitHub Actions' `schedule` cron does not guarantee to-the-minute execution,
 # and in this repo it has not come close: over the workflow's first 5 days it
 # delivered 34 of ~1484 `*/5` runs (2.2%), median gap 220 minutes, never once
-# under 115. Vercel Cron (vercel.json's `crons`) is now the primary trigger
-# and this workflow is the backup/manual path. Neither needs to be punctual:
-# apps/cron_tick_routes.py fires everything that came due since its last tick
-# (a cursor in Postgres, core/storage/cloud/cron_tick_cursor_store.py) rather
-# than only what is due this instant, and de-dupes each scheduled occurrence
-# (core/storage/cloud/routine_last_fired_store.py) so a late, doubled-up, or
-# overlapping run can neither miss nor double-fire a routine.
+# under 115. This is still the most frequent trigger available on the current
+# Vercel plan (whose crons are daily-only — see vercel.json's `crons`, the
+# once-a-day floor under this workflow), so `*/5` stays: it asks for far more
+# than it gets, and what it gets is roughly every 2-4 hours.
+#
+# That is survivable because apps/cron_tick_routes.py fires everything that
+# came due since its last tick (a cursor in Postgres,
+# core/storage/cloud/cron_tick_cursor_store.py) rather than only what is due
+# this instant, and de-dupes each scheduled occurrence
+# (core/storage/cloud/routine_last_fired_store.py) — so a late, doubled-up or
+# overlapping run can neither miss nor double-fire a routine. Late, not lost.
+# If routines need to land closer to their scheduled minute than "within a
+# few hours", the fix is a punctual external caller (any uptime pinger can
+# POST or GET this endpoint), not a smaller number in the cron below.
 on:
   schedule:
     - cron: "*/5 * * * *"

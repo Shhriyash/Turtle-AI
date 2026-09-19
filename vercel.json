@@ -3,7 +3,7 @@
   "crons": [
     {
       "path": "/internal/cron-tick",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 4 * * *"
     }
   ],
   "functions": {

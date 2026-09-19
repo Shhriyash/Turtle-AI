@@ -9,10 +9,14 @@ third-party webhooks. All share one bearer-token auth helper
 GET|POST /internal/cron-tick — Vercel migration Phase 2 — cloud replacement
 for the in-process APScheduler (core/routine_scheduler.py). Serverless has no
 persistent process to hold a live scheduler in, so instead a periodic
-external trigger (Vercel Cron via vercel.json's `crons`, with the GitHub
-Actions workflow .github/workflows/cron-tick.yml as a manual/backup path)
-hits this endpoint, which asks "which routines came due since my last tick?"
-and fires them — a tick rather than an always-running evaluator.
+external trigger hits this endpoint, which asks "which routines came due
+since my last tick?" and fires them — a tick rather than an always-running
+evaluator. Two triggers, neither punctual: the GitHub Actions workflow
+.github/workflows/cron-tick.yml is the frequent one, and Vercel Cron
+(vercel.json's `crons`) is a once-a-day floor, because this project's Vercel
+plan allows only daily crons. Anything that can POST or GET this endpoint on
+a schedule can be added alongside them; the tick does not care who calls it
+or how regularly.
 
 That question is deliberately "since my last tick" and not "right now".
 Triggers run late, badly: GitHub delivered 2.2% of this workflow's `*/5`
@@ -67,12 +71,17 @@ TICK_INTERVAL_MINUTES = 5
 # How far back a tick will look when the cursor is stale. Ticks run late —
 # GitHub delivered 2.2% of this workflow's `*/5` schedule over its first 5
 # days, median gap 220 minutes, worst 393 — so the window has to cover hours,
-# not minutes, or routines are simply dropped (the bug this replaced). It is
-# still bounded: after a long outage a routine that came due 3 days ago
-# should stay missed, not arrive at 4am in a burst of backfill. 12 hours
-# clears the worst observed gap with room while keeping any late fire the
-# same calendar day.
-MAX_CATCHUP_MINUTES = 12 * 60
+# not minutes, or routines are simply dropped (the bug this replaced).
+#
+# 24h specifically, because the Vercel Cron floor (vercel.json) is daily on
+# this project's plan: a shorter cap would let the once-a-day tick leave a
+# permanently uncovered stretch if the GitHub workflow ever goes dark, which
+# it can (GitHub disables scheduled workflows in repos idle 60 days). So the
+# guarantee is "at worst a routine arrives a day late", never "silently
+# never". It is still a cap — a routine missed for three days stays missed
+# rather than backfilling in a burst — and routine_last_fired_store means a
+# re-covered range fires nothing twice.
+MAX_CATCHUP_MINUTES = 24 * 60
 
 
 def _check_auth(authorization: str | None) -> None:
