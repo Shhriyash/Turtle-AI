@@ -1,5 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "crons": [
+    {
+      "path": "/internal/cron-tick",
+      "schedule": "*/5 * * * *"
+    }
+  ],
   "functions": {
     "main.py": {
       "maxDuration": 300,

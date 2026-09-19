@@ -12,7 +12,11 @@ import unittest.mock
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
-from core.routine_cron_tick import compute_due_routines, is_routine_due
+from core.routine_cron_tick import (
+    compute_due_occurrences,
+    compute_due_routines,
+    is_routine_due,
+)
 
 
 def _dt_utc(y, mo, d, h, mi):
@@ -203,6 +207,117 @@ class IsRoutineDueMidnightWrapTest(unittest.TestCase):
         self.assertFalse(due)
 
 
+class ComputeDueOccurrencesTest(unittest.TestCase):
+    """The catch-up half: a tick that arrives late must still fire what came
+    due while it was away — the failure mode that made ~98% of routines
+    silently never fire under GitHub Actions' real (hours-apart) cadence."""
+
+    def test_late_tick_still_catches_a_daily_routine(self) -> None:
+        value = {"cadence": "daily", "time": "09:00", "timezone": "UTC"}
+        # Tick due at 09:00 but the trigger only landed at 12:00.
+        buckets = compute_due_occurrences(
+            value,
+            window_start_utc=_dt_utc(2026, 9, 12, 6, 0),
+            window_end_utc=_dt_utc(2026, 9, 12, 12, 0),
+        )
+        self.assertEqual(buckets, ["2026-09-12T09:00"])
+
+    def test_hourly_routine_yields_one_bucket_per_missed_hour(self) -> None:
+        value = {"cadence": "hourly", "time": "00:15", "timezone": "UTC"}
+        buckets = compute_due_occurrences(
+            value,
+            window_start_utc=_dt_utc(2026, 9, 12, 10, 0),
+            window_end_utc=_dt_utc(2026, 9, 12, 13, 0),
+        )
+        self.assertEqual(
+            buckets,
+            ["2026-09-12T10:15", "2026-09-12T11:15", "2026-09-12T12:15"],
+        )
+
+    def test_multi_day_window_yields_one_bucket_per_day(self) -> None:
+        value = {"cadence": "daily", "time": "09:00", "timezone": "UTC"}
+        buckets = compute_due_occurrences(
+            value,
+            window_start_utc=_dt_utc(2026, 9, 12, 0, 0),
+            window_end_utc=_dt_utc(2026, 9, 14, 12, 0),
+        )
+        self.assertEqual(
+            buckets,
+            ["2026-09-12T09:00", "2026-09-13T09:00", "2026-09-14T09:00"],
+        )
+
+    def test_day_filter_still_applies_across_a_wide_window(self) -> None:
+        # 2026-09-12 is a Saturday, so a weekday routine skips the 12th/13th.
+        value = {"cadence": "weekday", "time": "09:00", "timezone": "UTC"}
+        buckets = compute_due_occurrences(
+            value,
+            window_start_utc=_dt_utc(2026, 9, 12, 0, 0),
+            window_end_utc=_dt_utc(2026, 9, 15, 12, 0),
+        )
+        self.assertEqual(buckets, ["2026-09-14T09:00", "2026-09-15T09:00"])
+
+    def test_occurrence_exactly_at_window_start_is_excluded(self) -> None:
+        # Half-open at the start: the previous tick already claimed 09:00.
+        value = {"cadence": "daily", "time": "09:00", "timezone": "UTC"}
+        buckets = compute_due_occurrences(
+            value,
+            window_start_utc=_dt_utc(2026, 9, 12, 9, 0),
+            window_end_utc=_dt_utc(2026, 9, 12, 12, 0),
+        )
+        self.assertEqual(buckets, [])
+
+    def test_occurrence_exactly_at_window_end_is_included(self) -> None:
+        value = {"cadence": "daily", "time": "09:00", "timezone": "UTC"}
+        buckets = compute_due_occurrences(
+            value,
+            window_start_utc=_dt_utc(2026, 9, 12, 6, 0),
+            window_end_utc=_dt_utc(2026, 9, 12, 9, 0),
+        )
+        self.assertEqual(buckets, ["2026-09-12T09:00"])
+
+    def test_empty_window_yields_nothing(self) -> None:
+        value = {"cadence": "daily", "time": "09:00", "timezone": "UTC"}
+        buckets = compute_due_occurrences(
+            value,
+            window_start_utc=_dt_utc(2026, 9, 12, 12, 0),
+            window_end_utc=_dt_utc(2026, 9, 12, 12, 0),
+        )
+        self.assertEqual(buckets, [])
+
+    def test_timezone_is_honored_over_a_wide_window(self) -> None:
+        # 09:00 America/New_York in September (EDT) = 13:00 UTC, so a window
+        # ending at 12:00 UTC has not reached it yet.
+        value = {"cadence": "daily", "time": "09:00", "timezone": "America/New_York"}
+        before = compute_due_occurrences(
+            value,
+            window_start_utc=_dt_utc(2026, 9, 12, 6, 0),
+            window_end_utc=_dt_utc(2026, 9, 12, 12, 0),
+        )
+        after = compute_due_occurrences(
+            value,
+            window_start_utc=_dt_utc(2026, 9, 12, 6, 0),
+            window_end_utc=_dt_utc(2026, 9, 12, 14, 0),
+        )
+        self.assertEqual(before, [])
+        self.assertEqual(after, ["2026-09-12T09:00"])
+
+    def test_unschedulable_routine_yields_nothing(self) -> None:
+        for value in (
+            {"cadence": "quarterly", "time": "09:00", "timezone": "UTC"},
+            {"cadence": "daily", "timezone": "UTC"},
+            {"cadence": "daily", "time": "09:00", "timezone": "Not/AZone"},
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    compute_due_occurrences(
+                        value,
+                        window_start_utc=_dt_utc(2026, 9, 12, 0, 0),
+                        window_end_utc=_dt_utc(2026, 9, 13, 0, 0),
+                    ),
+                    [],
+                )
+
+
 class ComputeDueRoutinesTest(unittest.TestCase):
     def _event(self, value):
         m = Mock()
@@ -219,11 +334,29 @@ class ComputeDueRoutinesTest(unittest.TestCase):
             ),
         }
         due = compute_due_routines(
-            routines, now_utc=_dt_utc(2026, 9, 12, 9, 0), tick_interval_minutes=5
+            routines,
+            window_start_utc=_dt_utc(2026, 9, 12, 8, 55),
+            window_end_utc=_dt_utc(2026, 9, 12, 9, 0),
         )
         self.assertEqual(len(due), 1)
         self.assertEqual(due[0][0], "workflow.morning_routine")
         self.assertEqual(due[0][2], "2026-09-12T09:00")
+
+    def test_one_entry_per_occurrence_under_a_late_tick(self) -> None:
+        routines = {
+            "workflow.hourly_check": self._event(
+                {"cadence": "hourly", "time": "00:30", "timezone": "UTC"}
+            )
+        }
+        due = compute_due_routines(
+            routines,
+            window_start_utc=_dt_utc(2026, 9, 12, 9, 0),
+            window_end_utc=_dt_utc(2026, 9, 12, 12, 0),
+        )
+        self.assertEqual(
+            [bucket for _, _, bucket in due],
+            ["2026-09-12T09:30", "2026-09-12T10:30", "2026-09-12T11:30"],
+        )
 
 
 # --- routine_last_fired_store -----------------------------------------------

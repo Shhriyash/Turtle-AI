@@ -3,10 +3,11 @@ core/storage/cloud/routine_last_fired_store.py
 --------------------------------------------------
 Exactly-once dedup for the cron-tick endpoint (apps/cron_tick_routes.py):
 claims a (user_id, routine_key, fire_bucket) tuple before firing so a routine
-fires exactly once per SCHEDULED occurrence even if two ticks both land
-inside the same due window (misfire/retry), or a GitHub Actions run overlaps
-the previous one. fire_bucket comes from core.routine_cron_tick.is_routine_due
-and identifies the scheduled time, not the tick that observed it.
+fires exactly once per SCHEDULED occurrence even if two ticks cover
+overlapping ranges (a retry, a tick that died before advancing its cursor, a
+rewound cursor) or one trigger run overlaps the previous one. fire_bucket
+comes from core.routine_cron_tick.compute_due_occurrences and identifies the
+scheduled time, not the tick that observed it.
 
 SYNCHRONOUS (psycopg), called via asyncio.to_thread from the async cron-tick
 route — matching this migration's established per-call-site driver choice.

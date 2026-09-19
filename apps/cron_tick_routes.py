@@ -6,13 +6,22 @@ GitHub Actions and self-invoking follow-up requests, never end users or
 third-party webhooks. All share one bearer-token auth helper
 (_check_auth, settings.cron_shared_secret).
 
-POST /internal/cron-tick — Vercel migration Phase 2 — cloud replacement for
-the in-process APScheduler (core/routine_scheduler.py). Serverless has no
+GET|POST /internal/cron-tick — Vercel migration Phase 2 — cloud replacement
+for the in-process APScheduler (core/routine_scheduler.py). Serverless has no
 persistent process to hold a live scheduler in, so instead a periodic
-external trigger (a GitHub Actions `on: schedule` workflow,
-.github/workflows/cron-tick.yml, every 5 minutes) hits this endpoint, which
-asks "which routines are due right now?" and fires them — a stateless tick
-rather than an always-running evaluator. Only meaningful in cloud mode
+external trigger (Vercel Cron via vercel.json's `crons`, with the GitHub
+Actions workflow .github/workflows/cron-tick.yml as a manual/backup path)
+hits this endpoint, which asks "which routines came due since my last tick?"
+and fires them — a tick rather than an always-running evaluator.
+
+That question is deliberately "since my last tick" and not "right now".
+Triggers run late, badly: GitHub delivered 2.2% of this workflow's `*/5`
+schedule over its first 5 days (median gap 220 minutes), and the original
+fixed 5-minute due window dropped essentially every routine as a result. The
+tick now reads a persisted cursor (core/storage/cloud/cron_tick_cursor_store.py),
+fires every occurrence in (cursor, now] bounded by MAX_CATCHUP_MINUTES, and
+advances the cursor — so a late tick catches up instead of losing the work.
+Only meaningful in cloud mode
 (TURTLE_DEPLOY=cloud) — local dev keeps using the always-on
 RoutineScheduler; this endpoint returns 503 there too, since running it
 against local SQLite/APScheduler's own state would double-fire every
@@ -39,7 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -50,11 +59,20 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/internal", tags=["cron"])
 
-# GitHub Actions' `on: schedule` cron granularity in this repo's workflow is
-# 5 minutes — see .github/workflows/cron-tick.yml. A routine due at HH:05 is
-# still due if the tick actually lands at HH:07 (GH Actions doesn't guarantee
-# to-the-minute execution), so the due-window width must match this value.
+# The nominal gap between ticks — see the `crons` entry in vercel.json and
+# .github/workflows/cron-tick.yml. Used only for the very first tick, before
+# a cursor exists; every tick after that works from the real elapsed range.
 TICK_INTERVAL_MINUTES = 5
+
+# How far back a tick will look when the cursor is stale. Ticks run late —
+# GitHub delivered 2.2% of this workflow's `*/5` schedule over its first 5
+# days, median gap 220 minutes, worst 393 — so the window has to cover hours,
+# not minutes, or routines are simply dropped (the bug this replaced). It is
+# still bounded: after a long outage a routine that came due 3 days ago
+# should stay missed, not arrive at 4am in a burst of backfill. 12 hours
+# clears the worst observed gap with room while keeping any late fire the
+# same calendar day.
+MAX_CATCHUP_MINUTES = 12 * 60
 
 
 def _check_auth(authorization: str | None) -> None:
@@ -79,15 +97,34 @@ def _run_tick(now_utc: datetime) -> dict[str, Any]:
     """The actual scan — synchronous (every call it makes is itself sync:
     JournalStore in cloud mode, try_claim_fire, _fire_routine), run via
     asyncio.to_thread from the route so it never blocks the event loop.
+
+    Fires every occurrence in (cursor, now], then advances the cursor. See
+    this module's docstring for why the range is elapsed-time rather than a
+    fixed window.
     """
     from core.routine_cron_tick import compute_due_routines
     from core.routine_scheduler import _fire_routine, get_active_routines_for_user
+    from core.storage.cloud.cron_tick_cursor_store import read_last_tick, write_last_tick
     from core.storage.cloud.journal_store import list_user_ids_pg
     from core.storage.cloud.routine_last_fired_store import try_claim_fire
 
     users_checked = 0
     routines_fired = 0
     errors: list[str] = []
+
+    # An unreadable cursor degrades to the old single-interval behaviour
+    # rather than failing the tick outright: firing the last 5 minutes'
+    # routines beats firing none while the cursor table is unreachable.
+    try:
+        last_tick = read_last_tick()
+    except Exception as exc:
+        errors.append(f"cursor read failed: {exc}")
+        last_tick = None
+
+    if last_tick is None:
+        window_start = now_utc - timedelta(minutes=TICK_INTERVAL_MINUTES)
+    else:
+        window_start = max(last_tick, now_utc - timedelta(minutes=MAX_CATCHUP_MINUTES))
 
     for user_id in list_user_ids_pg():
         users_checked += 1
@@ -105,7 +142,7 @@ def _run_tick(now_utc: datetime) -> dict[str, Any]:
             continue
 
         due = compute_due_routines(
-            active, now_utc=now_utc, tick_interval_minutes=TICK_INTERVAL_MINUTES
+            active, window_start_utc=window_start, window_end_utc=now_utc
         )
         for routine_key, event, fire_bucket in due:
             try:
@@ -116,15 +153,28 @@ def _run_tick(now_utc: datetime) -> dict[str, Any]:
             except Exception as exc:
                 errors.append(f"{user_id}/{routine_key}: fire failed: {exc}")
 
+    # Advanced last, and only for a scan that got all the way here: a tick
+    # that raises leaves the cursor behind so the next one re-covers the same
+    # range. try_claim_fire makes that overlap a no-op.
+    try:
+        write_last_tick(now_utc)
+    except Exception as exc:
+        errors.append(f"cursor write failed: {exc}")
+
     return {
         "users_checked": users_checked,
         "routines_fired": routines_fired,
         "errors": errors,
+        "window_start": window_start.isoformat(),
         "ticked_at": now_utc.isoformat(),
     }
 
 
-@router.post("/cron-tick")
+# GET as well as POST because Vercel Cron issues a GET (and sends
+# `Authorization: Bearer $CRON_SECRET`, so Vercel's CRON_SECRET env var must
+# be set to the same value as CRON_SHARED_SECRET). POST stays for the GitHub
+# Actions workflow, which has always used it.
+@router.api_route("/cron-tick", methods=["GET", "POST"])
 async def cron_tick(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _check_auth(authorization)
     if not settings.is_cloud:

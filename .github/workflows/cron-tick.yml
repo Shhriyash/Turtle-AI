@@ -5,12 +5,16 @@ name: cron-tick
 # external trigger stands in for it — see apps/cron_tick_routes.py's module
 # docstring for the full "why". This workflow is the trigger.
 #
-# GitHub Actions' `schedule` cron does not guarantee to-the-minute execution
-# (it queues on shared runners and can be delayed under load), which is
-# exactly why apps/cron_tick_routes.py evaluates a due WINDOW (5 minutes,
-# TICK_INTERVAL_MINUTES) rather than a single instant, and de-dupes each
-# scheduled occurrence in Postgres (core/storage/cloud/routine_last_fired_store.py)
-# so a late or doubled-up run can never double-fire a routine.
+# GitHub Actions' `schedule` cron does not guarantee to-the-minute execution,
+# and in this repo it has not come close: over the workflow's first 5 days it
+# delivered 34 of ~1484 `*/5` runs (2.2%), median gap 220 minutes, never once
+# under 115. Vercel Cron (vercel.json's `crons`) is now the primary trigger
+# and this workflow is the backup/manual path. Neither needs to be punctual:
+# apps/cron_tick_routes.py fires everything that came due since its last tick
+# (a cursor in Postgres, core/storage/cloud/cron_tick_cursor_store.py) rather
+# than only what is due this instant, and de-dupes each scheduled occurrence
+# (core/storage/cloud/routine_last_fired_store.py) so a late, doubled-up, or
+# overlapping run can neither miss nor double-fire a routine.
 on:
   schedule:
     - cron: "*/5 * * * *"
