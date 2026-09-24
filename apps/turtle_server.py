@@ -2594,6 +2594,30 @@ async def _refuse_forgeable_binding() -> None:
 
 
 @app.on_event("startup")
+async def _require_cloud_backends_configured() -> None:
+    """Cloud mode with a missing DATABASE_URL/REDIS_URL cannot serve a single
+    request — every Postgres/Redis-backed store raises CloudBackendUnavailable
+    lazily on first use (core/storage/cloud/__init__.py). Move that failure to
+    boot: a deploy that cannot work should not serve.
+
+    No-op unless settings.is_cloud is true, so this never fires in the test
+    suite's default local configuration (no Postgres/Redis there).
+    """
+    if not settings.is_cloud:
+        return
+    if not settings.database_url:
+        raise RuntimeError(
+            "TURTLE_DEPLOY=cloud requires DATABASE_URL to be set (the Neon "
+            "pooled connection string) — refusing to start without it."
+        )
+    if not settings.redis_url:
+        raise RuntimeError(
+            "TURTLE_DEPLOY=cloud requires REDIS_URL (or UPSTASH_REDIS_URL) to "
+            "be set — refusing to start without it."
+        )
+
+
+@app.on_event("startup")
 async def _validate_google_calendar_credentials() -> None:
     """Fail loudly (but not fatally) at boot if GOOGLE_CALENDAR_CREDENTIALS_JSON
     is malformed, instead of only surfacing it on the first calendar tool call
@@ -3190,9 +3214,36 @@ async def healthz():
 
     Intentionally does no auth and no I/O — it only proves the ASGI app booted
     and is routing. The Dockerfile HEALTHCHECK and test/smoke_boot_test.py both
-    hit this.
+    hit this. `sha` is read directly from the environment (not core/config.py,
+    a hotspot no WP owns this wave) so a deploy can prove which commit it is
+    serving; present (as null) even when unset so callers can rely on the key.
     """
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok", "sha": os.environ.get("TURTLE_BUILD_SHA")})
+
+
+@app.get("/readyz")
+async def readyz():
+    """Readiness probe: proves the backends this deploy actually needs work.
+
+    Local mode has no Postgres/Redis at all — report ready without any I/O
+    (probing here would be pure overhead and would never apply to local's
+    SQLite/JSONL/FAISS storage). Cloud mode runs both backend probes
+    concurrently, each bounded by core.storage.cloud.READYZ_TIMEOUT_S, and
+    returns 503 with a per-backend boolean if either fails — one dead backend
+    cannot make this route hang, and a deploy that cannot work should not
+    report itself ready.
+    """
+    if not settings.is_cloud:
+        return JSONResponse({"status": "ok", "mode": "local"})
+
+    from core.storage.cloud import probe_postgres, probe_redis
+
+    postgres_ok, redis_ok = await asyncio.gather(probe_postgres(), probe_redis())
+    ok = postgres_ok and redis_ok
+    return JSONResponse(
+        {"postgres": postgres_ok, "redis": redis_ok},
+        status_code=200 if ok else 503,
+    )
 
 
 @app.get("/favicon.ico")

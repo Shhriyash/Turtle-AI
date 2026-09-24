@@ -205,3 +205,51 @@ def close_redis_sync_client() -> None:
     if _redis_sync_client is not None:
         _redis_sync_client.close()
         _redis_sync_client = None
+
+
+# ---------------------------------------------------------------------------
+# Readiness probes (WP0.A / S-5.8)
+# ---------------------------------------------------------------------------
+# A module-level default so tests can shrink the budget (e.g. to prove a
+# hanging backend doesn't make /readyz hang) without actually waiting out a
+# real 2s timeout. The /readyz route never hardcodes this value itself.
+READYZ_TIMEOUT_S = 2.0
+
+
+async def probe_postgres(timeout: Optional[float] = None) -> bool:
+    """Run ``SELECT 1`` on the shared asyncpg pool, bounded by *timeout*.
+
+    Never raises: a missing DATABASE_URL (CloudBackendUnavailable), a real
+    connection failure, and exceeding the timeout budget all resolve to
+    False — /readyz only needs a boolean per backend.
+    """
+    budget = READYZ_TIMEOUT_S if timeout is None else timeout
+
+    async def _check() -> None:
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+
+    try:
+        await asyncio.wait_for(_check(), timeout=budget)
+        return True
+    except Exception:
+        return False
+
+
+async def probe_redis(timeout: Optional[float] = None) -> bool:
+    """Run ``PING`` on the shared async Redis client, bounded by *timeout*.
+
+    Same never-raises contract as probe_postgres() above.
+    """
+    budget = READYZ_TIMEOUT_S if timeout is None else timeout
+
+    async def _check() -> None:
+        client = await get_redis_client()
+        await client.ping()
+
+    try:
+        await asyncio.wait_for(_check(), timeout=budget)
+        return True
+    except Exception:
+        return False
