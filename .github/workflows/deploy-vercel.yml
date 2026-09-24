@@ -32,6 +32,8 @@ jobs:
       github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
     environment: production
+    env:
+      BUILD_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,7 +46,15 @@ jobs:
       - name: Install Vercel CLI
         run: npm install -g vercel@latest
 
-      - name: Deploy to production
+      # --skip-domain deploys without assigning the production domain, so a
+      # deployment that fails the /healthz or /readyz probes below is never
+      # user-visible and there is nothing to roll back. `vercel promote`
+      # (below) is the only thing that ever completes the domain assignment,
+      # and it only runs if this job reaches it — i.e. if every step above
+      # succeeded (GitHub Actions aborts the job on the first failing step
+      # unless a later step opts back in with `if: always()`/`if: failure()`,
+      # which none of these do).
+      - name: Deploy to production (without promoting)
         # No local `vercel pull` / `vercel build` step: building locally needs
         # `uv` on the runner's PATH, which actions/setup-python doesn't
         # provide, and fails with "uv is required but was not found in PATH"
@@ -55,14 +65,91 @@ jobs:
         # machine takes, and confirmed working that way already.
         id: deploy
         run: |
-          url=$(vercel deploy --prod --yes --token="$VERCEL_TOKEN")
+          set -euo pipefail
+          url=$(vercel deploy --prod --yes --skip-domain \
+            --env TURTLE_BUILD_SHA="$BUILD_SHA" \
+            --token="$VERCEL_TOKEN")
           echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "### Deployed to production" >> "$GITHUB_STEP_SUMMARY"
-          echo "$url" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Deployed to production (unpromoted)"
+            echo "- URL: $url"
+            echo "- Build SHA: $BUILD_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      # Asserts the deployment actually serves the commit this job checked
+      # out, not a stale build. `vercel curl` attaches the protection-bypass
+      # header so this unpromoted URL is reachable from CI. No `--fail` on
+      # curl: we want the real body + status code back even on a non-200 so
+      # the check below can report it, rather than have curl itself decide
+      # pass/fail. If `vercel curl` fails outright (e.g. it cannot reach the
+      # deployment at all), the `response=$(...)` assignment's own non-zero
+      # exit status still trips `set -e` immediately — that failure mode is
+      # not swallowed either.
+      - name: Probe /healthz and assert deployed SHA
+        id: healthz
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          DEPLOY_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          response=$(timeout 30 vercel curl /healthz \
+            --deployment "$DEPLOY_URL" --yes --token="$VERCEL_TOKEN" \
+            -- --silent --show-error --max-time 20 -w '\n%{http_code}')
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          echo "$body"
+          if [ "$http_code" != "200" ]; then
+            echo "::error::/healthz returned HTTP $http_code: $body"
+            echo "- /healthz: FAILED (HTTP $http_code)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          actual_sha=$(echo "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')
+          if [ "$actual_sha" != "$BUILD_SHA" ]; then
+            echo "::error::/healthz sha mismatch: expected $BUILD_SHA, got $actual_sha"
+            echo "- /healthz: FAILED (sha mismatch: expected $BUILD_SHA got $actual_sha)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "- /healthz: OK (sha=$actual_sha matches $BUILD_SHA)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Same non-swallowing reasoning as /healthz above: no `--fail` on curl,
+      # so a 503 comes back as a normal response we inspect explicitly; a
+      # `vercel curl` process failure still trips `set -e` via the `$(...)`
+      # assignment.
+      - name: Probe /readyz
+        id: readyz
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          DEPLOY_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          response=$(timeout 30 vercel curl /readyz \
+            --deployment "$DEPLOY_URL" --yes --token="$VERCEL_TOKEN" \
+            -- --silent --show-error --max-time 20 -w '\n%{http_code}')
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          echo "$body"
+          if [ "$http_code" != "200" ]; then
+            echo "::error::/readyz returned HTTP $http_code: $body"
+            echo "- /readyz: FAILED (HTTP $http_code): $body" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "- /readyz: OK (HTTP 200)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Only reached if the deploy step succeeded AND both probes above
+      # returned success (see the note on the deploy step). A failed check
+      # never gets here, so there is nothing to roll back.
+      - name: Promote to production domain
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          DEPLOY_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          vercel promote "$DEPLOY_URL" --token="$VERCEL_TOKEN" --yes
+          echo "- Promoted to production: $DEPLOY_URL" >> "$GITHUB_STEP_SUMMARY"
 
   deploy-preview:
     if: >
@@ -87,7 +174,7 @@ jobs:
         # Remote build (Vercel's own infra) does.
         id: deploy
         run: |
-          url=$(vercel deploy --yes --token="$VERCEL_TOKEN")
+          url=$(vercel deploy --yes --env TURTLE_BUILD_SHA="$BUILD_SHA" --token="$VERCEL_TOKEN")
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "### Preview deployed" >> "$GITHUB_STEP_SUMMARY"
           echo "$url" >> "$GITHUB_STEP_SUMMARY"
@@ -95,6 +182,7 @@ jobs:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          BUILD_SHA: ${{ github.event.workflow_run.head_sha }}
 
       - name: Comment preview URL on the PR
         # workflow_run only carries pull_requests[] when the run and the PR
