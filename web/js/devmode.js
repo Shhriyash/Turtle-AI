@@ -23,31 +23,45 @@ function bindTtsSpeedPreview() {
 
 const ADMIN_TOKEN_KEY = 'turtle_admin_token';
 
-async function postConfigPatch(cfgPatch, allowPrompt = true) {
-    const headers = { 'Content-Type': 'application/json' };
+/**
+ * Shared fetch wrapper for /api/config (both GET and POST): attaches the
+ * cached admin token if we have one, and on 401 drops the stale token,
+ * prompts once, caches the entry in sessionStorage (session-scoped — cleared
+ * when the tab closes, smaller blast radius than localStorage), then retries
+ * a single time (allowPrompt guards the recursion).
+ *
+ * WP1.D2: GET /api/config is now gated behind X-Admin-Token in cloud mode
+ * (same as POST), so loadDevConfig()'s bare fetch('/api/config') silently
+ * failed there with no way to supply the token. Both callers now go through
+ * this one mechanism instead of loadDevConfig growing a second copy of the
+ * prompt-retry dance.
+ */
+async function adminFetch(url, options = {}, allowPrompt = true) {
+    const headers = { ...(options.headers || {}) };
     const token = sessionStorage.getItem(ADMIN_TOKEN_KEY);
     if (token) headers['X-Admin-Token'] = token;
 
-    const res = await fetch('/api/config', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(cfgPatch),
-    });
+    const res = await fetch(url, { ...options, headers });
 
-    // When TURTLE_ADMIN_TOKEN is set server-side, POST /api/config is gated.
-    // On 401, drop any stale token, prompt once, cache it in sessionStorage
-    // (session-scoped — cleared when the tab closes, smaller blast radius than
-    // localStorage), then retry a single time (allowPrompt guards the recursion).
     if (res.status === 401) {
         sessionStorage.removeItem(ADMIN_TOKEN_KEY);
         if (allowPrompt) {
-            const entered = window.prompt('Admin token required to change server config:');
+            const entered = window.prompt('Admin token required to access server config:');
             if (entered && entered.trim()) {
                 sessionStorage.setItem(ADMIN_TOKEN_KEY, entered.trim());
-                return postConfigPatch(cfgPatch, false);
+                return adminFetch(url, options, false);
             }
         }
     }
+    return res;
+}
+
+async function postConfigPatch(cfgPatch, allowPrompt = true) {
+    const res = await adminFetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfgPatch),
+    }, allowPrompt);
     return await res.json();
 }
 
@@ -67,7 +81,7 @@ export async function loadDevConfig() {
     try {
         const [modelsRes, configRes, agentsRes] = await Promise.all([
             fetch('/api/models'),
-            fetch('/api/config'),
+            adminFetch('/api/config'),
             fetch('/api/agents'),
         ]);
         const models = await modelsRes.json();

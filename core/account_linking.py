@@ -50,6 +50,32 @@ RESERVATION_TTL_SECONDS = 60
 
 _TABLE = "link_codes"
 
+# WP1.D2 (ledger 1a.4 part 3): the WEB-issued mirror of the table above.
+#
+# ``link_codes`` binds a code to a CHANNEL identity; redemption proves target
+# ownership via an authenticated web session. This table is the other
+# direction: the code is bound to a TARGET web account (the caller was
+# already authenticated when they asked for it); redemption instead proves
+# control of a channel identity, by that channel identity being the one that
+# sends the code.
+#
+# SECURITY PROPERTY, stated precisely because it is NOT the mirror image of
+# the other table's guarantee: a leaked ``target_link_codes`` code lets
+# WHOEVER SENDS IT (from any channel identity they control, e.g. a fresh
+# Discord account) get that channel identity permanently pointed at the
+# target account, with their existing channel-side memory merged INTO it.
+# From then on their channel messages resolve to the target's user_id — i.e.
+# they read and extend the target's memory going forward. That is a materially
+# worse blast radius than the channel-issued code's ("attacker attaches their
+# OWN handle to their OWN account"), so this code must be treated as a
+# short-lived bearer secret: shown once on an authenticated page, never
+# logged, TTL-bounded (LINK_CODE_TTL_MINUTES, same as the other table), and
+# single-use. The 32^8 code space plus rate limiting on redemption attempts
+# (enforced by the caller, not this store) is what stands between "leaked"
+# and "brute forced" — this store does not rate-limit reservation attempts
+# itself.
+_TARGET_TABLE = "target_link_codes"
+
 
 def _normalize_code(code: str) -> str:
     return (code or "").strip().upper().replace(" ", "").replace("-", "")
@@ -70,6 +96,19 @@ class LinkCode:
     channel_user_id: str
     source_user_id: str
     expires_at: str
+
+
+@dataclass(frozen=True)
+class TargetLinkCode:
+    """A code minted by ``issue_target_code`` — bound to a target account, not
+    yet to any channel identity. ``channel``/``channel_user_id`` are populated
+    only once a redemption attempt has reserved it (see ``reserve_target_code``);
+    they are empty on a freshly issued, unreserved code."""
+    code: str
+    target_user_id: str
+    expires_at: str
+    channel: str = ""
+    channel_user_id: str = ""
 
 
 class LinkCodeStore:
@@ -125,6 +164,23 @@ class LinkCodeStore:
                 conn.execute(f"ALTER TABLE {_TABLE} ADD COLUMN reserved_for TEXT")
             if "reserved_at" not in cols:
                 conn.execute(f"ALTER TABLE {_TABLE} ADD COLUMN reserved_at TEXT")
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_TARGET_TABLE} (
+                    code TEXT PRIMARY KEY,
+                    target_user_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    -- Reservation locks the code to the FIRST channel identity
+                    -- that attempts redemption, same race-closing shape as
+                    -- link_codes.reserved_for above, just keyed on a
+                    -- (channel, channel_user_id) pair instead of a user_id.
+                    reserved_channel TEXT,
+                    reserved_channel_user_id TEXT,
+                    reserved_at TEXT
+                )
+                """
+            )
 
     def issue(self, *, channel: str, channel_user_id: str, source_user_id: str) -> LinkCode:
         """Mint a fresh claim code for a channel identity.
@@ -292,7 +348,121 @@ class LinkCodeStore:
             cursor = conn.execute(
                 f"DELETE FROM {_TABLE} WHERE expires_at <= ?", (_iso(_utc_now()),)
             )
-            return cursor.rowcount or 0
+            target_cursor = conn.execute(
+                f"DELETE FROM {_TARGET_TABLE} WHERE expires_at <= ?", (_iso(_utc_now()),)
+            )
+            return (cursor.rowcount or 0) + (target_cursor.rowcount or 0)
+
+    # ── WP1.D2 (ledger 1a.4 part 3): web-issued, target-bound codes ─────────
+
+    def issue_target_code(self, *, target_user_id: str) -> TargetLinkCode:
+        """Mint a code bound to an authenticated web account. Any previous
+        unconsumed code for the same target is dropped (same reissue-invalidates
+        rule as ``issue``), so asking twice never leaves two live codes."""
+        code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
+        expires = _iso(_utc_now() + timedelta(minutes=LINK_CODE_TTL_MINUTES))
+        with self._connect() as conn:
+            conn.execute(
+                f"DELETE FROM {_TARGET_TABLE} WHERE target_user_id = ? AND consumed_at IS NULL",
+                (target_user_id,),
+            )
+            conn.execute(
+                f"INSERT INTO {_TARGET_TABLE} (code, target_user_id, expires_at) VALUES (?, ?, ?)",
+                (code, target_user_id, expires),
+            )
+        return TargetLinkCode(code, target_user_id, expires)
+
+    def reserve_target_code(
+        self, code: str, channel: str, channel_user_id: str
+    ) -> tuple[str, TargetLinkCode | None]:
+        """Atomically claim a target-bound code for one channel identity.
+
+        Same three-way status contract as ``reserve``: "ok" / "invalid" /
+        "locked" (reserved for a DIFFERENT channel identity within TTL — do
+        not reveal that to the loser).
+        """
+        normalized = _normalize_code(code)
+        if not normalized or not channel or not channel_user_id:
+            return ("invalid", None)
+        now = _iso(_utc_now())
+        cutoff = _iso(_utc_now() - timedelta(seconds=RESERVATION_TTL_SECONDS))
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE {_TARGET_TABLE}
+                   SET reserved_channel = ?, reserved_channel_user_id = ?, reserved_at = ?
+                 WHERE code = ?
+                   AND consumed_at IS NULL
+                   AND expires_at > ?
+                   AND (reserved_channel IS NULL
+                        OR (reserved_channel = ? AND reserved_channel_user_id = ?)
+                        OR reserved_at IS NULL
+                        OR reserved_at < ?)
+                """,
+                (channel, channel_user_id, now, normalized, now, channel, channel_user_id, cutoff),
+            )
+            row = conn.execute(
+                f"SELECT * FROM {_TARGET_TABLE} WHERE code = ?", (normalized,)
+            ).fetchone()
+        if row is None or row["consumed_at"] is not None:
+            return ("invalid", None)
+        try:
+            expires = datetime.fromisoformat(row["expires_at"])
+        except Exception:
+            return ("invalid", None)
+        if expires <= _utc_now():
+            return ("invalid", None)
+        if (cursor.rowcount or 0) == 0:
+            return ("locked", None)
+        claim = TargetLinkCode(
+            normalized, row["target_user_id"], row["expires_at"], channel, channel_user_id,
+        )
+        return ("ok", claim)
+
+    def release_target_reservation(self, code: str, channel: str, channel_user_id: str) -> None:
+        normalized = _normalize_code(code)
+        if not normalized or not channel or not channel_user_id:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE {_TARGET_TABLE} SET reserved_channel = NULL, "
+                f"reserved_channel_user_id = NULL, reserved_at = NULL "
+                f"WHERE code = ? AND reserved_channel = ? AND reserved_channel_user_id = ? "
+                f"AND consumed_at IS NULL",
+                (normalized, channel, channel_user_id),
+            )
+
+    def consume_target_code(self, code: str) -> TargetLinkCode | None:
+        """Atomically redeem a target-bound code. Single-use, same rowcount
+        race-closing shape as ``consume``."""
+        normalized = _normalize_code(code)
+        if not normalized:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT * FROM {_TARGET_TABLE} WHERE code = ?", (normalized,)
+            ).fetchone()
+            if row is None or row["consumed_at"] is not None:
+                return None
+            try:
+                expires = datetime.fromisoformat(row["expires_at"])
+            except Exception:
+                return None
+            if expires <= _utc_now():
+                return None
+            cursor = conn.execute(
+                f"UPDATE {_TARGET_TABLE} SET consumed_at = ? WHERE code = ? AND consumed_at IS NULL",
+                (_iso(_utc_now()), normalized),
+            )
+            if (cursor.rowcount or 0) != 1:
+                return None  # lost the race
+        return TargetLinkCode(
+            normalized,
+            row["target_user_id"],
+            row["expires_at"],
+            row["reserved_channel"] or "",
+            row["reserved_channel_user_id"] or "",
+        )
 
 
 # Module-level thin wrappers so the redemption route can call these through
@@ -313,6 +483,24 @@ def mark_consumed(store: LinkCodeStore, code: str) -> bool:
     """Atomically mark a code consumed. Returns True on the first consume, False
     if it was already consumed / doesn't exist (peek+consume race lost)."""
     return store.consume(code) is not None
+
+
+# ── target-bound code wrappers (WP1.D2 / ledger 1a.4 part 3) ────────────────
+
+def reserve_target_code(
+    store: LinkCodeStore, code: str, channel: str, channel_user_id: str
+) -> tuple[str, TargetLinkCode | None]:
+    return store.reserve_target_code(code, channel, channel_user_id)
+
+
+def release_target_reservation(
+    store: LinkCodeStore, code: str, channel: str, channel_user_id: str
+) -> None:
+    store.release_target_reservation(code, channel, channel_user_id)
+
+
+def mark_target_consumed(store: LinkCodeStore, code: str) -> bool:
+    return store.consume_target_code(code) is not None
 
 
 def merge_memory(source_user_id: str, target_user_id: str) -> dict[str, Any]:

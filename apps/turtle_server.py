@@ -1792,6 +1792,20 @@ class RememberArgs(_RememberBaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# redeem_link_code tool args (WP1.D2 / ledger 1a.4 part 3)
+# ---------------------------------------------------------------------------
+
+class RedeemLinkCodeArgs(_RememberBaseModel):
+    code: str = _RememberField(
+        ...,
+        description=(
+            "The code the user says they generated on the Turtle web app to "
+            "link this channel identity to their web account."
+        ),
+    )
+
+
 def _build_model_from_str(model_str: str, settings: Any) -> Any | None:
     """Parse 'provider:model_name' and return a pydantic-ai model object."""
     if not model_str:
@@ -1807,6 +1821,87 @@ def _build_model_from_str(model_str: str, settings: Any) -> Any | None:
     return None
 
 
+async def _redeem_target_link_code_core(
+    *, channel: str, channel_user_id: str, source_user_id: str, code: str
+) -> str:
+    """The actual redemption logic for a web-issued, target-bound link code
+    (WP1.D2 / ledger 1a.4 part 3). Pulled out of the ``redeem_link_code`` tool
+    closure into a plain module-level coroutine so it's callable directly
+    from tests without going through pydantic-ai's tool-calling machinery —
+    the closure itself only validates ``ctx.deps`` (channel/private gates)
+    and delegates here.
+
+    Caller contract: ``channel``/``channel_user_id``/``source_user_id`` must
+    already be validated non-empty and the private-channel gate already
+    checked — this function does not re-check them. See the tool's own
+    docstring (in AgentManager.rebuild) for the full security-property
+    writeup and the reachability-under-invite-only note.
+
+    Locking: deliberately does NOT acquire
+    ``_channel_state_lock((channel, channel_user_id))`` — every real caller
+    (the tool, via _channel_dispatch_handler -> _execute_turn) is already
+    running inside that exact lock for the whole turn; re-acquiring it here
+    would deadlock. Tests that call this directly must hold (or not need) the
+    same discipline themselves.
+    """
+    from core.account_linking import (
+        mark_target_consumed, merge_memory, release_target_reservation,
+        reserve_target_code,
+    )
+    from core.identity import identity_manager
+    from core.storage.factory import get_link_code_store
+
+    store = get_link_code_store()
+    status, claim = await asyncio.to_thread(reserve_target_code, store, code, channel, channel_user_id)
+    if status in ("invalid", "locked"):
+        # Never distinguish the two to the caller — same non-disclosure
+        # posture as the existing /api/account/link redemption.
+        return ToolResult.invalid("That code is invalid or has expired.").to_agent_string()
+    assert claim is not None  # status == "ok" always yields a claim
+
+    if source_user_id == claim.target_user_id:
+        # Already the same account — nothing to merge, just burn the code.
+        await asyncio.to_thread(store.consume_target_code, code)
+        return ToolResult.ok("You're already linked to that account.").to_agent_string()
+
+    from core.worker import drain_user_tasks
+
+    _CHANNEL_STATES.pop((source_user_id, channel), None)
+    drained = await drain_user_tasks(source_user_id, timeout=5.0)
+    if drained:
+        print(f"LOG: link (web-issued) drained {drained} in-flight source task(s) for {source_user_id}")
+
+    merged = await asyncio.to_thread(merge_memory, source_user_id, claim.target_user_id)
+    if not merged.get("ok", False):
+        await asyncio.to_thread(release_target_reservation, store, code, channel, channel_user_id)
+        print(
+            f"LOG: web-issued link merge FAILED for {source_user_id}->{claim.target_user_id}: "
+            f"{merged.get('error', '?')} — mapping unchanged, reservation released"
+        )
+        return ToolResult.upstream_error(
+            "Could not link your account — please try again in a minute."
+        ).to_agent_string()
+
+    try:
+        previous = await identity_manager.link_channel(
+            user_id=claim.target_user_id, channel=channel, channel_user_id=channel_user_id
+        )
+        consumed = await asyncio.to_thread(mark_target_consumed, store, code)
+    except Exception:
+        await asyncio.to_thread(release_target_reservation, store, code, channel, channel_user_id)
+        raise
+    if not consumed:
+        print(f"LOG: web-issued link code raced during consume: {code[:2]}***")
+
+    print(
+        f"LOG: account linked (web-issued code) channel={channel} external={channel_user_id} "
+        f"-> {claim.target_user_id} (was {previous}) merged={merged}"
+    )
+    return ToolResult.ok(
+        "Linked! Your conversation history here has been merged into your web account."
+    ).to_agent_string()
+
+
 # ---------------------------------------------------------------------------
 # Agent builder — creates agent chain from current config, supports hot-reload
 # ---------------------------------------------------------------------------
@@ -1820,7 +1915,16 @@ class AgentManager:
         self.main_assistant_fallbacks: list[Agent] = []
         self.email_agent: Agent | None = None
         self.email_agent_fallbacks: list[Agent] = []
-        self.usage_limits = UsageLimits(request_limit=30)
+        # WP1.D2 (ledger 1a.4 part 4): total_tokens_limit bounds ONE turn's
+        # worst case, independent of the daily budget check (which only sees
+        # spend recorded by turns that already finished). 100_000 is ~10% of
+        # the default daily budget (TURTLE_DAILY_TOKEN_BUDGET=1_000_000) — a
+        # single pathological cascade (many fallback rungs, each burning a
+        # fraction of the 30-request cap with its own prompt+context) can cap
+        # out there without ever touching it in normal 1-3 rung turns, while
+        # still keeping the worst-case daily-budget overshoot from one turn
+        # to a tenth of a day's allowance rather than unbounded.
+        self.usage_limits = UsageLimits(request_limit=30, total_tokens_limit=100_000)
         self.stt = FastRTCSTT(groq_client=groq_client)
         self.rebuild(config)  # stt rebuilt inside rebuild()
 
@@ -2389,6 +2493,59 @@ class AgentManager:
                 f"yours — I can't link on an email address alone."
             ).to_agent_string()
 
+        async def redeem_link_code(ctx: RunContext[SharedState], args: RedeemLinkCodeArgs) -> str:
+            """Redeem a code issued on the Turtle web app, attaching THIS
+            channel identity to that web account.
+
+            WP1.D2 (ledger 1a.4 part 3) — the mirror of ``link_account``:
+            there the CHANNEL issues a code and the WEB (authenticated
+            session) redeems it; here the WEB (already authenticated when
+            they asked for the code) issues it and the CHANNEL identity that
+            SENDS it is the one being proven. See core/account_linking.py's
+            target_link_codes docstring for the security-property writeup —
+            a leaked code here is worse than the reverse direction's leaked
+            code, which is why redemption is private-channel-only (same gate
+            as link_account) and why the code is a short TTL, single-use,
+            first-claimer-wins bearer secret.
+
+            Reachability note: under TURTLE_CHANNEL_SIGNUP=invite, a channel
+            identity with NO existing mapping never reaches this tool at all
+            — apps/channels/*.py's resolve_channel_user() refuses (and
+            replies CHANNEL_INVITE_ONLY_MESSAGE) before _channel_dispatch_
+            handler, hence before any agent turn, is ever entered. This tool
+            only helps a channel identity that ALREADY has SOME mapping
+            (open-signup days, or minted before invite mode was turned on)
+            merge into a different target account. See this WP's report for
+            the exact hook a channel adapter would need to close that gap.
+            """
+            deps = ctx.deps
+            channel = str(getattr(deps, "channel", "") or "")
+            channel_uid = str(getattr(deps, "channel_user_id", "") or "")
+            if not channel or not channel_uid:
+                return ToolResult.invalid(
+                    "Redeeming a link code only makes sense from a channel "
+                    "like Discord — on the web you'd use the link panel directly."
+                ).to_agent_string()
+            # Same rationale as link_account's private-channel gate: a code
+            # typed into a shared channel could be grabbed by anyone present,
+            # and here a stolen code links THEIR identity to the target
+            # account, not just their own.
+            if not getattr(deps, "channel_is_private", False):
+                return ToolResult.invalid(
+                    "Send me that code in a direct message, not here — anyone "
+                    "in this channel could grab it otherwise."
+                ).to_agent_string()
+            code = (args.code or "").strip()
+            if not code:
+                return ToolResult.invalid("I need the code you generated on the web.").to_agent_string()
+
+            return await _redeem_target_link_code_core(
+                channel=channel,
+                channel_user_id=channel_uid,
+                source_user_id=deps.user_id,
+                code=code,
+            )
+
         async def calendar_create(ctx: RunContext[SharedState], args: CalendarCreateArgs) -> str:
             """Create a Google Calendar event. See tool contract for full spec."""
             from tools.calendar_tool import create_calendar_event
@@ -2525,6 +2682,7 @@ class AgentManager:
             ("get_directions", get_directions),
             ("remember", remember),
             ("link_account", link_account),
+            ("redeem_link_code", redeem_link_code),
         ]
         for _target_agent in [self.main_assistant, *self.main_assistant_fallbacks]:
             for _contract_name, _tool_fn in _tool_registry:
@@ -3659,6 +3817,45 @@ async def confirm_memory(request: Request):
     return JSONResponse({"status": "ok", "applied": accepted})
 
 
+@app.post("/api/account/link/issue")
+async def link_account_issue_code(request: Request):
+    """Mint a code bound to the CALLER's authenticated web account.
+
+    WP1.D2 (ledger 1a.4 part 3) — the mirror of the channel-issued code below:
+    this endpoint proves target-account ownership FIRST (the caller is
+    already authenticated), and the code is redeemed by whichever channel
+    identity later SENDS it (see the ``redeem_link_code`` tool). See
+    core/account_linking.py's ``target_link_codes`` docstring for the full
+    security-property writeup: a leaked code here is a materially worse leak
+    than the channel-issued direction (whoever sends it gets an ongoing
+    channel-side read/write into the target account), which is why the
+    response is a single value the caller must treat as a secret — never
+    logged here, and the code itself is dropped from server-side memory the
+    moment it's returned (only its hash-free DB row remains, same as the
+    channel-issued table).
+    """
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        return JSONResponse({"error": "Sign in to link an account"}, status_code=401)
+
+    from core.account_linking import LINK_CODE_TTL_MINUTES
+    from core.storage.factory import get_link_code_store
+
+    store = get_link_code_store()
+    try:
+        issued = await asyncio.to_thread(store.issue_target_code, target_user_id=user_id)
+    except Exception as e:
+        return JSONResponse({"error": f"Could not create a link code: {e}"}, status_code=503)
+    return JSONResponse(
+        {
+            "status": "ok",
+            "code": issued.code,
+            "expires_at": issued.expires_at,
+            "expires_in_minutes": LINK_CODE_TTL_MINUTES,
+        }
+    )
+
+
 @app.post("/api/account/link")
 async def link_account_redeem(request: Request):
     """Redeem a channel claim code against the CALLER's authenticated account.
@@ -4594,6 +4791,124 @@ def _classify_handler_error(exc: Exception) -> tuple[str, str]:
     return "internal_error", "Something went wrong. The error has been logged."
 
 
+# ---------------------------------------------------------------------------
+# Daily token budget (WP1.D2 / ledger 1a.4 part 4)
+# ---------------------------------------------------------------------------
+#
+# Cloud-mode only: local has no Redis to track spend against, so
+# _daily_spend_check/_record_daily_spend are no-ops off-cloud — every local
+# turn is unmetered. This mirrors how get_ws_rate_limiter()/get_channel_gate_
+# buffer() branch (Redis in cloud, an in-process/no-op stand-in locally):
+# there is no local equivalent of a cross-tenant spend cap because a local
+# deployment IS single-tenant already.
+#
+# REDIS-UNAVAILABLE POSTURE: fail OPEN (allow the turn, log it). Wave 1's
+# email reservation fails CLOSED because a duplicate send is unrecoverable —
+# the cost of a false negative there is a real external side effect. Here the
+# cost of a false negative is "one user's spend for one turn goes untracked
+# during a Redis blip" — recoverable, bounded, and self-healing on the next
+# successful check/record. Fail-closed here would instead turn a Redis blip
+# into a full outage for every metered user simultaneously (nobody can talk
+# to Turtle at all), which is a strictly worse failure mode than an
+# uncommon, temporary loss of metering precision.
+#
+# CHECK-VS-RECORD ORDERING / OVERSHOOT: a turn's cost is only known after it
+# finishes, so _daily_spend_check (called BEFORE the agent runs) can only ever
+# compare a user's already-recorded spend from EARLIER turns against today's
+# limit — never against the turn that's about to run. That means a user who
+# is JUST under budget can still start one more turn, and that turn is free
+# to spend up to UsageLimits.total_tokens_limit (see AgentManager.__init__)
+# before pydantic-ai itself cuts it off. So the daily budget can be overshot,
+# but only by at most one turn's worth of tokens — bounded by
+# total_tokens_limit (100_000, ~10% of the default 1_000_000/day budget), not
+# unbounded. _record_daily_spend runs in _execute_turn's `finally` block (see
+# below), so spend is recorded even for a turn that errored out — an
+# expensive failed cascade is exactly the case most worth counting.
+#
+# STREAMING GAP: _execute_turn_streaming (the voice/streaming path) does NOT
+# populate a CascadeStats and therefore is NOT metered by this budget at all
+# — see the comment at its call to stream_agent_text_with_fallbacks. This is
+# the ledger's accepted gap ("streaming joins in Phase 4"), not an oversight.
+
+def _utc_day_str() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).strftime("%Y%m%d")
+
+
+def _spend_key(user_id: str) -> str:
+    return f"turtle:spend:{user_id}:{_utc_day_str()}"
+
+
+def _next_utc_midnight_str() -> str:
+    """Human-readable UTC reset time for the refusal message."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return tomorrow.strftime("%H:%M UTC on %Y-%m-%d")
+
+
+def _is_unmetered(user_id: str) -> bool:
+    from core.config import parse_unmetered_user_ids
+
+    return bool(user_id) and user_id in parse_unmetered_user_ids(settings.unmetered_user_ids)
+
+
+def _daily_spend_check(user_id: str) -> str | None:
+    """Return a refusal message (naming the UTC reset time) if ``user_id`` is
+    at or over their daily token budget, else None (turn may proceed).
+
+    Local mode and unmetered users always return None. See the module-level
+    comment above for the ordering/overshoot and Redis-failure reasoning.
+    """
+    if not settings.is_cloud or not user_id:
+        return None
+    limit = int(settings.daily_token_budget or 0)
+    if limit <= 0:
+        return None
+    if _is_unmetered(user_id):
+        return None
+    try:
+        from core.storage.cloud import get_redis_sync_client
+
+        client = get_redis_sync_client()
+        spent = int(client.get(_spend_key(user_id)) or 0)
+    except Exception as exc:
+        print(f"LOG: daily budget check: Redis unavailable ({exc}) — failing open, turn allowed")
+        return None
+    if spent >= limit:
+        reset_at = _next_utc_midnight_str()
+        return (
+            f"You've reached today's usage limit for now. It resets at {reset_at}."
+        )
+    return None
+
+
+def _record_daily_spend(user_id: str, tokens: int) -> None:
+    """Advance ``user_id``'s spend key by ``tokens`` (2-day expiry, rolling).
+
+    Best-effort: a Redis failure here loses that turn's metering (already
+    accepted above as the cost of fail-open), never raises into the turn
+    pipeline.
+    """
+    if not settings.is_cloud or not user_id or tokens <= 0:
+        return
+    if _is_unmetered(user_id):
+        return
+    try:
+        from core.storage.cloud import get_redis_sync_client
+
+        client = get_redis_sync_client()
+        key = _spend_key(user_id)
+        pipe = client.pipeline()
+        pipe.incrby(key, tokens)
+        pipe.expire(key, 172800)  # 2 days, per the ledger's chosen option
+        pipe.execute()
+    except Exception as exc:
+        print(f"LOG: daily budget record failed for spend key ({exc}) — this turn's spend was not recorded")
+
+
 class TurnOutcome(NamedTuple):
     """Return value of the canonical turn pipeline.
 
@@ -4653,6 +4968,18 @@ async def _execute_turn(
 
     if state.user_id:
         emit_event_once(state.user_id, "first_message_sent", channel=channel)
+
+    # WP1.D2 (ledger 1a.4 part 4): refuse BEFORE any LLM call when the user is
+    # already over their daily token budget — checked first so a refused turn
+    # costs nothing (no "thinking" frame, no memory-context resolution, no
+    # agent call). See the _daily_spend_check module comment above
+    # TurnOutcome for local-mode/Redis-failure/overshoot reasoning.
+    _budget_refusal = _daily_spend_check(state.user_id)
+    if _budget_refusal is not None:
+        await _emit(ws, {"type": "done", "content": _budget_refusal})
+        timings["total_ms"] = round((time.time() - overall_start) * 1000)
+        await _emit(ws, {"type": "timing", **timings})
+        return TurnOutcome(message_history, _budget_refusal, _budget_refusal)
 
     if send_status:
         await _emit(ws, {"type": "status", "status": "thinking"})
@@ -4754,6 +5081,17 @@ async def _execute_turn(
                     _turn_span.set_attribute(ATTR_TOKENS_OUT, cascade_stats.total_output_tokens)
                 except Exception:
                     pass
+                # WP1.D2 (ledger 1a.4 part 4): record spend here too, in the
+                # same best-effort finally — this is the one place a batch
+                # turn's real token cost is known, success or failure. See the
+                # _daily_spend_check/_record_daily_spend module comment above
+                # class TurnOutcome for the ordering/overshoot/Redis-failure
+                # reasoning. NOTE: _execute_turn_streaming has no equivalent
+                # call — streamed turns are not metered by this budget yet.
+                _record_daily_spend(
+                    state.user_id,
+                    cascade_stats.total_input_tokens + cascade_stats.total_output_tokens,
+                )
         timings["llm_ms"] = round((time.time() - llm_start) * 1000)
 
         final_output = clean_text_for_model(response.output)
@@ -4925,6 +5263,15 @@ async def _execute_turn_streaming(
 
     async def _token_source():
         # Yields raw model text deltas; StreamCollector captures the finished run.
+        # WP1.D2 (ledger 1a.4 part 4): NOT metered by the daily token budget —
+        # stream_agent_text_with_fallbacks takes no `stats=` (no CascadeStats
+        # here to read token counts from), so this streamed/voice path is
+        # invisible to _daily_spend_check/_record_daily_spend in
+        # _execute_turn. This is the ledger's accepted, explicit gap
+        # ("streaming joins in Phase 4") — not an oversight, and not fixed
+        # here (usage_limits.total_tokens_limit still bounds one streamed
+        # turn's own worst case via pydantic-ai, it just isn't accumulated
+        # into turtle:spend:{uid}:{yyyymmdd}).
         async for delta in stream_agent_text_with_fallbacks(
             agents_mgr.main_assistant,
             agents_mgr.main_assistant_fallbacks,
