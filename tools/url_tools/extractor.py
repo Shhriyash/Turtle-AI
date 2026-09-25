@@ -12,6 +12,7 @@ from typing import Optional
 import httpx
 from bs4 import BeautifulSoup
 
+from . import safe_fetch
 from .models import UrlAnalysisResult
 
 _SPA_THRESHOLD = 200  # chars of visible text below which we consider the page a SPA
@@ -30,6 +31,16 @@ async def _fetch_with_scraped_do(
     timeout: float,
 ) -> tuple[str, int, str]:
     """Fetch via Scrape.do API (render=true) — cloud JS-rendering + geo bypass."""
+    # The outer request always goes to the fixed api.scrape.do host (plain
+    # http, port 80 — permitted by our own rules), so SSRF validation of
+    # *that* URL buys nothing. What matters is the model-supplied target
+    # embedded in the query string: we refuse to ask a third party to fetch
+    # an internal address on our behalf, which also stops this tool being
+    # used as an abuse proxy against arbitrary internal hosts.
+    try:
+        safe_fetch.validate_public_url(url)
+    except safe_fetch.UnsafeUrlError as exc:
+        raise safe_fetch.UnsafeUrlError(safe_fetch.REFUSAL_MESSAGE) from exc
     target = (
         f"http://api.scrape.do"
         f"?token={token}&url={urllib.parse.quote(url, safe='')}&render=true"
@@ -47,6 +58,18 @@ async def _fetch_with_playwright(
 ) -> tuple[str, int, str]:
     """Fetch via local Playwright headless browser for JS-rendered pages."""
     from playwright.async_api import async_playwright
+
+    # A local Chromium instance navigating straight to the target — the
+    # sharpest SSRF edge on this path, since the browser reaches the host's
+    # own network stack. Validate before launching the browser at all.
+    # Note: this only validates the initial URL; in-browser redirects that
+    # Playwright follows internally are not re-validated per hop (unlike
+    # the httpx path via safe_get). That is a narrower residual gap than
+    # the unvalidated status quo and is accepted for this WP.
+    try:
+        safe_fetch.validate_public_url(url)
+    except safe_fetch.UnsafeUrlError as exc:
+        raise safe_fetch.UnsafeUrlError(safe_fetch.REFUSAL_MESSAGE) from exc
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -218,11 +241,16 @@ async def fetch_url_content_async(
     headers = _build_headers()
 
     try:
-        # ── Step 1: httpx ──────────────────────────────────────────────────
-        response = await http_client.get(
-            url, headers=headers, timeout=timeout, follow_redirects=True
+        # ── Step 1: httpx (SSRF-validated, redirect-safe, body-capped) ──────
+        response = await safe_fetch.safe_get(
+            http_client, url, headers=headers, timeout=timeout
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            return UrlAnalysisResult(
+                title="", description=None, keywords=None, headings=[],
+                content="", links=[], url=url, success=False,
+                error_message=f"HTTP {response.status_code}",
+            )
         content_type = response.headers.get("content-type", "").lower()
         html_text = response.text
         status_code = response.status_code
@@ -230,7 +258,7 @@ async def fetch_url_content_async(
         # JSON — return as-is
         if "json" in content_type:
             try:
-                formatted = json.dumps(response.json(), indent=2)
+                formatted = json.dumps(json.loads(html_text), indent=2)
             except Exception:
                 formatted = html_text
             return UrlAnalysisResult(
@@ -277,6 +305,14 @@ async def fetch_url_content_async(
         # ── Step 3: parse HTML ─────────────────────────────────────────────
         return _parse_html(html_text, parsed, url, max_content_length, status_code, content_type)
 
+    except safe_fetch.UnsafeUrlError:
+        # Fixed, non-leaky refusal text — never echo the resolved IP or the
+        # internal validation reason back to the model.
+        return UrlAnalysisResult(
+            title="", description=None, keywords=None, headings=[],
+            content="", links=[], url=url, success=False,
+            error_message=safe_fetch.REFUSAL_MESSAGE,
+        )
     except httpx.TimeoutException:
         return UrlAnalysisResult(
             title="", description=None, keywords=None, headings=[],
