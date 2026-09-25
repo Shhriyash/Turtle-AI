@@ -224,6 +224,27 @@ class RedisIdempotencyTest(unittest.TestCase):
             with self.assertRaises(IdempotencyReservationError):
                 redis_is_duplicate_invocation("k1")
 
+    def test_success_kwarg_caches_non_email_shaped_result(self) -> None:
+        """WP1.E1: redis_record_invocation's `success` kwarg (added so
+        calendar_confirm's result — never "Email sent successfully" — can
+        still be cached) must override the default string-sniff."""
+        redis_record_invocation("k1", "Event created: Board Sync", success=True)
+        self.assertEqual(redis_is_duplicate_invocation("k1"), "Event created: Board Sync")
+
+    def test_success_kwarg_false_releases_reservation(self) -> None:
+        redis_record_invocation("k1", "some non-email result text", success=False)
+        self.assertIsNone(redis_is_duplicate_invocation("k1"))
+
+    def test_success_kwarg_omitted_keeps_email_sniff_behaviour(self) -> None:
+        """Back-compat: existing email call sites don't pass `success`, so
+        the string-sniff must still apply exactly as before."""
+        redis_record_invocation("k1", "Failed to send email: boom")
+        self.assertIsNone(redis_is_duplicate_invocation("k1"))
+        redis_record_invocation("k2", "Email sent successfully! message id 123")
+        self.assertEqual(
+            redis_is_duplicate_invocation("k2"), "Email sent successfully! message id 123"
+        )
+
     def test_cross_tenant_keys_built_via_key_builder_do_not_collide(self) -> None:
         """Ledger acceptance criterion, exercised through the real key
         builder: two different user_ids sending the byte-identical email

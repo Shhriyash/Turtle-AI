@@ -33,6 +33,7 @@ Distance (text + metres), duration (text + seconds), the travel mode, and a shar
 - **credentials_missing**: `GOOGLE_MAPS_API_KEY` not configured — say Maps routing is unavailable.
 - **empty**: No route was found — usually a typo in the endpoint names. Ask the user to clarify or try a nearby landmark.
 - **invalid**: `travel_mode` was outside the supported set — retry with a valid mode.
+- **rate_limited**: Either Google itself is rate-limiting requests, or this account has hit its daily cap on Places/Directions lookups. Tell the user to try again later — do not retry immediately.
 
 ## Examples
 
