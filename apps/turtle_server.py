@@ -2399,9 +2399,15 @@ class AgentManager:
             ).to_agent_string()
 
         async def calendar_create(ctx: RunContext[SharedState], args: CalendarCreateArgs) -> str:
-            """Create a Google Calendar event. See tool contract for full spec."""
-            from tools.calendar_tool import create_calendar_event
+            """Stage a Google Calendar event as a draft. See tool contract for full spec.
+
+            Does NOT touch Google Calendar. Stores the proposed event as
+            pending_calendar and asks the user to confirm; calendar_confirm
+            is the tool that actually creates it (mirrors the email
+            draft/send flow's pending_email)."""
             from tools.calendar_tool import CalendarCreateArgs as _CalendarCreateArgs
+            from tools.calendar_tool import render_calendar_draft
+
             inner = _CalendarCreateArgs(
                 title=args.title,
                 start_iso=args.start_iso,
@@ -2409,14 +2415,90 @@ class AgentManager:
                 attendee_emails=args.attendee_emails,
                 description=args.description,
                 add_google_meet=args.add_google_meet,
+                notify_attendees=args.notify_attendees,
             )
-            result = await create_calendar_event(inner, user_id=ctx.deps.user_id)
-            if result.status == "invalid" and result.error_code == "credentials_missing":
-                return (
-                    f"{result.to_agent_string()} Ask the user to connect their calendar at "
-                    f"{settings.public_base_url.rstrip('/')}/integrations/google_calendar/connect"
+            await ctx.deps.session_store.set_pending_calendar(
+                title=inner.title,
+                start_iso=inner.start_iso,
+                end_iso=inner.end_iso,
+                attendee_emails=inner.attendee_emails,
+                description=inner.description,
+                add_google_meet=inner.add_google_meet,
+                notify_attendees=inner.notify_attendees,
+            )
+            return clean_text_for_model(render_calendar_draft(inner))
+
+        async def calendar_confirm(ctx: RunContext[SharedState]) -> str:
+            """Create the previously drafted calendar event. See tool contract for full spec."""
+            from tools.calendar_tool import CalendarCreateArgs as _CalendarCreateArgs
+            from tools.calendar_tool import create_calendar_event
+            from tools.idempotency import (
+                IdempotencyReservationError,
+                build_calendar_idempotency_key,
+                is_duplicate_invocation,
+                send_with_reservation,
+            )
+
+            pending = ctx.deps.session_store.get_pending_calendar()
+            if not pending.get("title") or not pending.get("start_iso") or not pending.get("end_iso"):
+                return clean_text_for_model(
+                    "There's no pending calendar event to confirm (it may have expired — "
+                    "drafts last an hour). Ask me to create the event again first."
                 )
-            return result.to_agent_string()
+
+            inner = _CalendarCreateArgs(
+                title=pending.get("title", ""),
+                start_iso=pending.get("start_iso", ""),
+                end_iso=pending.get("end_iso", ""),
+                attendee_emails=list(pending.get("attendee_emails") or []),
+                description=pending.get("description", ""),
+                add_google_meet=bool(pending.get("add_google_meet", True)),
+                notify_attendees=bool(pending.get("notify_attendees", False)),
+            )
+
+            idem_key = build_calendar_idempotency_key(
+                ctx.deps.user_id, inner.title, inner.start_iso, inner.end_iso, inner.attendee_emails,
+            )
+            try:
+                cached_result = is_duplicate_invocation(idem_key)
+            except IdempotencyReservationError:
+                print(f"LOG: Calendar idempotency store unavailable — refusing create ({idem_key[:12]}...)")
+                return clean_text_for_model(
+                    "I could not verify this wasn't a duplicate create (the safety "
+                    "check is temporarily unavailable), so I did NOT create this "
+                    "event. Please try again in a moment."
+                )
+            if cached_result is not None:
+                print(f"LOG: Calendar idempotency hit — skipping duplicate create ({idem_key[:12]}...)")
+                return clean_text_for_model(cached_result)
+
+            success_holder: dict[str, bool] = {"ok": False}
+
+            async def _do_create() -> str:
+                result = await create_calendar_event(inner, user_id=ctx.deps.user_id)
+                success_holder["ok"] = result.status == "ok"
+                if result.status == "invalid" and result.error_code == "credentials_missing":
+                    return (
+                        f"{result.to_agent_string()} Ask the user to connect their calendar at "
+                        f"{settings.public_base_url.rstrip('/')}/integrations/google_calendar/connect"
+                    )
+                return result.to_agent_string()
+
+            try:
+                # send_with_reservation guarantees the reservation is always
+                # finalized or released, however the create exits (including
+                # asyncio.CancelledError on a client disconnect) — see its
+                # docstring in tools/idempotency.py. On any exception the
+                # draft must stay armed for retry (do not clear pending_calendar).
+                create_result = await send_with_reservation(
+                    idem_key, _do_create, is_success=lambda _r: success_holder["ok"],
+                )
+            except Exception as e:
+                return clean_text_for_model(f"Failed to create calendar event: {e}")
+
+            if success_holder["ok"]:
+                await ctx.deps.session_store.clear_pending_calendar()
+            return clean_text_for_model(create_result)
 
         async def calendar_list(ctx: RunContext[SharedState], args: CalendarListArgs) -> str:
             """List upcoming Google Calendar events. See tool contract for full spec."""
@@ -2448,7 +2530,7 @@ class AgentManager:
                 location_bias=args.location_bias,
             )
             # Reuse the shared http_client so we inherit the app's pool and timeouts.
-            result = await _find_place(inner, http_client=ctx.deps.http_client)
+            result = await _find_place(inner, http_client=ctx.deps.http_client, user_id=ctx.deps.user_id)
             if result.status == "ok" and result.data is not None:
                 rendered = render_find_place(result.data)
                 return _truncate_tool_output(rendered, label="places search")
@@ -2463,7 +2545,7 @@ class AgentManager:
             )
             print(f"\nPLACES: place_details id={args.place_id!r}")
             inner = _PlaceDetailsArgs(place_id=args.place_id)
-            result = await _place_details(inner, http_client=ctx.deps.http_client)
+            result = await _place_details(inner, http_client=ctx.deps.http_client, user_id=ctx.deps.user_id)
             if result.status == "ok" and result.data is not None:
                 rendered = render_place_details(result.data)
                 return _truncate_tool_output(rendered, label="place details")
@@ -2485,7 +2567,7 @@ class AgentManager:
                 destination=args.destination,
                 travel_mode=args.travel_mode,
             )
-            result = await _get_directions(inner, http_client=ctx.deps.http_client)
+            result = await _get_directions(inner, http_client=ctx.deps.http_client, user_id=ctx.deps.user_id)
             if result.status == "ok" and result.data is not None:
                 rendered = render_directions(result.data)
                 return _truncate_tool_output(rendered, label="directions")
@@ -2528,6 +2610,7 @@ class AgentManager:
             ("send_email_assistant", send_email_assistant),
             ("recall", recall),
             ("calendar_create", calendar_create),
+            ("calendar_confirm", calendar_confirm),
             ("calendar_list", calendar_list),
             ("find_place", find_place),
             ("place_details", place_details),

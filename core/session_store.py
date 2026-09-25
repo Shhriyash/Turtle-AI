@@ -71,6 +71,11 @@ class SessionRestoreResult:
 
 class SessionStore:
     PENDING_EMAIL_TTL_SECONDS = 3600
+    # Same TTL as pending_email (WP1.E1 / ledger 1b.1): a calendar draft
+    # abandoned an hour ago must not silently gap-fill a brand-new
+    # calendar_create call, mirroring the email-flow bug get_pending_email's
+    # lazy TTL check exists to prevent.
+    PENDING_CALENDAR_TTL_SECONDS = 3600
 
     def __init__(
         self, backend: SessionStoreProtocol | None = None, *, user_id: str = ""
@@ -85,6 +90,8 @@ class SessionStore:
         self.message_history: list[ModelMessage] = []
         self.pending_email: dict[str, Any] = self._default_pending_email()
         self._pending_email_updated_at: str = ""
+        self.pending_calendar: dict[str, Any] = self._default_pending_calendar()
+        self._pending_calendar_updated_at: str = ""
         self.current_status: str | None = None
         self.rolling_summary: list[dict[str, Any]] = []
 
@@ -102,6 +109,18 @@ class SessionStore:
             "content": "",
         }
 
+    @staticmethod
+    def _default_pending_calendar() -> dict[str, Any]:
+        return {
+            "title": "",
+            "start_iso": "",
+            "end_iso": "",
+            "attendee_emails": [],
+            "description": "",
+            "add_google_meet": True,
+            "notify_attendees": False,
+        }
+
     async def _sync_to_backend(self) -> None:
         if not self.session_id:
             return
@@ -114,6 +133,8 @@ class SessionStore:
             "messages": msgs_json,
             "pending_email": self.pending_email,
             "pending_email_updated_at": self._pending_email_updated_at,
+            "pending_calendar": self.pending_calendar,
+            "pending_calendar_updated_at": self._pending_calendar_updated_at,
             "summary": self.rolling_summary,
             "updated_at": _utc_now()
         }
@@ -124,6 +145,8 @@ class SessionStore:
         self.current_status = "active"
         self.pending_email = session.data.get("pending_email", self._default_pending_email())
         self._pending_email_updated_at = session.data.get("pending_email_updated_at", "")
+        self.pending_calendar = session.data.get("pending_calendar", self._default_pending_calendar())
+        self._pending_calendar_updated_at = session.data.get("pending_calendar_updated_at", "")
         summary = session.data.get("summary", [])
         self.rolling_summary = summary if isinstance(summary, list) else []
         raw_messages = session.data.get("messages", [])
@@ -224,6 +247,7 @@ class SessionStore:
         self.session_id = f"turtle_session_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         self.message_history = []
         self.pending_email = self._default_pending_email()
+        self.pending_calendar = self._default_pending_calendar()
         self.rolling_summary = []
         self.current_status = "active"
         await self._sync_to_backend()
@@ -316,6 +340,7 @@ class SessionStore:
         if isinstance(messages, list):
             session.data["messages"] = messages[-COMPLETED_SESSION_MESSAGE_TAIL:]
         session.data["pending_email"] = self._default_pending_email()
+        session.data["pending_calendar"] = self._default_pending_calendar()
         session.data["updated_at"] = _utc_now()
         await self.backend.put(session)
 
@@ -338,6 +363,31 @@ class SessionStore:
     async def clear_pending_email(self) -> None:
         self.pending_email = self._default_pending_email()
         self._pending_email_updated_at = ""
+        await self._sync_to_backend()
+
+    def get_pending_calendar(self) -> dict[str, Any]:
+        # Same lazy-TTL-on-read rationale as get_pending_email: an abandoned
+        # draft must not gap-fill a brand-new calendar_create call.
+        if self._pending_calendar_updated_at:
+            if self._seconds_since(self._pending_calendar_updated_at) > self.PENDING_CALENDAR_TTL_SECONDS:
+                self.pending_calendar = self._default_pending_calendar()
+                self._pending_calendar_updated_at = ""
+        return self.pending_calendar
+
+    async def set_pending_calendar(self, **kwargs: Any) -> None:
+        for k, v in kwargs.items():
+            if v is None:
+                continue
+            if isinstance(v, (str, bool)):
+                self.pending_calendar[k] = v
+            else:
+                self.pending_calendar[k] = list(v)
+        self._pending_calendar_updated_at = _utc_now()
+        await self._sync_to_backend()
+
+    async def clear_pending_calendar(self) -> None:
+        self.pending_calendar = self._default_pending_calendar()
+        self._pending_calendar_updated_at = ""
         await self._sync_to_backend()
 
     def get_summary_tail(self, max_entries: int = 20) -> list[dict[str, Any]]:

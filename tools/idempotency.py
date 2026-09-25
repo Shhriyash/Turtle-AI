@@ -155,9 +155,21 @@ def build_email_idempotency_key(
     bucket in the key made dedup fail exactly when retries straddled a
     minute boundary, so none is included here either.
 
-    Returns "{user_id}:{sha1}". Callers pass this straight to
-    is_duplicate_invocation/record_invocation, which add the "turtle:idem:"
-    storage prefix.
+    Returns "{user_id}:email:{sha1}". The "email:" discriminator (added
+    alongside the calendar draft/confirm flow) keeps an email key and a
+    calendar key for the same user from colliding as raw strings — the
+    "turtle:idem:" storage prefix added by the Redis backend does not by
+    itself guarantee that, since it is common to every tool's key. Callers
+    pass this straight to is_duplicate_invocation/record_invocation.
+
+    NOTE: this changes the key's raw string versus the pre-existing
+    "{user_id}:{sha1}" shape (the sha1 digest itself is unchanged — same
+    canonical string, same hash). Any reservation held under the old shape
+    at the moment this ships stops being reachable by its old key; that is
+    at most a 60s dedup window (_IDEMPOTENCY_WINDOW_S) per in-flight send,
+    not a correctness bug — a concurrent duplicate send in that exact
+    window would no longer be caught, but no email is lost or double-sent
+    outside of that pre-existing race.
     """
     sorted_recipients = sorted(r.lower().strip() for r in recipients)
     sorted_cc = sorted(r.lower().strip() for r in (cc or []))
@@ -172,7 +184,33 @@ def build_email_idempotency_key(
     )
     digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()
     safe_user = (user_id or "").strip() or "anonymous"
-    return f"{safe_user}:{digest}"
+    return f"{safe_user}:email:{digest}"
+
+
+def build_calendar_idempotency_key(
+    user_id: str,
+    title: str,
+    start_iso: str,
+    end_iso: str,
+    attendee_emails: list[str] | None = None,
+) -> str:
+    """Build a stable, per-tenant idempotency key for a calendar_confirm.
+
+    Mirrors build_email_idempotency_key's shape: "{user_id}:cal:{sha1}",
+    hashing (title, start, end, attendees) per the ledger's chosen key
+    shape (`turtle:idem:{uid}:cal:{sha1(title,start,end,attendees)}` once
+    the Redis backend's "turtle:idem:" prefix is added).
+    """
+    sorted_attendees = sorted(e.lower().strip() for e in (attendee_emails or []))
+    canonical = (
+        f"title:{(title or '').strip()}"
+        f"|start:{(start_iso or '').strip()}"
+        f"|end:{(end_iso or '').strip()}"
+        f"|attendees:{','.join(sorted_attendees)}"
+    )
+    digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()
+    safe_user = (user_id or "").strip() or "anonymous"
+    return f"{safe_user}:cal:{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -250,27 +288,38 @@ def is_duplicate_invocation(idempotency_key: str) -> Optional[str]:
         raise IdempotencyReservationError(str(exc)) from exc
 
 
-def record_invocation(idempotency_key: str, result: str) -> None:
+def record_invocation(idempotency_key: str, result: str, *, success: bool | None = None) -> None:
     """Finalize a reservation previously taken by is_duplicate_invocation.
 
-    On success (result starts with "Email sent successfully"), overwrite the
-    reservation with the final result so subsequent duplicates within the
-    window get the cached result. On failure, DELETE the reservation so the
-    user's retry is not blocked by a failed send.
+    On success, overwrite the reservation with the final result so
+    subsequent duplicates within the window get the cached result. On
+    failure, DELETE the reservation so the user's retry is not blocked by a
+    failed send.
+
+    `success` is generalised (originally this only ever sniffed email's
+    "Email sent successfully" prefix, which is meaningless for a calendar
+    result string). Pass it explicitly for any non-email caller — e.g.
+    calendar_confirm knows success from the tool's ToolResult.status, not
+    from string-sniffing its rendered text. When omitted, falls back to the
+    original email-specific sniff so the existing email call site (which
+    does not pass `success`) keeps its exact prior behaviour.
 
     In cloud mode, delegates to the Redis-backed implementation — see
     is_duplicate_invocation's docstring for why.
     """
+    if success is None:
+        success = str(result).startswith("Email sent successfully")
+
     from core.config import settings
 
     if settings.is_cloud:
         from core.storage.cloud.redis_backends import redis_record_invocation
 
-        redis_record_invocation(idempotency_key, result)
+        redis_record_invocation(idempotency_key, result, success=success)
         return
     try:
         conn = _ensure_db()
-        if str(result).startswith("Email sent successfully"):
+        if success:
             conn.execute(
                 "INSERT OR REPLACE INTO tool_invocations (idempotency_key, result, created_at_s) VALUES (?, ?, ?)",
                 (idempotency_key, result, time.time()),
@@ -287,7 +336,10 @@ def record_invocation(idempotency_key: str, result: str) -> None:
 
 
 async def send_with_reservation(
-    idempotency_key: str, send_coro_factory: Callable[[], Awaitable[str]]
+    idempotency_key: str,
+    send_coro_factory: Callable[[], Awaitable[str]],
+    *,
+    is_success: Callable[[str], bool] | None = None,
 ) -> str:
     """Run a reserved send, GUARANTEEING the reservation is finalized or
     released however it exits.
@@ -297,6 +349,13 @@ async def send_with_reservation(
     is called with no arguments and awaited to actually perform the send;
     it is a factory (not a bare coroutine) so this function can be reused
     safely without "coroutine was never awaited" surprises.
+
+    `is_success`, when given, is called with the returned result string to
+    decide whether record_invocation caches it (True) or releases the
+    reservation (False) — the email call site omits it and keeps relying on
+    record_invocation's own "Email sent successfully" sniff; a calendar
+    caller (whose result string is not that sentinel) should pass one, e.g.
+    a closure over the ToolResult.status captured before stringifying it.
 
     Without this wrapper, a send that RAISES instead of returning (a
     cancelled task from a client disconnect mid-SMTP, thread-pool
@@ -330,9 +389,15 @@ async def send_with_reservation(
         result = await send_coro_factory()
     except BaseException:
         try:
-            record_invocation(idempotency_key, "Failed to send email: the send did not complete")
+            record_invocation(
+                idempotency_key,
+                "Failed: the operation did not complete",
+                success=False,
+            )
         except Exception:
             pass
         raise
-    record_invocation(idempotency_key, result)
+    record_invocation(
+        idempotency_key, result, success=(is_success(result) if is_success else None)
+    )
     return result

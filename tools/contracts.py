@@ -173,6 +173,14 @@ class CalendarCreateArgs(BaseModel):
     )
     description: str = Field(default="", description="Optional event description / agenda.")
     add_google_meet: bool = Field(default=True, description="Attach a Google Meet link.")
+    notify_attendees: bool = Field(
+        default=False,
+        description=(
+            "Send calendar invite emails to attendees. Set True ONLY when the "
+            "user explicitly asked to notify/invite/email the attendees. "
+            "Defaults to False (silent) even when attendee_emails is non-empty."
+        ),
+    )
 
 
 class CalendarListArgs(BaseModel):
