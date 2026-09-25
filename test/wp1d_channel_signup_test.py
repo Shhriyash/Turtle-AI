@@ -23,6 +23,8 @@ Two independent pieces:
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -514,6 +516,94 @@ def test_rate_limit_runs_before_provisioning_and_lock(dispatch_harness, monkeypa
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    "channel,channel_user_id",
+    [
+        ("imessage", "+15550001111"),
+        ("slack", "U_SLACK_1"),
+        ("whatsapp", "whatsapp:+15550002222"),
+        ("twilio_voice", "+15550003333"),
+    ],
+)
+def test_rate_limit_keyed_on_channel_identity_for_previously_broken_channels(
+    channel, channel_user_id, dispatch_harness, monkeypatch
+):
+    """Coordinator follow-up on WP 1.D: imessage.py, slack.py, whatsapp.py
+    and twilio_voice.py did not set channel_user_id= when constructing their
+    TurtleEvent, so for exactly these 4 channels the rate-limit key (and the
+    lock key, and the account-link re-resolve guard) silently degraded to
+    event.user_id. Now that the adapters populate the field, drive each
+    THROUGH _channel_dispatch_handler (not just the adapter) and assert the
+    limiter's actual key is the channel identity, never a bare "usr_..." id.
+    """
+    harness = dispatch_harness
+    ts = harness.ts
+    limiter = WebSocketRateLimiter(per_hour=1, per_day=100)
+    monkeypatch.setattr(ts, "get_ws_rate_limiter", lambda: limiter)
+
+    harness.fake_identity._bound[(channel, channel_user_id)] = "usr_previously_hidden"
+
+    async def scenario():
+        await ts._channel_dispatch_handler(
+            _event(ts, "usr_previously_hidden", channel_user_id, channel=channel)
+        )
+
+    asyncio.run(scenario())
+
+    expected_key = f"{channel}:{channel_user_id}"
+    assert expected_key in limiter._events, (
+        f"expected the limiter to be keyed on {expected_key!r}, got keys "
+        f"{list(limiter._events)!r}"
+    )
+    assert "usr_previously_hidden" not in limiter._events, (
+        "the rate limit must never be keyed on event.user_id — this is "
+        "exactly the silent-degradation bug being regression-tested"
+    )
+
+    asyncio.run(
+        ts._channel_dispatch_handler(
+            _event(ts, "usr_previously_hidden", channel_user_id, channel=channel)
+        )
+    )
+    # Second call on the SAME channel identity, over the per_hour=1 cap,
+    # must have been refused — proving the key is actually load-bearing,
+    # not just present-but-unused.
+    assert harness.execute_turn.call_count == 1
+
+
+def test_redis_rate_limiter_accepts_the_compound_channel_identity_key():
+    """Nice-to-have (coordinator): the in-process WebSocketRateLimiter is
+    covered end-to-end above, but nothing proved the cloud-mode
+    RedisWebSocketRateLimiter tolerates the SAME compound key shape
+    ("<channel>:<channel_user_id>", e.g. "discord:chan_X") that
+    _channel_dispatch_handler now passes as its check_and_record() argument
+    — get_ws_rate_limiter() picks one or the other by deploy mode, but both
+    must behave identically for this key shape. Uses fakeredis, matching
+    test/redis_backends_test.py's own pattern; no live Redis in this env.
+    """
+    import fakeredis
+
+    from core.guardrails import WebSocketRateLimitExceeded
+    from core.storage.cloud.redis_backends import RedisWebSocketRateLimiter
+
+    fake = fakeredis.FakeStrictRedis(decode_responses=True)
+    with patch("core.storage.cloud.redis_backends.get_redis_sync_client", return_value=fake):
+        limiter = RedisWebSocketRateLimiter(per_hour=1, per_day=100)
+
+        # Two different channel identities that happen to share a colon-
+        # delimited shape must NOT collide into one Redis key.
+        limiter.check_and_record("discord:chan_A")
+        limiter.check_and_record("whatsapp:whatsapp:+15551234567")  # channel_user_id itself has a colon
+
+        with pytest.raises(WebSocketRateLimitExceeded):
+            limiter.check_and_record("discord:chan_A")
+
+        # The colon-containing whatsapp identity has its own independent
+        # budget — proves the key isn't being parsed/split anywhere.
+        with pytest.raises(WebSocketRateLimitExceeded):
+            limiter.check_and_record("whatsapp:whatsapp:+15551234567")
+
+
 # ---------------------------------------------------------------------------
 # 3. Per-channel invite-only no-mint coverage.
 #
@@ -567,6 +657,36 @@ def test_imessage_invite_only_unknown_sender_no_mint_no_dispatch():
     fake_send.assert_awaited_once_with("+15551234567", im.CHANNEL_INVITE_ONLY_MESSAGE)
 
 
+def test_imessage_known_sender_event_carries_channel_user_id():
+    """Coordinator follow-up: imessage.py previously left TurtleEvent.
+    channel_user_id unset, silently degrading the rate-limit/lock/re-resolve
+    keys in _channel_dispatch_handler to event.user_id for this channel."""
+    import apps.channels.imessage as im
+
+    captured = {}
+
+    async def fake_dispatch(event):
+        captured["event"] = event
+        from apps.channels import TurtleResponse
+
+        return TurtleResponse(content="hi", channel="imessage", user_id=event.user_id)
+
+    with patch.object(im, "_verify_sendblue_signature", return_value=True), patch.object(
+        im, "resolve_channel_user", new_callable=AsyncMock, return_value="usr_known"
+    ), patch.object(im, "dispatch_event", fake_dispatch), patch.object(
+        im, "_send_imessage_reply", new_callable=AsyncMock
+    ):
+        client = _make_client(im.router)
+        resp = client.post(
+            "/channels/imessage",
+            content=b'{"from_number": "+15551234567", "content": "hi", "message_handle": "h1"}',
+            headers={"X-SendBlue-Signature": "sig"},
+        )
+
+    assert resp.status_code == 200
+    assert captured["event"].channel_user_id == "+15551234567"
+
+
 def test_whatsapp_invite_only_unknown_sender_no_mint_no_dispatch():
     import apps.channels.whatsapp as wa
 
@@ -588,6 +708,33 @@ def test_whatsapp_invite_only_unknown_sender_no_mint_no_dispatch():
     fake_resolve.assert_awaited_once_with("whatsapp", "whatsapp:+15551234567")
     fake_dispatch.assert_not_called()
     fake_send.assert_awaited_once_with("whatsapp:+15551234567", wa.CHANNEL_INVITE_ONLY_MESSAGE)
+
+
+def test_whatsapp_known_sender_event_carries_channel_user_id():
+    """Coordinator follow-up: whatsapp.py previously left TurtleEvent.
+    channel_user_id unset."""
+    import apps.channels.whatsapp as wa
+
+    captured = {}
+
+    async def fake_dispatch(event):
+        captured["event"] = event
+        from apps.channels import TurtleResponse
+
+        return TurtleResponse(content="hi", channel="whatsapp", user_id=event.user_id)
+
+    with patch.object(wa, "_verify_twilio_signature", return_value=True), patch.object(
+        wa, "resolve_channel_user", new_callable=AsyncMock, return_value="usr_known"
+    ), patch.object(wa, "dispatch_event", fake_dispatch):
+        client = _make_client(wa.router)
+        resp = client.post(
+            "/channels/whatsapp",
+            data={"From": "whatsapp:+15551234567", "Body": "hi", "MessageSid": "SM2"},
+            headers={"X-Twilio-Signature": "sig"},
+        )
+
+    assert resp.status_code == 200
+    assert captured["event"].channel_user_id == "whatsapp:+15551234567"
 
 
 def test_slack_invite_only_unknown_sender_no_mint_no_dispatch():
@@ -632,6 +779,52 @@ def test_slack_invite_only_unknown_sender_no_mint_no_dispatch():
     assert fake_post.call_args.args[1] == sl.CHANNEL_INVITE_ONLY_MESSAGE
 
 
+def test_slack_known_sender_event_carries_channel_user_id():
+    """Coordinator follow-up: slack.py previously left TurtleEvent.
+    channel_user_id unset."""
+    import apps.channels.slack as sl
+
+    payload = {
+        "type": "event_callback",
+        "event": {
+            "type": "message",
+            "user": "U_KNOWN",
+            "text": "hi",
+            "channel": "C123",
+            "ts": "1234.9999",
+        },
+    }
+    captured = {}
+
+    async def fake_dispatch(event):
+        captured["event"] = event
+        from apps.channels import TurtleResponse
+
+        return TurtleResponse(content="hi", channel="slack", user_id=event.user_id)
+
+    with patch.object(sl, "_verify_slack_signature", return_value=True), patch.object(
+        sl, "resolve_channel_user", new_callable=AsyncMock, return_value="usr_known"
+    ), patch.object(sl, "dispatch_event", fake_dispatch), patch.object(
+        sl, "_post_slack_message", new_callable=AsyncMock
+    ):
+        client = _make_client(sl.router)
+        resp = client.post(
+            "/channels/slack/events",
+            json=payload,
+            headers={"X-Slack-Request-Timestamp": "0", "X-Slack-Signature": "v0=x"},
+        )
+        assert resp.status_code == 200
+
+        import time as _time
+
+        for _ in range(50):
+            if "event" in captured:
+                break
+            _time.sleep(0.02)
+
+    assert captured["event"].channel_user_id == "U_KNOWN"
+
+
 def test_twilio_voice_invite_only_unknown_caller_no_mint_no_dispatch():
     import apps.channels.twilio_voice as tv
 
@@ -654,6 +847,186 @@ def test_twilio_voice_invite_only_unknown_caller_no_mint_no_dispatch():
     fake_resolve.assert_awaited_once_with("twilio_voice", "+15551234567")
     fake_dispatch.assert_not_called()
     fake_tts.assert_awaited_once_with(tv.CHANNEL_INVITE_ONLY_MESSAGE)
+
+
+def test_twilio_voice_absent_from_under_invite_refuses_rather_than_falls_through():
+    """Coordinator steer: a caller with NO from_number at all (Twilio hands
+    us nothing, or the number is withheld) under TURTLE_CHANNEL_SIGNUP=invite
+    must be refused, not silently treated as an anonymous session — you
+    cannot check an identity you do not have."""
+    import apps.channels.twilio_voice as tv
+
+    with patch.object(tv.settings, "channel_signup", "invite"), patch.object(
+        tv, "resolve_channel_user", new_callable=AsyncMock
+    ) as fake_resolve, patch.object(
+        tv, "dispatch_event", new_callable=AsyncMock
+    ) as fake_dispatch, patch.object(
+        tv, "_synthesize_ulaw", new_callable=AsyncMock, return_value=b"\x00" * 160
+    ) as fake_tts:
+        client = _make_client(tv.router)
+        with client.websocket_connect("/channels/twilio/voice/stream") as ws:
+            # No customParameters at all — exactly what an un-parameterized
+            # <Stream> (or a withheld caller ID) produces.
+            ws.send_text('{"event": "start", "start": {"callSid": "CA1"}}')
+            ws.send_text('{"event": "stop"}')
+
+    fake_resolve.assert_not_called()  # nothing to look up
+    fake_dispatch.assert_not_called()
+    fake_tts.assert_awaited_once_with(tv.CHANNEL_INVITE_ONLY_MESSAGE)
+
+
+def test_twilio_voice_absent_from_under_open_still_falls_through_to_anon():
+    """Same absent-from_number input, but the DEFAULT policy — must NOT
+    regress: an anonymous caller is still served (scoped to its own
+    anon_<call_sid> identity), matching today's behaviour."""
+    import apps.channels.twilio_voice as tv
+
+    captured = {}
+
+    async def fake_dispatch(event):
+        captured["event"] = event
+        from apps.channels import TurtleResponse
+
+        return TurtleResponse(content="hi", channel="twilio_voice", user_id=event.user_id)
+
+    with patch.object(tv.settings, "channel_signup", "open"), patch.object(
+        tv, "resolve_channel_user", new_callable=AsyncMock
+    ) as fake_resolve, patch.object(
+        tv, "dispatch_event", fake_dispatch
+    ), patch.object(
+        tv, "_transcribe_audio", new_callable=AsyncMock, return_value="hello"
+    ), patch.object(
+        tv, "_synthesize_ulaw", new_callable=AsyncMock, return_value=b"\x00" * 160
+    ), patch.object(
+        tv, "_frame_energy", return_value=10_000
+    ):
+        client = _make_client(tv.router)
+        with client.websocket_connect("/channels/twilio/voice/stream") as ws:
+            ws.send_text('{"event": "start", "start": {"callSid": "CA_anon"}}')
+            ws.send_text(json.dumps({
+                "event": "media",
+                "media": {"payload": base64.b64encode(b"\x00" * 160).decode()},
+            }))
+            ws.send_text('{"event": "stop"}')
+
+    fake_resolve.assert_not_called()
+    assert captured["event"].user_id == "anon_CA_anon"
+    assert captured["event"].channel_user_id == ""
+
+
+def test_twilio_voice_known_caller_event_carries_channel_user_id():
+    """Coordinator follow-up: twilio_voice.py previously left TurtleEvent.
+    channel_user_id unset for the dispatched turn (only the WS-local
+    from_number was tracked, never forwarded onto the event)."""
+    import apps.channels.twilio_voice as tv
+
+    captured = {}
+
+    async def fake_dispatch(event):
+        captured["event"] = event
+        from apps.channels import TurtleResponse
+
+        return TurtleResponse(content="hi", channel="twilio_voice", user_id=event.user_id)
+
+    with patch.object(
+        tv, "resolve_channel_user", new_callable=AsyncMock, return_value="usr_known"
+    ) as fake_resolve, patch.object(
+        tv, "dispatch_event", fake_dispatch
+    ), patch.object(
+        tv, "_transcribe_audio", new_callable=AsyncMock, return_value="hello"
+    ), patch.object(
+        tv, "_synthesize_ulaw", new_callable=AsyncMock, return_value=b"\x00" * 160
+    ), patch.object(
+        tv, "_frame_energy", return_value=10_000
+    ):
+        client = _make_client(tv.router)
+        with client.websocket_connect("/channels/twilio/voice/stream") as ws:
+            ws.send_text(
+                '{"event": "start", "start": {"callSid": "CA2", '
+                '"customParameters": {"from": "+15559998888"}}}'
+            )
+            ws.send_text(json.dumps({
+                "event": "media",
+                "media": {"payload": base64.b64encode(b"\x00" * 160).decode()},
+            }))
+            ws.send_text('{"event": "stop"}')
+
+    fake_resolve.assert_awaited_once_with("twilio_voice", "+15559998888")
+    assert captured["event"].user_id == "usr_known"
+    assert captured["event"].channel_user_id == "+15559998888"
+
+
+# ---------------------------------------------------------------------------
+# The TwiML <-> WS seam (coordinator's "must-fix 1"): voice_incoming's TwiML
+# was never actually fed into the start-frame handler anywhere — every prior
+# test synthesized a start frame with customParameters injected by hand,
+# which proved the WS-side gate works given an input that, in production,
+# voice_incoming never produced (no <Parameter> in the TwiML, so Twilio's
+# real "start" event carries no "from" under customParameters at all). This
+# test closes that seam: it calls the REAL voice_incoming, parses the REAL
+# TwiML it returns, extracts the REAL customParameters from that TwiML, and
+# feeds THOSE into the start-frame handler.
+# ---------------------------------------------------------------------------
+
+def test_twiml_from_voice_incoming_actually_reaches_the_start_handler_gate():
+    import xml.etree.ElementTree as ET
+
+    import apps.channels.twilio_voice as tv
+
+    async def _get_twiml(from_number: str) -> str:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+        app.include_router(tv.router)
+        with TestClient(app) as client:
+            resp = client.post("/channels/twilio/voice/incoming", data={"From": from_number})
+        assert resp.status_code == 200
+        return resp.text
+
+    # 1) Get the REAL TwiML for a real inbound call.
+    twiml = asyncio.run(_get_twiml("+15557778888 <evil> & \"quoted\""))
+
+    # 2) Parse it for real — no hand-rolled string matching.
+    root = ET.fromstring(twiml)
+    stream_el = root.find("./Connect/Stream")
+    assert stream_el is not None, "TwiML must contain <Connect><Stream>"
+    params = {
+        p.get("name"): p.get("value")
+        for p in stream_el.findall("Parameter")
+    }
+    assert "from" in params, (
+        "voice_incoming's TwiML carries no <Parameter name=\"from\">, so "
+        "the WS start handler's from_number is ALWAYS empty in production "
+        "— this is the exact dead-code gate the coordinator flagged"
+    )
+    # XML-escaping round-tripped correctly (ElementTree unescapes on parse).
+    assert params["from"] == '+15557778888 <evil> & "quoted"'
+
+    # 3) Feed the REAL extracted customParameters into the REAL start
+    #    handler and assert the gate actually fires.
+    with patch.object(
+        tv, "resolve_channel_user", new_callable=AsyncMock, return_value=None
+    ) as fake_resolve, patch.object(
+        tv, "dispatch_event", new_callable=AsyncMock
+    ) as fake_dispatch, patch.object(
+        tv, "_synthesize_ulaw", new_callable=AsyncMock, return_value=b"\x00" * 160
+    ):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+        app.include_router(tv.router)
+        client = TestClient(app)
+        with client.websocket_connect("/channels/twilio/voice/stream") as ws:
+            ws.send_text(json.dumps({
+                "event": "start",
+                "start": {"callSid": "CA_seam", "customParameters": params},
+            }))
+            ws.send_text('{"event": "stop"}')
+
+    fake_resolve.assert_awaited_once_with("twilio_voice", params["from"])
+    fake_dispatch.assert_not_called()
 
 
 # --- Gateway closures (discord_gateway, telegram_gateway) -------------------

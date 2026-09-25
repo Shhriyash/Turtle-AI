@@ -38,12 +38,13 @@ import struct
 import time
 import wave
 from typing import Optional
+from xml.sax.saxutils import escape as _xml_escape
 
 import httpx
 from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect
 
 from apps.channels import TurtleEvent, TurtleResponse, dispatch_event
-from core.config import settings
+from core.config import CHANNEL_SIGNUP_INVITE, normalize_channel_signup, settings
 from core.identity import CHANNEL_INVITE_ONLY_MESSAGE, resolve_channel_user
 from core.output_clean import clean_text_for_tts
 
@@ -160,16 +161,43 @@ async def voice_incoming(request: Request):
     """
     Twilio calls this when a voice call arrives.
     Returns TwiML that tells Twilio to open a Media Stream to /stream.
+
+    Twilio's Media Streams "start" event does NOT carry the caller's number
+    at the top level — it only appears under customParameters, and only if
+    THIS TwiML puts it there via <Parameter>. Without this, voice_stream's
+    identity gate (invite-only sign-up, the re-resolve-under-lock account-
+    link protection, and the rate-limit key) is dead code: from_number is
+    always "", so it's never even attempted. Twilio DOES hand us the
+    caller's number as the `From` form field on THIS webhook — read it here
+    and forward it into the Stream so the WS side has something to gate on.
     """
+    form = await request.form()
+    from_number = str(form.get("From") or "").strip()
+
     host = request.headers.get("host") or request.base_url.netloc
     scheme = "wss" if request.url.scheme == "https" else "ws"
     stream_url = f"{scheme}://{host}/channels/twilio/voice/stream"
+
+    # A withheld/absent From is legitimate (caller ID blocked) — omit the
+    # <Parameter> entirely rather than forward an empty value; voice_stream
+    # treats "no customParameters['from']" as "identity unknown" and, under
+    # TURTLE_CHANNEL_SIGNUP=invite, refuses rather than falling through to
+    # an anonymous session (you cannot check an identity you do not have).
+    if from_number:
+        escaped_from = _xml_escape(from_number, {chr(34): "&quot;"})
+        stream_tag = (
+            f'<Stream url="{stream_url}">'
+            f'<Parameter name="from" value="{escaped_from}" />'
+            "</Stream>"
+        )
+    else:
+        stream_tag = f'<Stream url="{stream_url}" />'
 
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         "<Connect>"
-        f'<Stream url="{stream_url}" />'
+        f"{stream_tag}"
         "</Connect>"
         "</Response>"
     )
@@ -199,6 +227,22 @@ async def voice_stream(ws: WebSocket):
     audio_buffer: list[bytes] = []   # accumulated μ-law frames
     silence_count: int = 0
     speaking: bool = False
+
+    async def _speak_and_hang_up(text: str) -> None:
+        """Synthesize `text`, stream it as media frames, then close the
+        stream. Shared by every invite-only refusal path below — this IS
+        the adapter's reply shape for a live audio call (no text send)."""
+        audio = await _synthesize_ulaw(text)
+        chunk_size = _FRAME_SAMPLES
+        for i in range(0, len(audio), chunk_size):
+            chunk = audio[i: i + chunk_size]
+            payload = base64.b64encode(chunk).decode()
+            await ws.send_text(json.dumps({
+                "event": "media",
+                "streamSid": call_sid,
+                "media": {"payload": payload},
+            }))
+        await ws.close()
 
     async def _flush_and_respond() -> None:
         """STT the buffer, dispatch to Turtle, send TTS reply."""
@@ -230,6 +274,13 @@ async def voice_stream(ws: WebSocket):
             modality="voice",
             content=text,
             message_id=call_sid,
+            # WP 1.D follow-up: this was previously left unset, which meant
+            # _channel_dispatch_handler's rate-limit key, lock key, and
+            # account-link re-resolve guard all silently fell back to
+            # event.user_id for this channel. from_number IS the channel
+            # identity here (empty for a withheld caller, matching the
+            # "anon_<call_sid>" scoping above).
+            channel_user_id=from_number,
         )
         response: TurtleResponse = await dispatch_event(event)
         reply_text = clean_text_for_tts(response.content)
@@ -272,18 +323,19 @@ async def voice_stream(ws: WebSocket):
                         # stream, not a text reply, so the refusal has to be
                         # synthesized and streamed like any other reply.
                         print(f"[TwilioVoice] Rejecting unknown caller {from_number} (invite-only)")
-                        invite_audio = await _synthesize_ulaw(CHANNEL_INVITE_ONLY_MESSAGE)
-                        chunk_size = _FRAME_SAMPLES
-                        for i in range(0, len(invite_audio), chunk_size):
-                            chunk = invite_audio[i: i + chunk_size]
-                            payload = base64.b64encode(chunk).decode()
-                            await ws.send_text(json.dumps({
-                                "event": "media",
-                                "streamSid": call_sid,
-                                "media": {"payload": payload},
-                            }))
-                        await ws.close()
+                        await _speak_and_hang_up(CHANNEL_INVITE_ONLY_MESSAGE)
                         return
+                elif normalize_channel_signup(settings.channel_signup) == CHANNEL_SIGNUP_INVITE:
+                    # No caller id at all (Twilio hands us nothing, or the
+                    # caller withheld their number) AND sign-up is
+                    # invite-only. There is no identity here to check against
+                    # the invite list, so — per the coordinator's steer —
+                    # refuse rather than silently fall through to an
+                    # anonymous session; "no from_number" must not become a
+                    # bypass for invite-only.
+                    print("[TwilioVoice] Rejecting caller with no from_number (invite-only)")
+                    await _speak_and_hang_up(CHANNEL_INVITE_ONLY_MESSAGE)
+                    return
                 print(f"[TwilioVoice] Stream started: call_sid={call_sid} from={from_number}")
 
             elif event_name == "media":

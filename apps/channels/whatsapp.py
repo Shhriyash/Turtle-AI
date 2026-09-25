@@ -157,6 +157,12 @@ async def whatsapp_webhook(
         modality="text",
         content=Body.strip(),
         message_id=MessageSid,
+        # WP 1.D follow-up: this was previously left unset, which meant
+        # _channel_dispatch_handler's rate-limit key, lock key, and
+        # account-link re-resolve guard all silently fell back to
+        # event.user_id for this channel instead of the raw channel
+        # identity.
+        channel_user_id=From,
     )
     response: TurtleResponse = await dispatch_event(event)
     reply_text = response.content

@@ -158,6 +158,12 @@ async def slack_events(request: Request):
             content=text,
             message_id=event_ts,
             thread_id=thread_ts,
+            # WP 1.D follow-up: this was previously left unset, which meant
+            # _channel_dispatch_handler's rate-limit key, lock key, and
+            # account-link re-resolve guard all silently fell back to
+            # event.user_id for this channel instead of the raw channel
+            # identity.
+            channel_user_id=slack_user_id,
         )
         response: TurtleResponse = await dispatch_event(turtle_event)
         await _post_slack_message(channel_id, response.content, thread_ts=thread_ts)
