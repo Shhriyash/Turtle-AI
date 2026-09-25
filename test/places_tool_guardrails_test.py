@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable
 
 import httpx
@@ -410,3 +411,281 @@ def test_redis_call_limiter_driver_failure_fails_open(monkeypatch):
     limiter = RedisPlacesCallLimiter(per_day=1)
     # Must not raise PlacesCallCapExceeded (or anything else) — fails open.
     limiter.check_and_record("user-1")
+
+
+# ---------------------------------------------------------------------------
+# WP 1.G2 must-fix 1 — RedisPlacesCallLimiter.check_and_record must be
+# atomic under real concurrency: a sliding-window sorted set built from
+# separate ZREMRANGEBYSCORE -> ZCARD (read) -> conditional ZADD (write)
+# round-trips is racy (each caller decides on a count read a moment
+# earlier). Fixed by ZADD-ing a uniquely-keyed member FIRST, then counting
+# (which necessarily includes the caller's own just-landed write), and
+# self-removing only the caller's own member on refusal or mid-flight
+# failure.
+#
+# _FakeRedisCap below simulates a REAL Redis round trip: each command
+# sleeps (network latency) BEFORE taking a short internal lock to mutate/
+# read the shared sorted set (the "atomic on the server" part). The sleep
+# is deliberately OUTSIDE the lock so many callers' round trips can be
+# in-flight — and interleaved with each other — at once. A sequential fake
+# (no delay, or delay-under-lock) would serialize every command and make
+# any implementation "pass" without exercising the race at all.
+# ---------------------------------------------------------------------------
+
+import random
+import threading as _threading
+from concurrent.futures import ThreadPoolExecutor
+
+
+class _FakeRedisCap:
+    def __init__(self, delay: float = 0.015, jitter: float = 0.01, seed: int = 7):
+        self._lock = _threading.Lock()
+        self._zset: dict[str, dict[str, float]] = {}
+        self._delay = delay
+        self._jitter = jitter
+        self._rng = random.Random(seed)
+
+    def _sleep(self):
+        # Random jitter per call — real network latency is not perfectly
+        # synchronized across concurrent callers, so a fixed delay alone
+        # would let every caller's round trips land in lockstep and hide
+        # the very interleaving we're trying to exercise.
+        time.sleep(self._delay + self._rng.uniform(0, self._jitter))
+
+    def zadd(self, key, mapping):
+        self._sleep()
+        with self._lock:
+            self._zset.setdefault(key, {}).update(mapping)
+
+    def zremrangebyscore(self, key, min_, max_):
+        self._sleep()
+        with self._lock:
+            z = self._zset.setdefault(key, {})
+            cutoff = float(max_)
+            for m in [m for m, s in z.items() if s <= cutoff]:
+                del z[m]
+
+    def zcard(self, key):
+        self._sleep()
+        with self._lock:
+            return len(self._zset.get(key, {}))
+
+    def zrem(self, key, member):
+        with self._lock:
+            self._zset.get(key, {}).pop(member, None)
+
+    def expire(self, key, seconds):
+        pass
+
+
+def test_call_cap_concurrent_callers_cannot_exceed_cap(monkeypatch):
+    """N=20 real OS threads race against a cap of 5. Must never collectively
+    exceed the cap. Against the pre-fix ZREMRANGEBYSCORE -> ZCARD -> ZADD
+    sequence, this test fails (see the WP report for the captured failure:
+    20 allowed against a cap of 5)."""
+    from tools.places_guardrails import RedisPlacesCallLimiter
+
+    fake = _FakeRedisCap()
+    monkeypatch.setattr("core.storage.cloud.get_redis_sync_client", lambda: fake)
+
+    limiter = RedisPlacesCallLimiter(per_day=5)
+    n = 20
+    results: list[bool] = [False] * n
+
+    def worker(i):
+        try:
+            limiter.check_and_record("user-race")
+            results[i] = True
+        except Exception:
+            results[i] = False
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futures = [pool.submit(worker, i) for i in range(n)]
+        for f in futures:
+            f.result()
+
+    allowed_count = sum(results)
+    assert allowed_count <= 5, (
+        f"{allowed_count} of {n} concurrent callers were allowed against a "
+        f"cap of 5 — the call cap was raced past, which is exactly the WP "
+        f"1.G2 must-fix. Under the old check-then-act sequence this "
+        f"assertion fails ({n} > 5)."
+    )
+    assert allowed_count >= 1, "the fake Redis or limiter logic is broken, not just strict"
+
+    # The sorted set must end up holding exactly the members that were
+    # actually granted — no stray leftovers from refused attempts.
+    key = "turtle:places_cap:v1:user-race"
+    assert len(fake._zset.get(key, {})) == allowed_count
+
+
+def test_call_cap_refusal_leaves_no_stranded_member(monkeypatch):
+    """A refused call must remove exactly the member IT added, not leave it
+    behind and not touch anyone else's member."""
+    from tools.places_guardrails import RedisPlacesCallLimiter, PlacesCallCapExceeded
+
+    fake = _FakeRedisCap(delay=0.0, jitter=0.0)
+    monkeypatch.setattr("core.storage.cloud.get_redis_sync_client", lambda: fake)
+
+    limiter = RedisPlacesCallLimiter(per_day=2)
+    limiter.check_and_record("user-1")
+    limiter.check_and_record("user-1")
+    key = "turtle:places_cap:v1:user-1"
+    assert len(fake._zset.get(key, {})) == 2
+
+    with pytest.raises(PlacesCallCapExceeded):
+        limiter.check_and_record("user-1")
+
+    # The refused call's own member must not survive; the two already-
+    # granted members must be untouched.
+    assert len(fake._zset.get(key, {})) == 2
+
+
+def test_call_cap_mid_flight_exception_leaves_no_stranded_member(monkeypatch):
+    """A driver failure AFTER our own ZADD lands (e.g. ZCARD blows up) must
+    still remove our own member before failing open — not just refusals."""
+    from tools.places_guardrails import RedisPlacesCallLimiter
+
+    fake = _FakeRedisCap(delay=0.0, jitter=0.0)
+
+    real_zcard = fake.zcard
+
+    def _boom_zcard(key):
+        raise ConnectionError("simulated mid-flight redis failure")
+
+    fake.zcard = _boom_zcard
+    monkeypatch.setattr("core.storage.cloud.get_redis_sync_client", lambda: fake)
+
+    limiter = RedisPlacesCallLimiter(per_day=5)
+    limiter.check_and_record("user-1")  # must not raise — fails open
+
+    key = "turtle:places_cap:v1:user-1"
+    assert fake._zset.get(key, {}) == {}, (
+        "the ZADD-ed member must be cleaned up when a later call in the "
+        "same check_and_record fails, not stranded in the sorted set"
+    )
+
+
+def test_call_cap_cancelled_error_leaves_no_stranded_member_and_propagates(monkeypatch):
+    """asyncio.CancelledError is a BaseException, not an Exception. Must
+    still clean up our own member (Wave 1 shipped exactly this bug: a
+    stranding cleanup path that only caught Exception), AND must still
+    propagate the cancellation rather than being silently swallowed as if
+    it were an ordinary Redis failure."""
+    import asyncio as _asyncio
+
+    from tools.places_guardrails import RedisPlacesCallLimiter
+
+    fake = _FakeRedisCap(delay=0.0, jitter=0.0)
+
+    def _cancel_zcard(key):
+        raise _asyncio.CancelledError()
+
+    fake.zcard = _cancel_zcard
+    monkeypatch.setattr("core.storage.cloud.get_redis_sync_client", lambda: fake)
+
+    limiter = RedisPlacesCallLimiter(per_day=5)
+    with pytest.raises(_asyncio.CancelledError):
+        limiter.check_and_record("user-1")
+
+    key = "turtle:places_cap:v1:user-1"
+    assert fake._zset.get(key, {}) == {}, (
+        "CancelledError mid-check must not strand the member either"
+    )
+
+
+# ---------------------------------------------------------------------------
+# WP 1.G2 must-fix 2 — a ConnectError's str(exc) must never reach the model.
+# ---------------------------------------------------------------------------
+
+
+def test_connect_error_does_not_leak_host_or_key_to_model(monkeypatch, caplog):
+    from tools.places_tool import find_place, FindPlaceArgs
+
+    _set_api_key(monkeypatch, "key")
+    _no_op_cache_and_cap(monkeypatch)
+
+    leaky_detail = (
+        "[Errno 111] Connection refused: internal-host-10-0-4-17.corp.local "
+        "key=AIzaSyFAKE-INTERNAL-LEAK-9999"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(leaky_detail, request=request)
+
+    async def go():
+        async with _mock_client(handler) as client:
+            return await find_place(FindPlaceArgs(query="anywhere"), http_client=client)
+
+    with caplog.at_level(logging.WARNING, logger="tools.places_tool"):
+        result = asyncio.run(go())
+
+    assert result.status == "upstream_error"
+    assert result.error_code == "network_error"
+    assert result.retryable is True
+    assert "internal-host-10-0-4-17.corp.local" not in result.error_message
+    assert "AIzaSyFAKE-INTERNAL-LEAK-9999" not in result.error_message
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "internal-host-10-0-4-17.corp.local" in logged
+    assert "AIzaSyFAKE-INTERNAL-LEAK-9999" in logged
+
+
+# ---------------------------------------------------------------------------
+# WP 1.G2 must-fix 3 — the tuned timeout must apply per-request, even when
+# the injected http_client has none of its own (apps/turtle_server.py's
+# shared client is a plain httpx.AsyncClient() with no timeout set).
+# ---------------------------------------------------------------------------
+
+
+def test_tuned_timeout_applies_even_with_a_timeoutless_injected_client(monkeypatch):
+    from tools.places_tool import find_place, FindPlaceArgs, _DEFAULT_TIMEOUT
+
+    _set_api_key(monkeypatch, "key")
+    _no_op_cache_and_cap(monkeypatch)
+
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["timeout"] = request.extensions.get("timeout")
+        return httpx.Response(200, json={"places": []})
+
+    async def go():
+        # An injected client built with NO timeout of its own — exactly how
+        # apps/turtle_server.py hands its shared http_client to every tool.
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await find_place(FindPlaceArgs(query="anywhere"), http_client=client)
+
+    asyncio.run(go())
+
+    assert seen["timeout"] == {
+        "connect": _DEFAULT_TIMEOUT.connect,
+        "read": _DEFAULT_TIMEOUT.read,
+        "write": _DEFAULT_TIMEOUT.write,
+        "pool": _DEFAULT_TIMEOUT.pool,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Nice-to-have — local-mode in-process dicts stay bounded rather than
+# growing without limit for the lifetime of a long-running dev process.
+# ---------------------------------------------------------------------------
+
+
+def test_in_process_cache_stays_bounded_under_many_distinct_keys():
+    from tools.places_guardrails import InProcessPlacesCache
+
+    cache = InProcessPlacesCache()
+    for i in range(cache._MAX_ENTRIES + 500):
+        cache.set(f"k{i}", i, ttl_seconds=600)
+    assert len(cache._store) <= cache._MAX_ENTRIES
+
+
+def test_in_process_call_limiter_stays_bounded_under_many_distinct_users():
+    from tools.places_guardrails import InProcessPlacesCallLimiter
+
+    limiter = InProcessPlacesCallLimiter(per_day=1000)
+    for i in range(limiter._MAX_USERS + 500):
+        limiter.check_and_record(f"user-{i}")
+    assert len(limiter._events) <= limiter._MAX_USERS
