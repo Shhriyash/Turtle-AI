@@ -176,7 +176,7 @@ class EmailTool:
             )
             
             # Send email via Gmail SMTP
-            with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port) as smtp:
+            with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, timeout=20) as smtp:
                 smtp.login(self.config.sender_email, self.config.sender_passkey)
                 smtp.send_message(msg, to_addrs=all_recipients)
             
@@ -267,7 +267,7 @@ class EmailTool:
             logger.info(f"Attempting to send email to {email_request.receiver}")
             
             # Send email via Gmail SMTP
-            with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port) as smtp:
+            with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, timeout=20) as smtp:
                 smtp.login(self.config.sender_email, self.config.sender_passkey)
                 smtp.send_message(
                     msg,
@@ -336,7 +336,7 @@ class EmailTool:
             
             logger.info("Testing SMTP connection...")
             
-            with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port) as smtp:
+            with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, timeout=20) as smtp:
                 smtp.login(self.config.sender_email, self.config.sender_passkey)
             
             logger.info("SMTP connection test successful")

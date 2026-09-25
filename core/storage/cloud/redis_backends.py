@@ -133,26 +133,71 @@ class RedisChannelGateBuffer:
 _IDEMPOTENCY_WINDOW_S = 60  # Matches tools/idempotency.py's local window.
 _SUCCESS_PREFIX = "Email sent successfully"
 
+# Sentinel written by the reservation itself, before the SMTP call has
+# returned. Keep this message in sync with tools/idempotency.py's local-mode
+# equivalent — both are surfaced verbatim to the model/user.
+_PENDING_SENTINEL = "__pending__"
+_PENDING_MESSAGE = (
+    "An identical email is already being sent (it started moments ago). "
+    "Please wait a few seconds before trying again to avoid sending it twice."
+)
+
+
+class IdempotencyReservationError(RuntimeError):
+    """Raised when Redis could not be reached to take/verify a reservation.
+
+    Fail-closed: callers MUST refuse the send. This is a deliberate flip
+    from the prior behaviour, which caught the exception and treated the
+    invocation as new (fail-open) — meaning a Redis blip used to risk a
+    duplicate send; now it costs the user a refused send instead.
+    """
+
 
 def redis_is_duplicate_invocation(idempotency_key: str) -> Optional[str]:
-    """Drop-in for tools.idempotency.is_duplicate_invocation."""
+    """Reservation-based dedup check, drop-in for tools.idempotency.is_duplicate_invocation.
+
+    Atomically claims `idempotency_key` via SET ... NX EX 60 with a pending
+    sentinel BEFORE the caller sends anything (closing the race where two
+    concurrent identical sends both saw "not yet recorded" and both fired).
+    Returns None when the reservation is acquired, a "still sending" message
+    when another send for this key is mid-flight, or the cached completed
+    result when a prior send already finished within the window.
+
+    Raises IdempotencyReservationError if Redis is unreachable.
+    """
+    key = f"turtle:idem:{idempotency_key}"
     try:
         client = get_redis_sync_client()
-        raw = client.get(f"turtle:idem:{idempotency_key}")
-        return raw if raw is not None else None
+        acquired = client.set(key, _PENDING_SENTINEL, nx=True, ex=_IDEMPOTENCY_WINDOW_S)
+        if acquired:
+            return None
+        raw = client.get(key)
+        if raw is None:
+            # Raced with a concurrent finalize/expiry between the failed SET
+            # and this GET: the key is gone, so retry the reservation once
+            # rather than either sending blind or refusing a legitimate new
+            # send (mirrors the local SQLite path's equivalent race).
+            acquired = client.set(key, _PENDING_SENTINEL, nx=True, ex=_IDEMPOTENCY_WINDOW_S)
+            return None if acquired else _PENDING_MESSAGE
+        if raw == _PENDING_SENTINEL:
+            return _PENDING_MESSAGE
+        return raw
     except Exception as exc:
-        print(f"LOG: Redis idempotency check failed ({exc}), treating as new invocation")
-        return None
+        print(f"LOG: Redis idempotency reservation failed ({exc}) — refusing send (fail closed)")
+        raise IdempotencyReservationError(str(exc)) from exc
 
 
 def redis_record_invocation(idempotency_key: str, result: str) -> None:
-    """Drop-in for tools.idempotency.record_invocation. SETEX gives the same
-    60s dedup horizon as the local SQLite version's created_at_s cutoff, with
-    the expiry enforced by Redis itself instead of a WHERE clause."""
-    if not str(result).startswith(_SUCCESS_PREFIX):
-        return
+    """Finalize a reservation taken by redis_is_duplicate_invocation: overwrite
+    with the completed result on success, or DELETE it on failure so the
+    user's retry is not blocked by a failed send. Drop-in for
+    tools.idempotency.record_invocation."""
+    key = f"turtle:idem:{idempotency_key}"
     try:
         client = get_redis_sync_client()
-        client.set(f"turtle:idem:{idempotency_key}", result, ex=_IDEMPOTENCY_WINDOW_S)
+        if str(result).startswith(_SUCCESS_PREFIX):
+            client.set(key, result, ex=_IDEMPOTENCY_WINDOW_S)
+        else:
+            client.delete(key)
     except Exception as exc:
-        print(f"LOG: Redis idempotency record failed ({exc}) — continuing without idempotency")
+        print(f"LOG: Redis idempotency finalize failed ({exc}) — reservation may linger until its TTL")

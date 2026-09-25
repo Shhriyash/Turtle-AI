@@ -180,6 +180,66 @@ class RedisIdempotencyTest(unittest.TestCase):
         redis_record_invocation("k1", "Email sent successfully! a")
         self.assertIsNone(redis_is_duplicate_invocation("k2"))
 
+    def test_same_key_twice_before_finalize_is_still_in_flight(self) -> None:
+        """Reservation semantics: a second call before record_invocation must
+        NOT get a fresh None (that would let a concurrent send fire) and must
+        not silently claim a result that doesn't exist yet."""
+        from core.storage.cloud.redis_backends import _PENDING_MESSAGE
+
+        self.assertIsNone(redis_is_duplicate_invocation("k1"))
+        self.assertEqual(redis_is_duplicate_invocation("k1"), _PENDING_MESSAGE)
+
+        redis_record_invocation("k1", "Email sent successfully! done")
+        self.assertEqual(
+            redis_is_duplicate_invocation("k1"), "Email sent successfully! done"
+        )
+
+    def test_failed_send_deletes_reservation_allows_retry(self) -> None:
+        self.assertIsNone(redis_is_duplicate_invocation("k1"))
+        redis_record_invocation("k1", "Failed to send email: smtp boom")
+        # Retry is a fresh reservation, not a duplicate.
+        self.assertIsNone(redis_is_duplicate_invocation("k1"))
+
+    def test_two_concurrent_reservations_exactly_one_proceeds(self) -> None:
+        """Simulated concurrency: two callers racing on the same key via the
+        same atomic SET NX — exactly one must get the reservation."""
+        from core.storage.cloud.redis_backends import _PENDING_MESSAGE
+
+        first = redis_is_duplicate_invocation("k1")
+        second = redis_is_duplicate_invocation("k1")
+        results = [first, second]
+        self.assertEqual(results.count(None), 1)
+        self.assertEqual(results.count(_PENDING_MESSAGE), 1)
+
+    def test_redis_unavailable_raises_and_is_fail_closed(self) -> None:
+        """Fail-closed flip: the previous behaviour caught the exception and
+        returned None (fail open — treat as new, proceed to send). Now it
+        must raise so the caller refuses the send instead."""
+        from core.storage.cloud.redis_backends import IdempotencyReservationError
+
+        with patch(
+            "core.storage.cloud.redis_backends.get_redis_sync_client",
+            side_effect=RuntimeError("redis unreachable"),
+        ):
+            with self.assertRaises(IdempotencyReservationError):
+                redis_is_duplicate_invocation("k1")
+
+    def test_cross_tenant_keys_built_via_key_builder_do_not_collide(self) -> None:
+        """Ledger acceptance criterion, exercised through the real key
+        builder: two different user_ids sending the byte-identical email
+        within 60s both get a fresh reservation (both send)."""
+        from tools.idempotency import build_email_idempotency_key
+
+        key_a = build_email_idempotency_key(
+            "usr_a", recipients=["shared@example.com"], subject="Hi", body="Same body", cc=[], bcc=[],
+        )
+        key_b = build_email_idempotency_key(
+            "usr_b", recipients=["shared@example.com"], subject="Hi", body="Same body", cc=[], bcc=[],
+        )
+        self.assertNotEqual(key_a, key_b)
+        self.assertIsNone(redis_is_duplicate_invocation(key_a))
+        self.assertIsNone(redis_is_duplicate_invocation(key_b))
+
 
 if __name__ == "__main__":
     unittest.main()
