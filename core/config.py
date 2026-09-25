@@ -291,7 +291,7 @@ class TurtleSettings(BaseSettings):
         return normalize_channel_signup(value)
 
     # WP1.D2 (ledger 1a.4 part 4): per-tenant daily token budget, enforced in
-    # cloud mode only (see apps/turtle_server.py's _daily_spend_check —
+    # cloud mode only (see apps/turtle_server.py's _reserve_daily_spend —
     # local mode has no Redis and this is simply not metered there). 0 or
     # negative disables the budget outright (unmetered for everyone).
     daily_token_budget: int = Field(
