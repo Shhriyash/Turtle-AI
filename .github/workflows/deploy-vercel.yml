@@ -102,11 +102,13 @@ jobs:
         id: healthz
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           DEPLOY_URL: ${{ steps.deploy.outputs.url }}
         run: |
           set -euo pipefail
           response=$(timeout 30 vercel curl /healthz \
-            --deployment "$DEPLOY_URL" --yes --token="$VERCEL_TOKEN" \
+            --deployment "$DEPLOY_URL" --yes \
             -- --silent --show-error --max-time 20 -w '\n%{http_code}')
           http_code=$(echo "$response" | tail -n1)
           body=$(echo "$response" | sed '$d')
@@ -133,11 +135,13 @@ jobs:
         id: readyz
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           DEPLOY_URL: ${{ steps.deploy.outputs.url }}
         run: |
           set -euo pipefail
           response=$(timeout 30 vercel curl /readyz \
-            --deployment "$DEPLOY_URL" --yes --token="$VERCEL_TOKEN" \
+            --deployment "$DEPLOY_URL" --yes \
             -- --silent --show-error --max-time 20 -w '\n%{http_code}')
           http_code=$(echo "$response" | tail -n1)
           body=$(echo "$response" | sed '$d')
