@@ -36,6 +36,9 @@ A ranked list of places. Each entry carries: name, address, Google Maps URL, web
 - **credentials_missing**: `GOOGLE_MAPS_API_KEY` not configured — tell the user Maps lookup is unavailable and suggest search_web as a fallback.
 - **empty**: No matches — broaden the query or ask the user for a clarifying landmark. Do NOT invent an address.
 - **auth_failed**: The API key is present but rejected — usually a missing "Places API (New)" enablement or a referrer/IP restriction. Tell the user briefly.
+- **rate_limited**: Either Google itself is rate-limiting requests, or this account has hit its daily cap on Places/Directions lookups. Tell the user to try again later — do not retry immediately.
+
+Note: identical searches (same query, result count, and location bias) made within about 10 minutes are served from a cache, so re-issuing the same search is cheap — but you should still prefer reusing an earlier result already in the conversation over calling the tool again.
 
 ## Examples
 

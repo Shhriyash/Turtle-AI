@@ -84,6 +84,59 @@ def get_ws_rate_limiter() -> Any:
     return _rate_limiter
 
 
+_places_cache: Any = None
+_places_call_limiter: Any = None
+
+
+def get_places_cache() -> Any:
+    """In-process TTL cache locally, Redis-backed in cloud mode, for
+    tools/places_tool.py's Places/Routes API responses.
+
+    See tools/places_guardrails.py for both implementations and the full
+    rationale for why this cache is keyed GLOBALLY (never per-user/tenant).
+    Cached the same way the other singletons on this page are: one instance
+    per process, since InProcessPlacesCache's dict IS the storage locally
+    (a fresh instance per call would cache nothing) and RedisPlacesCache is
+    stateless but cheap to reuse.
+    """
+    global _places_cache
+    if _places_cache is not None:
+        return _places_cache
+    if settings.is_cloud:
+        from tools.places_guardrails import RedisPlacesCache
+
+        _places_cache = RedisPlacesCache()
+    else:
+        from tools.places_guardrails import InProcessPlacesCache
+
+        _places_cache = InProcessPlacesCache()
+    return _places_cache
+
+
+def get_places_call_limiter() -> Any:
+    """Per-user daily call cap for tools/places_tool.py.
+
+    Own Redis/in-process key namespace (turtle:places_cap:v1:) — deliberately
+    NOT get_ws_rate_limiter()'s turtle:ws_rate: keyspace. See
+    tools/places_guardrails.py's module docstring for why a shared keyspace
+    would double-count a places call against the inbound-message budget.
+    Singleton-cached for the same reason get_ws_rate_limiter() is: the
+    in-process counters ARE the state between calls.
+    """
+    global _places_call_limiter
+    if _places_call_limiter is not None:
+        return _places_call_limiter
+    if settings.is_cloud:
+        from tools.places_guardrails import RedisPlacesCallLimiter
+
+        _places_call_limiter = RedisPlacesCallLimiter()
+    else:
+        from tools.places_guardrails import InProcessPlacesCallLimiter
+
+        _places_call_limiter = InProcessPlacesCallLimiter()
+    return _places_call_limiter
+
+
 def get_link_code_store() -> Any:
     """core.account_linking.LinkCodeStore(identity_manager.db_path) locally,
     PostgresLinkCodeStore in cloud mode.
