@@ -84,16 +84,41 @@ function scrollPanelToBottom() {
 // ── Message rendering ────────────────────────────────────────
 
 /**
+ * WP1.H: resolve the allow-list `formatMessage` should use for a message,
+ * given its role and whatever `toolUrls` the caller passed.
+ *
+ * The safe/unsafe default is keyed off `role`, NOT off whether the caller
+ * remembered to pass `toolUrls` — a `done` frame missing the `tool_urls` key
+ * entirely (the budget-refusal frame deliberately omits it, since no tool
+ * ran) or a call site that forgets the third argument must both fail CLOSED
+ * (nothing linkified), never silently reopen the old unrestricted
+ * behaviour. So: for `role === 'assistant'`, a non-array `toolUrls`
+ * (undefined, missing, anything else) is normalised to `[]` — restrictive.
+ * `role === 'user'` always gets the unrestricted legacy behaviour
+ * (`undefined`) regardless of `toolUrls`, because that text is the user's
+ * own trusted input, never attacker-influenced tool output.
+ *
+ * Exported (pure, no DOM) so this exact fail-closed mapping is unit
+ * testable without a DOM shim.
+ * @param {'user'|'assistant'} role
+ * @param {string[]|undefined} toolUrls
+ * @returns {string[]|undefined}
+ */
+export function resolveToolUrlsForRole(role, toolUrls) {
+    if (role === 'user') return undefined;
+    return Array.isArray(toolUrls) ? toolUrls : [];
+}
+
+/**
  * Add a message to the response panel.
  * @param {'user'|'assistant'} role
  * @param {string} text
  * @param {string[]|undefined} toolUrls - WP1.H: URLs the server confirms came
- *   from a tool result THIS turn (the "done" frame's `tool_urls`). When
- *   provided, only URLs in this list are rendered as clickable anchors — a
- *   URL the model merely wrote in prose, that no tool returned, renders as
- *   plain text. `undefined` (the legacy call shape, still used for the
- *   user's own typed message, which is trusted input — not attacker text)
- *   keeps the old unrestricted linkify behaviour.
+ *   from a tool result THIS turn (the "done" frame's `tool_urls`). Only
+ *   URLs in this list are rendered as clickable anchors for an ASSISTANT
+ *   message — a URL the model merely wrote in prose, that no tool returned,
+ *   renders as plain text. See resolveToolUrlsForRole for the fail-closed
+ *   defaulting rule applied here.
  */
 export function addMessage(role, text, toolUrls) {
     openResponsePanel();
@@ -108,9 +133,11 @@ export function addMessage(role, text, toolUrls) {
     label.className = 'panel-msg-label';
     label.textContent = role === 'user' ? 'You' : 'Turtle';
 
+    const effectiveToolUrls = resolveToolUrlsForRole(role, toolUrls);
+
     const content = document.createElement('div');
     content.className = 'panel-msg-content';
-    content.innerHTML = formatMessage(text, toolUrls);
+    content.innerHTML = formatMessage(text, effectiveToolUrls);
 
     msg.appendChild(label);
     msg.appendChild(content);
@@ -138,9 +165,12 @@ function safeHost(url) {
  * https://reuters.com/anything-it-invents into a link — same host, but the
  * path wasn't part of any tool result.
  *
- * `toolUrls === undefined` means "no allow-list was supplied" (the legacy
- * call shape) and everything is allowed, preserving old behaviour for the
- * user's own trusted, self-typed message.
+ * `toolUrls === undefined` means everything is allowed — but by the time
+ * formatMessage sees this, `addMessage` has already collapsed that sentinel
+ * down to only the `role === 'user'` case (trusted, self-typed input).
+ * Every assistant call always arrives here with a real array, even an empty
+ * one, so a missing/malformed allow-list for an assistant message can never
+ * be misread as "unrestricted" this far down the call chain either.
  */
 function isAllowedUrl(url, toolUrls) {
     if (toolUrls === undefined) return true;
