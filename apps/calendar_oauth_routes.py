@@ -106,7 +106,7 @@ async def _read_token(user_id: str) -> str | None:
         stored = path.read_text(encoding="utf-8") if path.exists() else None
     if stored is None:
         return None
-    plaintext, _key_version = decrypt_stored(stored, _token_key())
+    plaintext, _key_version = decrypt_stored(stored, _token_key(), user_id=user_id)
     return plaintext
 
 
@@ -119,7 +119,9 @@ async def _write_token(user_id: str, token_json: str) -> None:
     from core.calendar_token_crypto import CalendarTokenKeyRequired, encrypt_for_storage
 
     try:
-        stored = encrypt_for_storage(token_json, _token_key(), is_cloud=settings.is_cloud)
+        stored = encrypt_for_storage(
+            token_json, _token_key(), is_cloud=settings.is_cloud, user_id=user_id
+        )
     except CalendarTokenKeyRequired as exc:
         logger.error("calendar oauth: refusing to store token unencrypted: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -436,23 +438,37 @@ _CURRENT_SCOPE_MARKER = "calendar.events"
 def _scope_is_stale(token_json: str) -> bool:
     """True when the stored token's granted scope predates the
     calendar.events narrowing (WP1.E2) — i.e. it still carries the old full
-    read/write ``https://www.googleapis.com/auth/calendar`` grant (or
-    anything else that doesn't include calendar.events). Drives the
+    read/write ``https://www.googleapis.com/auth/calendar`` grant, OR its
+    scope cannot be confirmed as calendar.events at all. Drives the
     "Reconnect Calendar" prompt: /status reports it, web/js/calendar.js
     renders it.
 
     Google's token endpoint echoes back the space-separated scopes actually
     granted in the "scope" field of the token response, which is exactly
-    what gets persisted verbatim in token_json — no separate bookkeeping
-    needed, this just reads what is already there.
+    what gets persisted verbatim in token_json — every token minted through
+    /callback has this field (RFC 6749 + Google's own documented behaviour
+    for the authorization_code grant), so a missing/empty scope in practice
+    means a manually-pasted or legacy token (the GOOGLE_CALENDAR_TOKEN_JSON
+    env-var path), not a normal connect.
+
+    An absent/empty scope counts as STALE, not "unknown, don't nag": the
+    two wrong answers are not symmetric. A false "stale" costs the user one
+    click on an advisory prompt they didn't strictly need. A false
+    "not stale" means a token still holding the old over-broad grant is
+    never flagged, defeating the entire purpose of this item for that user,
+    silently and permanently. When we cannot confirm the narrow scope, we
+    must not default to treating it as already narrow.
     """
     try:
         data = json.loads(token_json)
     except (json.JSONDecodeError, TypeError):
-        return False  # can't tell; don't nag on unparseable data
+        return False  # malformed token_json entirely — a different failure
+        # mode than "no scope field" (this should not happen for anything
+        # this module itself ever wrote); not worth nagging over.
     scope_field = data.get("scope")
-    if not scope_field or not isinstance(scope_field, str):
-        return False  # no scope recorded (older/manual token) — don't nag on missing data
+    if not isinstance(scope_field, str) or not scope_field.strip():
+        return True  # missing/empty/whitespace-only scope — cannot confirm
+        # calendar.events, so treat as stale (see docstring above).
     return not any(_CURRENT_SCOPE_MARKER in s for s in scope_field.split())
 
 

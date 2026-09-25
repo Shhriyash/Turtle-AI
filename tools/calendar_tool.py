@@ -206,7 +206,7 @@ def _load_token_json(user_id: Optional[str]) -> Optional[str]:
 
                 key_secret = settings.calendar_token_key
                 key = parse_key(key_secret.get_secret_value()) if key_secret is not None else None
-                token_json, _key_version = decrypt_stored(stored, key)
+                token_json, _key_version = decrypt_stored(stored, key, user_id=user_id)
                 return token_json
             except Exception:
                 pass  # fall through to the legacy env var

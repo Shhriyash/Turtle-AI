@@ -305,7 +305,9 @@ def test_write_token_uses_postgres_in_cloud_mode(monkeypatch):
     assert stored_user_id == "usr_a"
     assert stored_value != '{"refresh_token": "x"}'
     assert "refresh_token" not in stored_value  # not readable as the original token
-    plaintext, key_version = decrypt_stored(stored_value, parse_key(_TEST_TOKEN_KEY_B64))
+    plaintext, key_version = decrypt_stored(
+        stored_value, parse_key(_TEST_TOKEN_KEY_B64), user_id="usr_a"
+    )
     assert plaintext == '{"refresh_token": "x"}'
     assert key_version == 1
 
@@ -464,7 +466,9 @@ def test_plaintext_token_readable_after_deploy_and_reencrypted_on_write(monkeypa
     asyncio.run(oauth_routes._write_token("usr_a", '{"refresh_token": "post-migration"}'))
     on_disk = pre_migration_path.read_text(encoding="utf-8")
     assert "refresh_token" not in on_disk
-    plaintext, key_version = decrypt_stored(on_disk, parse_key(_TEST_TOKEN_KEY_B64))
+    plaintext, key_version = decrypt_stored(
+        on_disk, parse_key(_TEST_TOKEN_KEY_B64), user_id="usr_a"
+    )
     assert plaintext == '{"refresh_token": "post-migration"}'
     assert key_version == 1
 
@@ -608,6 +612,43 @@ def test_status_not_connected_when_no_token(monkeypatch):
     assert result == {"connected": False, "scope_stale": False}
 
 
+@pytestmark_fastapi
+@pytest.mark.parametrize(
+    "token_json",
+    [
+        json.dumps({"refresh_token": "rt"}),  # scope field entirely absent
+        json.dumps({"refresh_token": "rt", "scope": ""}),  # empty string
+        json.dumps({"refresh_token": "rt", "scope": "   "}),  # whitespace-only
+    ],
+    ids=["absent", "empty", "whitespace-only"],
+)
+def test_status_treats_missing_or_empty_scope_as_stale(monkeypatch, token_json):
+    """Owner ruling on WP1.E2: an absent/empty/whitespace-only scope cannot
+    be confirmed as calendar.events, so it counts as STALE — not "unknown,
+    don't nag". The asymmetry: a false "stale" costs one click on an
+    advisory prompt; a false "not stale" means a token still on the old
+    over-broad grant is never flagged, defeating the item's purpose for
+    that user, silently and permanently. Every token minted through
+    /callback has a scope field (RFC 6749 + Google's documented behaviour
+    for the authorization_code grant), so this bucket is reached only by
+    manually-pasted/legacy tokens (GOOGLE_CALENDAR_TOKEN_JSON), not normal
+    connects — this is not expected to fire for everyday users."""
+    import apps.calendar_oauth_routes as oauth_routes
+
+    fake_settings = mock.MagicMock()
+    fake_settings.is_cloud = False
+    fake_settings.calendar_token_key = None
+    monkeypatch.setattr(oauth_routes, "settings", fake_settings)
+    monkeypatch.setattr(oauth_routes, "_require_user", lambda req: "u123")
+    monkeypatch.setattr(
+        oauth_routes, "_read_token", mock.AsyncMock(return_value=token_json)
+    )
+
+    fake_req = mock.MagicMock()
+    result = asyncio.run(oauth_routes.status(fake_req))
+    assert result == {"connected": True, "scope_stale": True}
+
+
 # ---------------------------------------------------------------------------
 # core.calendar_token_crypto — key parsing, envelope encrypt/decrypt, nonce
 # freshness.
@@ -687,9 +728,9 @@ def test_encrypt_for_storage_roundtrips():
     from core.calendar_token_crypto import decrypt_stored, encrypt_for_storage, parse_key
 
     key = parse_key(_TEST_TOKEN_KEY_B64)
-    stored = encrypt_for_storage('{"refresh_token": "abc"}', key, is_cloud=True)
+    stored = encrypt_for_storage('{"refresh_token": "abc"}', key, is_cloud=True, user_id="usr_a")
     assert "refresh_token" not in stored
-    plaintext, key_version = decrypt_stored(stored, key)
+    plaintext, key_version = decrypt_stored(stored, key, user_id="usr_a")
     assert plaintext == '{"refresh_token": "abc"}'
     assert key_version == 1
 
@@ -698,24 +739,41 @@ def test_encrypt_for_storage_cloud_without_key_raises():
     from core.calendar_token_crypto import CalendarTokenKeyRequired, encrypt_for_storage
 
     with pytest.raises(CalendarTokenKeyRequired):
-        encrypt_for_storage('{"refresh_token": "abc"}', None, is_cloud=True)
+        encrypt_for_storage('{"refresh_token": "abc"}', None, is_cloud=True, user_id="usr_a")
 
 
 def test_encrypt_for_storage_local_without_key_is_plaintext():
     from core.calendar_token_crypto import encrypt_for_storage
 
-    stored = encrypt_for_storage('{"refresh_token": "abc"}', None, is_cloud=False)
+    stored = encrypt_for_storage('{"refresh_token": "abc"}', None, is_cloud=False, user_id="usr_a")
     assert stored == '{"refresh_token": "abc"}'
 
 
 def test_decrypt_stored_plaintext_passthrough():
     """A bare (pre-encryption) token is read back unchanged, key_version 0,
-    with no key required."""
+    with no key required — and, per WP1.E2's AAD follow-up, no user_id
+    dependency at all: a missing or wrong user_id must not break this path,
+    since plaintext reads never touch AES-GCM/AAD in the first place."""
     from core.calendar_token_crypto import decrypt_stored
 
-    plaintext, key_version = decrypt_stored('{"refresh_token": "abc"}', None)
+    plaintext, key_version = decrypt_stored('{"refresh_token": "abc"}', None, user_id="usr_a")
     assert plaintext == '{"refresh_token": "abc"}'
     assert key_version == 0
+
+    # Same plaintext, decrypted under a DIFFERENT (or nonsense) user_id —
+    # still succeeds unchanged, proving the plaintext path is genuinely
+    # AAD-independent, not just untested with a mismatched value.
+    plaintext_other, key_version_other = decrypt_stored(
+        '{"refresh_token": "abc"}', None, user_id="someone-else-entirely"
+    )
+    assert plaintext_other == '{"refresh_token": "abc"}'
+    assert key_version_other == 0
+
+    plaintext_empty, key_version_empty = decrypt_stored(
+        '{"refresh_token": "abc"}', None, user_id=""
+    )
+    assert plaintext_empty == '{"refresh_token": "abc"}'
+    assert key_version_empty == 0
 
 
 def test_decrypt_stored_envelope_without_key_raises():
@@ -726,11 +784,11 @@ def test_decrypt_stored_envelope_without_key_raises():
     )
 
     key = parse_key(_TEST_TOKEN_KEY_B64)
-    stored = encrypt_for_storage('{"refresh_token": "abc"}', key, is_cloud=True)
+    stored = encrypt_for_storage('{"refresh_token": "abc"}', key, is_cloud=True, user_id="usr_a")
     with pytest.raises(CalendarTokenDecryptError):
         from core.calendar_token_crypto import decrypt_stored
 
-        decrypt_stored(stored, None)
+        decrypt_stored(stored, None, user_id="usr_a")
 
 
 def test_decrypt_stored_envelope_wrong_key_raises():
@@ -743,9 +801,34 @@ def test_decrypt_stored_envelope_wrong_key_raises():
 
     key1 = parse_key(_TEST_TOKEN_KEY_B64)
     key2 = parse_key(_TEST_TOKEN_KEY_B64_2)
-    stored = encrypt_for_storage('{"refresh_token": "abc"}', key1, is_cloud=True)
+    stored = encrypt_for_storage('{"refresh_token": "abc"}', key1, is_cloud=True, user_id="usr_a")
     with pytest.raises(CalendarTokenDecryptError):
-        decrypt_stored(stored, key2)
+        decrypt_stored(stored, key2, user_id="usr_a")
+
+
+def test_decrypt_stored_envelope_wrong_user_id_raises():
+    """AAD binding: a blob encrypted for user A must fail to decrypt under
+    user B's user_id, even with the correct key — proves the ciphertext is
+    cryptographically tied to the identity it was stored under, not just
+    protected by the key."""
+    from core.calendar_token_crypto import (
+        CalendarTokenDecryptError,
+        decrypt_stored,
+        encrypt_for_storage,
+        parse_key,
+    )
+
+    key = parse_key(_TEST_TOKEN_KEY_B64)
+    stored = encrypt_for_storage(
+        '{"refresh_token": "abc"}', key, is_cloud=True, user_id="user-a"
+    )
+    with pytest.raises(CalendarTokenDecryptError):
+        decrypt_stored(stored, key, user_id="user-b")
+
+    # The correct user_id still works on the exact same stored value.
+    plaintext, key_version = decrypt_stored(stored, key, user_id="user-a")
+    assert plaintext == '{"refresh_token": "abc"}'
+    assert key_version == 1
 
 
 def test_encrypting_same_plaintext_twice_produces_different_ciphertext():
@@ -755,8 +838,12 @@ def test_encrypting_same_plaintext_twice_produces_different_ciphertext():
     from core.calendar_token_crypto import encrypt_for_storage, parse_key
 
     key = parse_key(_TEST_TOKEN_KEY_B64)
-    stored_1 = encrypt_for_storage('{"refresh_token": "same-plaintext"}', key, is_cloud=True)
-    stored_2 = encrypt_for_storage('{"refresh_token": "same-plaintext"}', key, is_cloud=True)
+    stored_1 = encrypt_for_storage(
+        '{"refresh_token": "same-plaintext"}', key, is_cloud=True, user_id="usr_a"
+    )
+    stored_2 = encrypt_for_storage(
+        '{"refresh_token": "same-plaintext"}', key, is_cloud=True, user_id="usr_a"
+    )
     assert stored_1 != stored_2
 
     blob_1 = json.loads(stored_1)["blob"]
@@ -766,6 +853,27 @@ def test_encrypting_same_plaintext_twice_produces_different_ciphertext():
     nonce_1 = base64.b64decode(blob_1)[:12]
     nonce_2 = base64.b64decode(blob_2)[:12]
     assert nonce_1 != nonce_2
+
+
+def test_parse_envelope_rejects_plaintext_json_with_envelope_like_keys():
+    """Tightened envelope detection: a plaintext blob that HAPPENS to be
+    JSON containing literal "key_version"/"blob" keys (not reachable through
+    Google's real token response shape) must not be misdetected as an
+    encrypted envelope — key_version must be a real int >= 1 and blob must
+    base64-decode to at least a nonce's worth of bytes."""
+    from core.calendar_token_crypto import decrypt_stored
+
+    # blob is not valid base64 of nonce-length-or-more bytes.
+    fake = json.dumps({"key_version": 1, "blob": "not-base64!!!"})
+    plaintext, key_version = decrypt_stored(fake, None, user_id="usr_a")
+    assert plaintext == fake
+    assert key_version == 0
+
+    # Extra keys beyond exactly {"key_version", "blob"} — not our envelope shape.
+    fake2 = json.dumps({"key_version": 1, "blob": "AAAAAAAAAAAAAAAAAAAAAAAA", "extra": "x"})
+    plaintext2, key_version2 = decrypt_stored(fake2, None, user_id="usr_a")
+    assert plaintext2 == fake2
+    assert key_version2 == 0
 
 
 # ---------------------------------------------------------------------------
@@ -793,7 +901,7 @@ def test_load_token_json_decrypts_local_mode(tmp_path, monkeypatch):
     user_id = "u123"
     token_path = fake_personal_memory_dir(user_id) / "google_calendar_token.json"
     encrypted = encrypt_for_storage(
-        json.dumps({"refresh_token": "per-user-token"}), key, is_cloud=False
+        json.dumps({"refresh_token": "per-user-token"}), key, is_cloud=False, user_id=user_id
     )
     assert "refresh_token" not in encrypted
     token_path.write_text(encrypted, encoding="utf-8")
@@ -815,7 +923,7 @@ def test_load_token_json_decrypts_cloud_mode(monkeypatch):
     monkeypatch.setattr(ct, "settings", fake_settings)
 
     encrypted = encrypt_for_storage(
-        json.dumps({"refresh_token": "cloud-token"}), key, is_cloud=True
+        json.dumps({"refresh_token": "cloud-token"}), key, is_cloud=True, user_id="u123"
     )
     with mock.patch(
         "core.storage.cloud.calendar_token_store.get_token_json",
