@@ -16,11 +16,18 @@ name: deploy-vercel
 # was not this workflow's deploy). That hole is now closed in-repo:
 # vercel.json sets `git.deploymentEnabled: false`, which turns off
 # Git-triggered auto-deployment for every branch and leaves this workflow
-# as the sole way anything reaches Vercel. That setting does NOT affect
-# `vercel deploy`/`vercel promote` run from the CLI with a token (as this
-# workflow does) — those go through the API, not the Git webhook. Do not
-# remove `git.deploymentEnabled` from vercel.json; doing so silently
-# re-opens this race.
+# as the sole way anything reaches Vercel. This does not block the CLI path
+# this workflow uses: on deploy-vercel run 36143665574 (deploy-preview, from
+# commit 269a69f, which already carried the flag), `vercel deploy --token`
+# still succeeded and produced a live preview
+# (turtle-evmualrd4-sheshs-projects-3450851d.vercel.app), while Vercel's Git
+# integration created zero deployments for that same commit (checked 3m32s
+# after the push, versus a 34s baseline for a `vercel[bot]` Preview record
+# on commit ac0ddf7 before this flag existed) — likely because the CLI/API
+# path and the Git webhook are separate, though that internal mechanism
+# isn't independently confirmed, just observed to hold here. Do not remove
+# `git.deploymentEnabled` from vercel.json; doing so silently re-opens this
+# race.
 on:
   workflow_run:
     workflows: ["tests"]
