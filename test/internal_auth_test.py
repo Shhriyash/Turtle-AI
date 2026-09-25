@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -313,6 +314,97 @@ class RealRedisDriverFailureTest(unittest.IsolatedAsyncioTestCase):
             stall_forever.set()
             server.close()
             await server.wait_closed()
+
+
+class SyncRedisClientStallingTest(unittest.IsolatedAsyncioTestCase):
+    """Coordinator follow-up: core/storage/cloud/__init__.py's
+    get_redis_sync_client() (used by core/guardrails.py's WebSocketRateLimiter,
+    core/channel_gate.py's ChannelGateBuffer and tools/idempotency.py via
+    core/storage/cloud/redis_backends.py — none of which this test file
+    otherwise owns) had no socket timeouts either, and unlike the async
+    client its commands run SYNCHRONOUSLY on the event-loop thread — a stall
+    there freezes the whole server, not just one caller. This test targets
+    get_redis_sync_client() directly (the one function in this file this WP
+    was narrowly granted), not the redis_backends.py wrappers, which belong
+    to a different WP. Placed here (rather than test/redis_backends_test.py,
+    which this WP does not own) because it exercises core/storage/cloud's
+    own accessor, not the higher-level wrappers; flagged to the coordinator
+    for relocation if a better home exists.
+    """
+
+    async def test_sync_client_against_a_stalling_redis_is_bounded(self) -> None:
+        import socket
+
+        import core.storage.cloud as cloud_mod
+
+        stall_forever = threading.Event()
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+
+        def _accept_and_stall() -> None:
+            # Accept the connection but never write a response and never
+            # close — simulates a Redis that stalls rather than refuses.
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            stall_forever.wait(timeout=10.0)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+        server_thread = threading.Thread(target=_accept_and_stall, daemon=True)
+        server_thread.start()
+
+        orig_client = cloud_mod._redis_sync_client
+        orig_url = cloud_mod.settings.redis_url_primary
+        try:
+            from pydantic import SecretStr
+
+            cloud_mod._redis_sync_client = None
+            cloud_mod.settings.redis_url_primary = SecretStr(f"redis://127.0.0.1:{port}/0")
+
+            start = time.monotonic()
+            with self.assertRaises(Exception) as ctx:
+                # get_redis_sync_client() is itself synchronous (that's the
+                # whole point — it's called with no `await` at its real call
+                # sites), so call it directly, off the test's own event loop
+                # thread via asyncio.to_thread purely so this ONE test can
+                # await a bounded wall-clock assertion without blocking the
+                # test runner's loop; get_redis_sync_client()'s production
+                # callers do NOT do this (that's exactly the bug this WP is
+                # documenting, not fixing — fixing it is out of this WP's
+                # file ownership).
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._make_call, cloud_mod), timeout=8.0
+                )
+            elapsed = time.monotonic() - start
+            # Worst case for one command is socket_connect_timeout +
+            # socket_timeout (2.0s with the values get_redis_sync_client()
+            # now uses). A generous ceiling well under "hangs forever".
+            self.assertLess(elapsed, 5.0)
+            # A redis-py TimeoutError (subclass of redis.exceptions.RedisError)
+            # is what a bounded stall actually raises.
+            import redis.exceptions
+
+            self.assertIsInstance(ctx.exception, redis.exceptions.RedisError)
+        finally:
+            stall_forever.set()
+            try:
+                listener.close()
+            except OSError:
+                pass
+            server_thread.join(timeout=2.0)
+            cloud_mod._redis_sync_client = orig_client
+            cloud_mod.settings.redis_url_primary = orig_url
+
+    @staticmethod
+    def _make_call(cloud_mod) -> None:
+        client = cloud_mod.get_redis_sync_client()
+        client.set("turtle:test:stall-probe", "1")
 
 
 if __name__ == "__main__":

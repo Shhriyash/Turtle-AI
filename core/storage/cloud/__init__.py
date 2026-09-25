@@ -215,7 +215,27 @@ def get_redis_sync_client() -> Any:
         )
     import redis  # local import: optional dep
 
-    _redis_sync_client = redis.from_url(url, decode_responses=True)
+    # WP 1.B / S-7.3 follow-up (coordinator-flagged): this client runs its
+    # commands SYNCHRONOUSLY, directly on the event-loop thread (see the
+    # docstring above) — a stalling Redis here doesn't just hang the one
+    # caller, it freezes the WHOLE server, every connected websocket user,
+    # for as long as the stall lasts. That's a STRICTLY WORSE blast radius
+    # than the async client's (bounded to Discord's 3s ACK deadline above),
+    # which is why this uses the SAME 1.0s connect / 1.0s socket bound
+    # rather than a more generous one: none of this client's callers (the
+    # WS rate limiter, the channel-gate buffer, tools/idempotency.py's
+    # Redis-backed dedup) sits under a hard external deadline the way
+    # Discord's self-invoke does, but a longer timeout here would extend an
+    # outage's freeze to every concurrent user rather than just the caller
+    # that hit it, which is a worse trade than a tighter bound risking an
+    # occasional false-positive timeout against a healthy backend. If a
+    # real deploy ever needs slack beyond 1.0s/1.0s for a genuinely slow
+    # (not stalled) Redis, the right fix is moving these callers off the
+    # loop thread via asyncio.to_thread (the pattern ledger item 1a.7 used
+    # for SMTP), not loosening this bound.
+    _redis_sync_client = redis.from_url(
+        url, decode_responses=True, socket_connect_timeout=1.0, socket_timeout=1.0
+    )
     return _redis_sync_client
 
 
