@@ -170,10 +170,10 @@ def _decrypt_blob(blob_b64: str, key: bytes, aad: bytes) -> str:
         return aesgcm.decrypt(nonce, ciphertext, aad).decode("utf-8")
     except InvalidTag as exc:
         # Covers three distinct causes with one exception type: wrong
-        # CALENDAR_TOKEN_KEY, wrong/mismatched user_id (AAD), or genuine
-        # tampering — GCM's authentication tag does not distinguish them,
-        # so neither do we. The message says all three rather than
-        # implying only one.
+        # CALENDAR_TOKEN_KEY, a wrong or mismatched user_id (AAD), or
+        # genuine tampering — GCM's authentication tag does not
+        # distinguish them, so neither do we. The message says all three
+        # rather than implying only one.
         raise CalendarTokenDecryptError(
             "Calendar token ciphertext failed authentication — wrong "
             "CALENDAR_TOKEN_KEY, a user_id mismatch, or the stored value "

@@ -1,0 +1,28 @@
+# Reviewed, non-findings only. Every entry below is a specific fingerprint
+# (commit:file:rule-id:line) that a human read and confirmed is NOT a
+# secret. Do not add a bare path or a bare rule-id here: a path entry would
+# silently blind the scanner to a future REAL secret added to that file, and
+# a rule entry would blind it to that rule repo-wide. Two fingerprints,
+# nothing broader.
+#
+# ledger 1b.6 follow-up. core/calendar_token_crypto.py's `generic-api-key`
+# rule was matching the prose "wrong/mismatched" in a comment (the
+# slash-joined pair, sitting right below the literal string
+# "CALENDAR_TOKEN_KEY", reads like an assigned secret to the rule's
+# entropy heuristic). The comment was reworded in commit 2f97f44
+# ("a wrong or mismatched user_id" — no slash) and verified clean on an
+# isolated branch (CI run 36196179980: 1 commit scanned, 0 leaks). That fix
+# cannot reach these two entries: they are two EARLIER, already-committed
+# commits whose diffs contain the pre-reword phrasing forever — git history
+# is immutable, so `git log -p` will show the old wording in these two
+# commits' patches on every future scan that includes them, regardless of
+# what the file looks like today.
+#
+# These entries exist ONLY because those two commits are still unmerged
+# into main (fix/p1-wave3b-calendar-tokens -> fix/p1-wave4-guardrails).
+# Once they land on main, no future branch's merge-base range will reach
+# back far enough to include them, gitleaks will never scan their diffs
+# again, and these two lines become dead weight — delete them at that
+# point rather than leaving them to accumulate.
+8b6f884c434e74de746b97492c3da84bb59e11fa:core/calendar_token_crypto.py:generic-api-key:173
+9b4ae9f2e8bebd85422fe1455d8de059235e51a4:core/calendar_token_crypto.py:generic-api-key:173
