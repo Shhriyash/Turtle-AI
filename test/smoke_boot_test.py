@@ -35,9 +35,16 @@ class BootSmoke(unittest.TestCase):
         self.client = TestClient(turtle_server.app)
 
     def test_healthz_returns_ok(self) -> None:
+        # WP0.A: /healthz also reports the build SHA (read from TURTLE_BUILD_SHA)
+        # so a deploy can prove which commit it is serving. Assert the contract
+        # CI relies on directly — status is "ok" and the "sha" key is always
+        # present (it may be null when TURTLE_BUILD_SHA is unset) — rather than
+        # an exact-dict match that would break the moment a new key is added.
         resp = self.client.get("/healthz")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json(), {"status": "ok"})
+        body = resp.json()
+        self.assertEqual(body.get("status"), "ok")
+        self.assertIn("sha", body)
 
     def test_api_config_returns_dict(self) -> None:
         resp = self.client.get("/api/config")

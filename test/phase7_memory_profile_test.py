@@ -4,6 +4,7 @@ import importlib
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 import core.paths as paths
 from core.personal_memory_store import PersonalMemoryStore
@@ -61,6 +62,22 @@ def test_profile_returns_stored_topics(pm_root, monkeypatch):
 
 def test_profile_unauthorized_in_cloud(pm_root, monkeypatch):
     monkeypatch.setattr(turtle_server.settings, "deploy_mode", "cloud", raising=False)
+    # WP0.A: cloud startup now refuses to boot without DATABASE_URL/REDIS_URL
+    # (a deploy that cannot reach its backends should not serve). Fake, obviously
+    # non-real values so the startup hook is satisfied and this test can get to
+    # the auth behaviour it actually cares about. Do not strip these as noise.
+    monkeypatch.setattr(
+        turtle_server.settings,
+        "database_url",
+        SecretStr("postgresql://fake:fake@fake-neon.example/db"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        turtle_server.settings,
+        "redis_url_primary",
+        SecretStr("redis://fake-upstash.example:6379"),
+        raising=False,
+    )
     with TestClient(app) as client:
         r = client.get("/api/memory/profile")  # no Bearer, cloud → no local fallback
     assert r.status_code == 401

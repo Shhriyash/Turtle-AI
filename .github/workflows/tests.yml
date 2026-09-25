@@ -49,3 +49,69 @@ jobs:
         # Boot smoke (app imports + /healthz + /api/config + /) rides the suite
         # via test/smoke_boot_test.py, so no separate CI boot job is needed.
         run: python -m pytest test -q
+
+  cloud-tests:
+    # WP0.C (ledger 0.4 / S-9.5): runs test/cloud_integration/ against a REAL
+    # Postgres + Redis, TURTLE_DEPLOY=cloud. The `tests` job above only ever
+    # exercises the cloud stores through SQL-prefix fakes (test/cloud_storage_test.py
+    # et al) — those can't catch a wrong placeholder or column name. This job
+    # is what does: every cloud store in core/storage/cloud/ builds its own
+    # schema from an empty database here and round-trips through its own
+    # public read/write methods.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # The pgvector-bundled image, not plain postgres — CREATE EXTENSION
+        # vector (core/storage/cloud/__init__.py's get_pg_pool) fails on the
+        # bare image.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TURTLE_DEPLOY: cloud
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      REDIS_URL: redis://localhost:6379
+      # Same dummy keys as the `tests` job so module imports succeed offline;
+      # the cloud integration suite never hits a live LLM/embedding API (see
+      # test/cloud_integration/pgvector_store_test.py's fake embedder).
+      GROQ_API_KEY: ci-dummy
+      GEMINI_API_KEY: ci-dummy
+      OPEN_ROUTER_API_KEY_1: ci-dummy
+      COHERE_API_KEY: ci-dummy
+      TAVILY_API_KEY: ci-dummy
+      DEEPGRAM_API_KEY: ci-dummy
+      AUTH_SECRET_KEY: ci-dummy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        # requirements.txt already declares asyncpg/psycopg/pgvector/redis
+        # (the cloud storage backends' drivers) — see requirements.txt's
+        # "Cloud storage backends" comment. pytest is test-only, same as the
+        # `tests` job above.
+        run: |
+          pip install -r requirements.txt
+          pip install pytest==9.0.3
+
+      - name: Run cloud integration suite
+        run: python -m pytest test/cloud_integration -q -m cloud
