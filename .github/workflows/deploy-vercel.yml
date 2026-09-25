@@ -8,13 +8,26 @@ name: deploy-vercel
 # requires workflow_run.conclusion == 'success'.
 #
 # IMPORTANT — this is the ONLY deploy path. Vercel's own dashboard Git
-# integration (if connected) auto-deploys on every push/PR independent of
-# this workflow, which would race it and let an untested commit reach
-# production anyway. Either leave the repo DISCONNECTED from Vercel's Git
-# integration entirely (recommended — this workflow is then the sole way
-# anything reaches Vercel), or if you connect it for its preview-comment UI,
-# go to Project Settings -> Git and disable "Automatically deploy commits
-# pushed to main" so production only ever happens through this gate.
+# integration (if connected) would otherwise auto-deploy on every push/PR
+# independent of this workflow, racing it and letting an untested commit
+# reach production anyway — confirmed happening in practice on commit
+# 5891bb1, where this workflow's probe failed and skipped `promote`, yet
+# production served the new code anyway with a null build SHA (proof it
+# was not this workflow's deploy). That hole is now closed in-repo:
+# vercel.json sets `git.deploymentEnabled: false`, which turns off
+# Git-triggered auto-deployment for every branch and leaves this workflow
+# as the sole way anything reaches Vercel. This does not block the CLI path
+# this workflow uses: on deploy-vercel run 36143665574 (deploy-preview, from
+# commit 269a69f, which already carried the flag), `vercel deploy --token`
+# still succeeded and produced a live preview
+# (turtle-evmualrd4-sheshs-projects-3450851d.vercel.app), while Vercel's Git
+# integration created zero deployments for that same commit (checked 3m32s
+# after the push, versus a 34s baseline for a `vercel[bot]` Preview record
+# on commit ac0ddf7 before this flag existed) — likely because the CLI/API
+# path and the Git webhook are separate, though that internal mechanism
+# isn't independently confirmed, just observed to hold here. Do not remove
+# `git.deploymentEnabled` from vercel.json; doing so silently re-opens this
+# race.
 on:
   workflow_run:
     workflows: ["tests"]
