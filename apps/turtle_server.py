@@ -1792,20 +1792,6 @@ class RememberArgs(_RememberBaseModel):
     )
 
 
-# ---------------------------------------------------------------------------
-# redeem_link_code tool args (WP1.D2 / ledger 1a.4 part 3)
-# ---------------------------------------------------------------------------
-
-class RedeemLinkCodeArgs(_RememberBaseModel):
-    code: str = _RememberField(
-        ...,
-        description=(
-            "The code the user says they generated on the Turtle web app to "
-            "link this channel identity to their web account."
-        ),
-    )
-
-
 def _build_model_from_str(model_str: str, settings: Any) -> Any | None:
     """Parse 'provider:model_name' and return a pydantic-ai model object."""
     if not model_str:
@@ -1819,87 +1805,6 @@ def _build_model_from_str(model_str: str, settings: Any) -> Any | None:
         models = get_google_models(model_name=model_str[7:], settings=settings)
         return models[0] if models else None
     return None
-
-
-async def _redeem_target_link_code_core(
-    *, channel: str, channel_user_id: str, source_user_id: str, code: str
-) -> str:
-    """The actual redemption logic for a web-issued, target-bound link code
-    (WP1.D2 / ledger 1a.4 part 3). Pulled out of the ``redeem_link_code`` tool
-    closure into a plain module-level coroutine so it's callable directly
-    from tests without going through pydantic-ai's tool-calling machinery —
-    the closure itself only validates ``ctx.deps`` (channel/private gates)
-    and delegates here.
-
-    Caller contract: ``channel``/``channel_user_id``/``source_user_id`` must
-    already be validated non-empty and the private-channel gate already
-    checked — this function does not re-check them. See the tool's own
-    docstring (in AgentManager.rebuild) for the full security-property
-    writeup and the reachability-under-invite-only note.
-
-    Locking: deliberately does NOT acquire
-    ``_channel_state_lock((channel, channel_user_id))`` — every real caller
-    (the tool, via _channel_dispatch_handler -> _execute_turn) is already
-    running inside that exact lock for the whole turn; re-acquiring it here
-    would deadlock. Tests that call this directly must hold (or not need) the
-    same discipline themselves.
-    """
-    from core.account_linking import (
-        mark_target_consumed, merge_memory, release_target_reservation,
-        reserve_target_code,
-    )
-    from core.identity import identity_manager
-    from core.storage.factory import get_link_code_store
-
-    store = get_link_code_store()
-    status, claim = await asyncio.to_thread(reserve_target_code, store, code, channel, channel_user_id)
-    if status in ("invalid", "locked"):
-        # Never distinguish the two to the caller — same non-disclosure
-        # posture as the existing /api/account/link redemption.
-        return ToolResult.invalid("That code is invalid or has expired.").to_agent_string()
-    assert claim is not None  # status == "ok" always yields a claim
-
-    if source_user_id == claim.target_user_id:
-        # Already the same account — nothing to merge, just burn the code.
-        await asyncio.to_thread(store.consume_target_code, code)
-        return ToolResult.ok("You're already linked to that account.").to_agent_string()
-
-    from core.worker import drain_user_tasks
-
-    _CHANNEL_STATES.pop((source_user_id, channel), None)
-    drained = await drain_user_tasks(source_user_id, timeout=5.0)
-    if drained:
-        print(f"LOG: link (web-issued) drained {drained} in-flight source task(s) for {source_user_id}")
-
-    merged = await asyncio.to_thread(merge_memory, source_user_id, claim.target_user_id)
-    if not merged.get("ok", False):
-        await asyncio.to_thread(release_target_reservation, store, code, channel, channel_user_id)
-        print(
-            f"LOG: web-issued link merge FAILED for {source_user_id}->{claim.target_user_id}: "
-            f"{merged.get('error', '?')} — mapping unchanged, reservation released"
-        )
-        return ToolResult.upstream_error(
-            "Could not link your account — please try again in a minute."
-        ).to_agent_string()
-
-    try:
-        previous = await identity_manager.link_channel(
-            user_id=claim.target_user_id, channel=channel, channel_user_id=channel_user_id
-        )
-        consumed = await asyncio.to_thread(mark_target_consumed, store, code)
-    except Exception:
-        await asyncio.to_thread(release_target_reservation, store, code, channel, channel_user_id)
-        raise
-    if not consumed:
-        print(f"LOG: web-issued link code raced during consume: {code[:2]}***")
-
-    print(
-        f"LOG: account linked (web-issued code) channel={channel} external={channel_user_id} "
-        f"-> {claim.target_user_id} (was {previous}) merged={merged}"
-    )
-    return ToolResult.ok(
-        "Linked! Your conversation history here has been merged into your web account."
-    ).to_agent_string()
 
 
 # ---------------------------------------------------------------------------
@@ -2493,59 +2398,6 @@ class AgentManager:
                 f"yours — I can't link on an email address alone."
             ).to_agent_string()
 
-        async def redeem_link_code(ctx: RunContext[SharedState], args: RedeemLinkCodeArgs) -> str:
-            """Redeem a code issued on the Turtle web app, attaching THIS
-            channel identity to that web account.
-
-            WP1.D2 (ledger 1a.4 part 3) — the mirror of ``link_account``:
-            there the CHANNEL issues a code and the WEB (authenticated
-            session) redeems it; here the WEB (already authenticated when
-            they asked for the code) issues it and the CHANNEL identity that
-            SENDS it is the one being proven. See core/account_linking.py's
-            target_link_codes docstring for the security-property writeup —
-            a leaked code here is worse than the reverse direction's leaked
-            code, which is why redemption is private-channel-only (same gate
-            as link_account) and why the code is a short TTL, single-use,
-            first-claimer-wins bearer secret.
-
-            Reachability note: under TURTLE_CHANNEL_SIGNUP=invite, a channel
-            identity with NO existing mapping never reaches this tool at all
-            — apps/channels/*.py's resolve_channel_user() refuses (and
-            replies CHANNEL_INVITE_ONLY_MESSAGE) before _channel_dispatch_
-            handler, hence before any agent turn, is ever entered. This tool
-            only helps a channel identity that ALREADY has SOME mapping
-            (open-signup days, or minted before invite mode was turned on)
-            merge into a different target account. See this WP's report for
-            the exact hook a channel adapter would need to close that gap.
-            """
-            deps = ctx.deps
-            channel = str(getattr(deps, "channel", "") or "")
-            channel_uid = str(getattr(deps, "channel_user_id", "") or "")
-            if not channel or not channel_uid:
-                return ToolResult.invalid(
-                    "Redeeming a link code only makes sense from a channel "
-                    "like Discord — on the web you'd use the link panel directly."
-                ).to_agent_string()
-            # Same rationale as link_account's private-channel gate: a code
-            # typed into a shared channel could be grabbed by anyone present,
-            # and here a stolen code links THEIR identity to the target
-            # account, not just their own.
-            if not getattr(deps, "channel_is_private", False):
-                return ToolResult.invalid(
-                    "Send me that code in a direct message, not here — anyone "
-                    "in this channel could grab it otherwise."
-                ).to_agent_string()
-            code = (args.code or "").strip()
-            if not code:
-                return ToolResult.invalid("I need the code you generated on the web.").to_agent_string()
-
-            return await _redeem_target_link_code_core(
-                channel=channel,
-                channel_user_id=channel_uid,
-                source_user_id=deps.user_id,
-                code=code,
-            )
-
         async def calendar_create(ctx: RunContext[SharedState], args: CalendarCreateArgs) -> str:
             """Create a Google Calendar event. See tool contract for full spec."""
             from tools.calendar_tool import create_calendar_event
@@ -2682,7 +2534,6 @@ class AgentManager:
             ("get_directions", get_directions),
             ("remember", remember),
             ("link_account", link_account),
-            ("redeem_link_code", redeem_link_code),
         ]
         for _target_agent in [self.main_assistant, *self.main_assistant_fallbacks]:
             for _contract_name, _tool_fn in _tool_registry:
@@ -3815,45 +3666,6 @@ async def confirm_memory(request: Request):
         if result.topic == "workflow":
             _register_user_routines_safe(user_id)
     return JSONResponse({"status": "ok", "applied": accepted})
-
-
-@app.post("/api/account/link/issue")
-async def link_account_issue_code(request: Request):
-    """Mint a code bound to the CALLER's authenticated web account.
-
-    WP1.D2 (ledger 1a.4 part 3) — the mirror of the channel-issued code below:
-    this endpoint proves target-account ownership FIRST (the caller is
-    already authenticated), and the code is redeemed by whichever channel
-    identity later SENDS it (see the ``redeem_link_code`` tool). See
-    core/account_linking.py's ``target_link_codes`` docstring for the full
-    security-property writeup: a leaked code here is a materially worse leak
-    than the channel-issued direction (whoever sends it gets an ongoing
-    channel-side read/write into the target account), which is why the
-    response is a single value the caller must treat as a secret — never
-    logged here, and the code itself is dropped from server-side memory the
-    moment it's returned (only its hash-free DB row remains, same as the
-    channel-issued table).
-    """
-    user_id = _get_user_id_from_request(request)
-    if not user_id:
-        return JSONResponse({"error": "Sign in to link an account"}, status_code=401)
-
-    from core.account_linking import LINK_CODE_TTL_MINUTES
-    from core.storage.factory import get_link_code_store
-
-    store = get_link_code_store()
-    try:
-        issued = await asyncio.to_thread(store.issue_target_code, target_user_id=user_id)
-    except Exception as e:
-        return JSONResponse({"error": f"Could not create a link code: {e}"}, status_code=503)
-    return JSONResponse(
-        {
-            "status": "ok",
-            "code": issued.code,
-            "expires_at": issued.expires_at,
-            "expires_in_minutes": LINK_CODE_TTL_MINUTES,
-        }
-    )
 
 
 @app.post("/api/account/link")

@@ -50,23 +50,6 @@ CREATE TABLE IF NOT EXISTS link_codes (
 )
 """
 
-# WP1.D2 (ledger 1a.4 part 3) — mirrors core.account_linking.LinkCodeStore's
-# target_link_codes table exactly; see that module for the security-property
-# writeup (a leaked code here lets whoever SENDS it from any channel identity
-# claim the target account, which is why it's TTL-bounded + single-use +
-# reserved to the first channel identity that attempts redemption).
-_CREATE_TARGET_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS target_link_codes (
-    code TEXT PRIMARY KEY,
-    target_user_id TEXT NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    consumed_at TIMESTAMPTZ,
-    reserved_channel TEXT,
-    reserved_channel_user_id TEXT,
-    reserved_at TIMESTAMPTZ
-)
-"""
-
 _initialized = False
 
 
@@ -76,7 +59,6 @@ def _ensure_init() -> Any:
     if not _initialized:
         with pool.connection() as conn:
             conn.execute(_CREATE_TABLE_SQL)
-            conn.execute(_CREATE_TARGET_TABLE_SQL)
         _initialized = True
     return pool
 
@@ -229,110 +211,4 @@ class PostgresLinkCodeStore:
         pool = _ensure_init()
         with pool.connection() as conn:
             cur = conn.execute("DELETE FROM link_codes WHERE expires_at <= %s", (_utc_now(),))
-            target_cur = conn.execute(
-                "DELETE FROM target_link_codes WHERE expires_at <= %s", (_utc_now(),)
-            )
-            return (cur.rowcount or 0) + (target_cur.rowcount or 0)
-
-    # ── target-bound codes (WP1.D2 / ledger 1a.4 part 3) — see
-    # core.account_linking.LinkCodeStore's sibling methods for the contract. ──
-
-    def issue_target_code(self, *, target_user_id: str):
-        from core.account_linking import TargetLinkCode
-
-        pool = _ensure_init()
-        code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
-        expires = _utc_now() + timedelta(minutes=LINK_CODE_TTL_MINUTES)
-        with pool.connection() as conn:
-            conn.execute(
-                "DELETE FROM target_link_codes WHERE target_user_id = %s AND consumed_at IS NULL",
-                (target_user_id,),
-            )
-            conn.execute(
-                "INSERT INTO target_link_codes (code, target_user_id, expires_at) "
-                "VALUES (%s, %s, %s)",
-                (code, target_user_id, expires),
-            )
-        return TargetLinkCode(code, target_user_id, _iso(expires))
-
-    def reserve_target_code(self, code: str, channel: str, channel_user_id: str):
-        from core.account_linking import TargetLinkCode
-
-        normalized = _normalize_code(code)
-        if not normalized or not channel or not channel_user_id:
-            return ("invalid", None)
-        pool = _ensure_init()
-        now = _utc_now()
-        cutoff = now - timedelta(seconds=RESERVATION_TTL_SECONDS)
-        with pool.connection() as conn:
-            cur = conn.execute(
-                """
-                UPDATE target_link_codes
-                   SET reserved_channel = %s, reserved_channel_user_id = %s, reserved_at = %s
-                 WHERE code = %s
-                   AND consumed_at IS NULL
-                   AND expires_at > %s
-                   AND (reserved_channel IS NULL
-                        OR (reserved_channel = %s AND reserved_channel_user_id = %s)
-                        OR reserved_at IS NULL
-                        OR reserved_at < %s)
-                """,
-                (channel, channel_user_id, now, normalized, now, channel, channel_user_id, cutoff),
-            )
-            row = conn.execute(
-                "SELECT target_user_id, expires_at, consumed_at "
-                "FROM target_link_codes WHERE code = %s",
-                (normalized,),
-            ).fetchone()
-        if row is None or row[2] is not None:
-            return ("invalid", None)
-        target_user_id, expires_at, _consumed = row
-        if expires_at <= _utc_now():
-            return ("invalid", None)
-        if cur.rowcount == 0:
-            return ("locked", None)
-        claim = TargetLinkCode(normalized, target_user_id, _iso(expires_at), channel, channel_user_id)
-        return ("ok", claim)
-
-    def release_target_reservation(self, code: str, channel: str, channel_user_id: str) -> None:
-        normalized = _normalize_code(code)
-        if not normalized or not channel or not channel_user_id:
-            return
-        pool = _ensure_init()
-        with pool.connection() as conn:
-            conn.execute(
-                "UPDATE target_link_codes SET reserved_channel = NULL, "
-                "reserved_channel_user_id = NULL, reserved_at = NULL "
-                "WHERE code = %s AND reserved_channel = %s AND reserved_channel_user_id = %s "
-                "AND consumed_at IS NULL",
-                (normalized, channel, channel_user_id),
-            )
-
-    def consume_target_code(self, code: str):
-        from core.account_linking import TargetLinkCode
-
-        normalized = _normalize_code(code)
-        if not normalized:
-            return None
-        pool = _ensure_init()
-        with pool.connection() as conn:
-            row = conn.execute(
-                "SELECT target_user_id, expires_at, consumed_at, "
-                "reserved_channel, reserved_channel_user_id "
-                "FROM target_link_codes WHERE code = %s",
-                (normalized,),
-            ).fetchone()
-            if row is None or row[2] is not None:
-                return None
-            target_user_id, expires_at, _consumed, r_channel, r_channel_uid = row
-            if expires_at <= _utc_now():
-                return None
-            cur = conn.execute(
-                "UPDATE target_link_codes SET consumed_at = %s WHERE code = %s AND consumed_at IS NULL",
-                (_utc_now(), normalized),
-            )
-            if cur.rowcount != 1:
-                return None  # lost the race
-        return TargetLinkCode(
-            normalized, target_user_id, _iso(expires_at), r_channel or "", r_channel_uid or "",
-        )
+            return cur.rowcount or 0
