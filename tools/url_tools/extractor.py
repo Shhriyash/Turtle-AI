@@ -61,11 +61,8 @@ async def _fetch_with_playwright(
 
     # A local Chromium instance navigating straight to the target — the
     # sharpest SSRF edge on this path, since the browser reaches the host's
-    # own network stack. Validate before launching the browser at all.
-    # Note: this only validates the initial URL; in-browser redirects that
-    # Playwright follows internally are not re-validated per hop (unlike
-    # the httpx path via safe_get). That is a narrower residual gap than
-    # the unvalidated status quo and is accepted for this WP.
+    # own network stack. Validate before launching the browser at all, so an
+    # obviously-bad URL fails fast without paying browser-startup cost.
     try:
         safe_fetch.validate_public_url(url)
     except safe_fetch.UnsafeUrlError as exc:
@@ -76,7 +73,58 @@ async def _fetch_with_playwright(
         try:
             page = await browser.new_page()
             await page.set_extra_http_headers(headers)
-            resp = await page.goto(url, wait_until="networkidle", timeout=int(timeout * 1000))
+
+            # Re-validate every *navigation* Chromium performs (the initial
+            # goto plus every server redirect it follows internally) via
+            # request interception — mirroring safe_get's manual redirect
+            # loop for the httpx path, and enforcing the same MAX_REDIRECTS
+            # hop limit. This must be registered before page.goto(), or the
+            # first navigation escapes it entirely.
+            #
+            # Deliberately scoped to navigation requests
+            # (request.is_navigation_request()) rather than every request:
+            # blocking/validating every subresource load (JS, CSS, images,
+            # XHR/fetch) would routinely break legitimate JS-rendered pages,
+            # which is the entire reason this fallback exists. This is a
+            # real, named residual gap, not an oversight: a page's own
+            # script can still issue an XHR/fetch to an internal address
+            # (e.g. the cloud metadata endpoint) after the page loads, and
+            # that traffic is NOT validated by this handler.
+            nav_state = {"count": 0, "blocked": False}
+
+            async def _validate_navigation(route, request):
+                if not request.is_navigation_request():
+                    await route.continue_()
+                    return
+                nav_state["count"] += 1
+                if nav_state["count"] > safe_fetch.MAX_REDIRECTS + 1:
+                    nav_state["blocked"] = True
+                    await route.abort()
+                    return
+                try:
+                    safe_fetch.validate_public_url(request.url)
+                except safe_fetch.UnsafeUrlError:
+                    nav_state["blocked"] = True
+                    await route.abort()
+                    return
+                await route.continue_()
+
+            await page.route("**/*", _validate_navigation)
+
+            try:
+                resp = await page.goto(url, wait_until="networkidle", timeout=int(timeout * 1000))
+            except Exception as exc:
+                if nav_state["blocked"]:
+                    # Translate Playwright's own navigation-failure exception
+                    # (e.g. net::ERR_FAILED for an aborted request) into our
+                    # fixed refusal — never leak the raw Playwright error
+                    # string, which could contain the blocked target URL.
+                    raise safe_fetch.UnsafeUrlError(safe_fetch.REFUSAL_MESSAGE) from exc
+                raise
+
+            if nav_state["blocked"]:
+                raise safe_fetch.UnsafeUrlError(safe_fetch.REFUSAL_MESSAGE)
+
             status = resp.status if resp else 200
             content_type = (
                 resp.headers.get("content-type", "text/html").lower() if resp else "text/html"
