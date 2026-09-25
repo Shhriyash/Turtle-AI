@@ -77,7 +77,7 @@ async def start_discord_gateway() -> None:
 
     # Import locally too so type-checkers/readers see the guarded module.
     from apps.channels import TurtleEvent, TurtleResponse, dispatch_event
-    from core.identity import identity_manager
+    from core.identity import CHANNEL_INVITE_ONLY_MESSAGE, resolve_channel_user
 
     intents = discord.Intents.default()
     intents.message_content = True  # privileged — enable in the Developer Portal
@@ -129,7 +129,12 @@ async def start_discord_gateway() -> None:
             return
 
         try:
-            user_id = await identity_manager.resolve_user("discord", str(message.author.id))
+            user_id = await resolve_channel_user("discord", str(message.author.id))
+            if user_id is None:
+                # TURTLE_CHANNEL_SIGNUP=invite and this sender is unknown —
+                # reply with the invite message and mint nothing.
+                await message.channel.send(CHANNEL_INVITE_ONLY_MESSAGE)
+                return
             print(f"LOG: discord dispatching turn user_id={user_id} text={text[:80]!r}", flush=True)
             # Discord hands us a display name on every message; pass it so a
             # first-contact user gets a seeded profile instead of being a

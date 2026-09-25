@@ -32,7 +32,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from apps.channels import TurtleEvent, TurtleResponse, dispatch_event
 from core.config import settings
-from core.identity import identity_manager
+from core.identity import CHANNEL_INVITE_ONLY_MESSAGE, resolve_channel_user
 
 router = APIRouter(prefix="/channels/imessage", tags=["imessage"])
 
@@ -98,7 +98,12 @@ async def imessage_webhook(request: Request):
     if not content:
         return Response(status_code=200)
 
-    user_id = await identity_manager.resolve_user("imessage", from_number)
+    user_id = await resolve_channel_user("imessage", from_number)
+    if user_id is None:
+        # TURTLE_CHANNEL_SIGNUP=invite and this sender is unknown — reply
+        # with the invite message and mint nothing.
+        await _send_imessage_reply(from_number, CHANNEL_INVITE_ONLY_MESSAGE)
+        return Response(status_code=200)
 
     event = TurtleEvent(
         user_id=user_id,
@@ -106,6 +111,12 @@ async def imessage_webhook(request: Request):
         modality="text",
         content=content,
         message_id=message_handle,
+        # WP 1.D follow-up: this was previously left unset, which meant
+        # _channel_dispatch_handler's rate-limit key, lock key, and
+        # account-link re-resolve guard all silently fell back to
+        # event.user_id for this channel instead of the raw channel
+        # identity.
+        channel_user_id=from_number,
     )
     response: TurtleResponse = await dispatch_event(event)
 

@@ -342,13 +342,12 @@ class DiscordProcessEndpointTest(unittest.TestCase):
 class ProcessDeferredInteractionTest(unittest.IsolatedAsyncioTestCase):
     async def test_success_dispatches_and_sends_followup(self) -> None:
         with patch.object(
-            discord_module, "identity_manager"
-        ) as fake_identity, patch.object(
+            discord_module, "resolve_channel_user", new_callable=AsyncMock, return_value="usr_a"
+        ), patch.object(
             discord_module, "dispatch_event", new_callable=AsyncMock
         ) as fake_dispatch, patch.object(
             discord_module, "_send_followup", new_callable=AsyncMock
         ) as fake_send:
-            fake_identity.resolve_user = AsyncMock(return_value="usr_a")
             fake_dispatch.return_value = TurtleResponse(
                 content="reply text", channel="discord", user_id="usr_a"
             )
@@ -362,17 +361,36 @@ class ProcessDeferredInteractionTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_failure_sends_graceful_error_followup(self) -> None:
         with patch.object(
-            discord_module, "identity_manager"
-        ) as fake_identity, patch.object(
+            discord_module, "resolve_channel_user", new_callable=AsyncMock, return_value="usr_a"
+        ), patch.object(
             discord_module, "dispatch_event", new_callable=AsyncMock, side_effect=RuntimeError("boom")
         ), patch.object(
             discord_module, "_send_followup", new_callable=AsyncMock
         ) as fake_send:
-            fake_identity.resolve_user = AsyncMock(return_value="usr_a")
             await discord_module._process_deferred_interaction(_PAYLOAD)
 
         fake_send.assert_awaited_once()
         self.assertIn("wrong", fake_send.call_args[0][1].lower())
+
+    async def test_invite_only_unknown_sender_no_mint_no_dispatch(self) -> None:
+        """WP 1.D (ledger 1a.4): TURTLE_CHANNEL_SIGNUP=invite + unknown
+        sender -> resolve_channel_user returns None (never mints), the
+        adapter replies with the invite message, and no turn is dispatched.
+        """
+        with patch.object(
+            discord_module, "resolve_channel_user", new_callable=AsyncMock, return_value=None
+        ) as fake_resolve, patch.object(
+            discord_module, "dispatch_event", new_callable=AsyncMock
+        ) as fake_dispatch, patch.object(
+            discord_module, "_send_followup", new_callable=AsyncMock
+        ) as fake_send:
+            await discord_module._process_deferred_interaction(_PAYLOAD)
+
+        fake_resolve.assert_awaited_once_with("discord", "999")
+        fake_dispatch.assert_not_called()
+        fake_send.assert_awaited_once_with(
+            "tok_abc", discord_module.CHANNEL_INVITE_ONLY_MESSAGE
+        )
 
 
 if __name__ == "__main__":

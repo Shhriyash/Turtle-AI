@@ -20,6 +20,69 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ENV_FILE = _PROJECT_ROOT / ".env"
 
 
+# The 2 accepted values for TURTLE_CHANNEL_SIGNUP — the single source of
+# truth so core/identity.py's resolve_channel_user, this module's own
+# validator, and any test compare against the same literals rather than
+# bare strings sprinkled at each use site.
+CHANNEL_SIGNUP_OPEN = "open"
+CHANNEL_SIGNUP_INVITE = "invite"
+_CHANNEL_SIGNUP_VALUES = (CHANNEL_SIGNUP_OPEN, CHANNEL_SIGNUP_INVITE)
+
+# WP1.D2 (ledger 1a.4 part 4): per-tenant daily token budget default. 1M
+# tokens/user/day at today's cascade shape (max_tokens=1024 output, a handful
+# of tool-calling requests per turn) comfortably covers heavy daily use while
+# still bounding a runaway/abusive tenant's cost.
+DEFAULT_DAILY_TOKEN_BUDGET = 1_000_000
+
+
+def normalize_channel_signup(raw: str) -> str:
+    """Case/whitespace-tolerant parse of TURTLE_CHANNEL_SIGNUP.
+
+    A security toggle must never fail OPEN on a typo — this repo has been
+    bitten by exactly this shape before (Phase 0: bool(SecretStr(" ")) is
+    True, so a whitespace-only backend URL silently passed a truthiness
+    check). "INVITE", "Invite", " invite" and "invite " must all still mean
+    invite-only, so strip + lowercase BEFORE comparing.
+
+    An UNRECOGNISED value (e.g. "invyte") is deliberately treated the same
+    as an unset value — "open" — rather than fail-closed: fail-closed here
+    would silently lock out every existing channel user on a deploy over a
+    typo, the exact asymmetric harm that kept "invite" from being the
+    default in the first place. Instead the typo is made LOUD: logged at
+    startup (and on every subsequent call, since settings can be mutated
+    post-construction, e.g. in tests) naming the bad value and the accepted
+    ones, so a misconfiguration is visible instead of silent in either
+    direction. An unset/empty value is the expected default and does NOT
+    warn.
+    """
+    normalized = (raw or "").strip().lower()
+    if normalized in _CHANNEL_SIGNUP_VALUES:
+        return normalized
+    if normalized:
+        print(
+            f"LOG: TURTLE_CHANNEL_SIGNUP={raw!r} is not a recognised value "
+            f"(accepted: {', '.join(_CHANNEL_SIGNUP_VALUES)}) — falling back "
+            f"to {CHANNEL_SIGNUP_OPEN!r}. Channel sign-up is OPEN, not "
+            f"invite-only. Fix the value to actually close it."
+        )
+    return CHANNEL_SIGNUP_OPEN
+
+
+def parse_unmetered_user_ids(raw: str) -> frozenset[str]:
+    """Parse TURTLE_UNMETERED_USER_IDS — a comma-separated allowlist of
+    user_ids exempt from the daily token budget (the owner, typically).
+
+    Whitespace-tolerant and empty-entry-tolerant (a trailing comma or double
+    comma must not produce a "" that then vacuously matches a blank/unset
+    user_id somewhere else). Unlike normalize_channel_signup this is not an
+    enum with a fixed accepted set, so there is no "unrecognised value"
+    warning to give — any non-empty entry is a plausible user_id.
+    """
+    if not raw:
+        return frozenset()
+    return frozenset(uid.strip() for uid in raw.split(",") if uid.strip())
+
+
 class TurtleSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(_ENV_FILE),
@@ -202,6 +265,45 @@ class TurtleSettings(BaseSettings):
     ws_messages_per_day: int = Field(
         default=1000, alias="TURTLE_WS_MESSAGES_PER_DAY"
     )
+    # Sign-up policy for the 8 channel adapters (discord, imessage, telegram,
+    # whatsapp, twilio voice, slack, ...). Accepted values (case/whitespace
+    # insensitive — see normalize_channel_signup below): "open" (default)
+    # preserves today's behaviour: a first message from an unknown channel
+    # identity silently mints a new tenant via identity_manager.resolve_user.
+    # "invite" closes that door — an unknown sender is looked up (never
+    # minted) and gets an invite-only reply instead. The web onboarding flow
+    # (apps/onboarding_routes.py) and the dev fast-path (apps/auth.py) are
+    # NOT channel adapters and keep minting under either setting. Owner opts
+    # in explicitly: TURTLE_CHANNEL_SIGNUP=invite. Defaulting to invite-only
+    # would lock out every existing channel user on an unconfigured deploy.
+    # Any OTHER value (a typo) is treated as "open" and logged loudly, never
+    # silently — see normalize_channel_signup.
+    channel_signup: str = Field(default=CHANNEL_SIGNUP_OPEN, alias="TURTLE_CHANNEL_SIGNUP")
+
+    @field_validator("channel_signup")
+    @classmethod
+    def _normalize_channel_signup(cls, value: str) -> str:
+        # Startup-time normalization (env var read once at process boot).
+        # resolve_channel_user() ALSO normalizes at call time — belt and
+        # suspenders, since settings.channel_signup can be reassigned after
+        # construction (tests do this routinely via monkeypatch), which a
+        # field_validator alone would not re-run.
+        return normalize_channel_signup(value)
+
+    # WP1.D2 (ledger 1a.4 part 4): per-tenant daily token budget, enforced in
+    # cloud mode only (see apps/turtle_server.py's _reserve_daily_spend —
+    # local mode has no Redis and this is simply not metered there). 0 or
+    # negative disables the budget outright (unmetered for everyone).
+    daily_token_budget: int = Field(
+        default=DEFAULT_DAILY_TOKEN_BUDGET, alias="TURTLE_DAILY_TOKEN_BUDGET"
+    )
+    # Comma-separated user_ids exempt from the daily budget (the owner).
+    # Parsed via parse_unmetered_user_ids at the call site (not just here)
+    # for the same reason channel_signup re-normalizes at call time: tests
+    # and hot-config-reload can reassign settings.unmetered_user_ids after
+    # construction, which a field_validator alone would not re-run against.
+    unmetered_user_ids: str = Field(default="", alias="TURTLE_UNMETERED_USER_IDS")
+
     # Phase 7: gate /admin/* endpoints. None = endpoints return 503.
     admin_token: Optional[SecretStr] = Field(default=None, alias="TURTLE_ADMIN_TOKEN")
 

@@ -20,7 +20,7 @@ from typing import Optional
 import aiosqlite
 from pydantic import BaseModel
 
-from core.config import settings
+from core.config import CHANNEL_SIGNUP_INVITE, normalize_channel_signup, settings
 from core.io_atomic import atomic_write_json
 
 # The web onboarding channel whose channel_user_id is an email address. Only
@@ -193,6 +193,25 @@ class IdentityManager:
         )
         return previous
 
+    async def lookup_user(self, channel: str, channel_user_id: str) -> Optional[str]:
+        """Non-minting counterpart to resolve_user: returns the existing
+        user_id for (channel, channel_user_id) or None on a miss. Never
+        mints, never rebinds from account markers. Used by channel adapters
+        under TURTLE_CHANNEL_SIGNUP=invite so an unknown sender is never
+        silently onboarded (see apps/channels/*). resolve_user's own
+        existing-mapping check delegates here so there is exactly one query
+        that defines "is this identity known".
+        """
+        is_email = channel == WEB_EMAIL_CHANNEL
+        lookup_id = normalize_email(channel_user_id) if is_email else channel_user_id
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT user_id FROM channel_mappings WHERE channel = ? AND channel_user_id = ?",
+                (channel, lookup_id)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else None
+
     async def resolve_user(self, channel: str, channel_user_id: str) -> str:
         """Resolve a channel user ID to a canonical internal UserId. Creates one if missing.
 
@@ -208,24 +227,20 @@ class IdentityManager:
         lookup_id = normalize_email(channel_user_id) if is_email else channel_user_id
 
         # 1) Existing mapping wins.
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                "SELECT user_id FROM channel_mappings WHERE channel = ? AND channel_user_id = ?",
-                (channel, lookup_id)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    if is_email:
-                        # Backfill primary_email for rows minted before the
-                        # column was populated; only touches NULLs so this is
-                        # a one-time repair per user, not a per-login write.
-                        await db.execute(
-                            "UPDATE users SET primary_email = ? WHERE user_id = ?"
-                            " AND primary_email IS NULL",
-                            (lookup_id, row[0]),
-                        )
-                        await db.commit()
-                    return row[0]
+        existing = await self.lookup_user(channel, channel_user_id)
+        if existing is not None:
+            if is_email:
+                # Backfill primary_email for rows minted before the column
+                # was populated; only touches NULLs so this is a one-time
+                # repair per user, not a per-login write.
+                async with aiosqlite.connect(self.db_path) as db:
+                    await db.execute(
+                        "UPDATE users SET primary_email = ? WHERE user_id = ?"
+                        " AND primary_email IS NULL",
+                        (lookup_id, existing),
+                    )
+                    await db.commit()
+            return existing
 
         # 2) Mapping MISS. For web_email, try to rebind from a surviving marker
         #    before minting — a manual reset that dropped users.sqlite while the
@@ -366,3 +381,46 @@ def _make_identity_manager():
 
 
 identity_manager = _make_identity_manager()
+
+
+# User-facing copy for a rejected channel sign-up. Deliberately vague about
+# WHY (never confirms or denies that a given channel handle is already
+# known — see resolve_channel_user) and tells the person how to get access
+# without naming an internal process.
+CHANNEL_INVITE_ONLY_MESSAGE = (
+    "This assistant is invite-only right now. Ask someone who already has "
+    "access to invite you, or reach out to the owner for access."
+)
+
+
+async def resolve_channel_user(channel: str, channel_user_id: str) -> Optional[str]:
+    """Sign-up-policy-aware identity resolution for the 8 channel adapters
+    (apps/channels/*.py) ONLY. The 3 non-channel resolve_user callers — the
+    re-resolve inside apps/turtle_server.py's _channel_dispatch_handler (an
+    account-link redemption re-pointing an in-flight event), the web signup
+    path in apps/onboarding_routes.py, and the dev fast-path in
+    apps/auth.py — must keep calling identity_manager.resolve_user directly
+    and are NOT routed through here; they mint by design regardless of this
+    policy.
+
+    settings.channel_signup == "open" (default, case/whitespace-insensitive,
+    unrecognised values fall back here too — see
+    core.config.normalize_channel_signup): identical to resolve_user — mints
+    a new identity on a miss, preserving today's behaviour for unconfigured
+    deployments.
+
+    settings.channel_signup == "invite": non-minting lookup only. Returns
+    None on a miss so the caller can reply with CHANNEL_INVITE_ONLY_MESSAGE
+    instead of onboarding a stranger.
+
+    The raw setting is re-normalized here (not just trusted from
+    TurtleSettings' own field_validator) because settings.channel_signup can
+    be reassigned after construction — tests do this routinely via
+    monkeypatch, and a field_validator does not re-run on plain attribute
+    assignment. A security toggle failing OPEN on an un-normalized typo is
+    exactly the bug class this guards against.
+    """
+    policy = normalize_channel_signup(settings.channel_signup)
+    if policy == CHANNEL_SIGNUP_INVITE:
+        return await identity_manager.lookup_user(channel, channel_user_id)
+    return await identity_manager.resolve_user(channel, channel_user_id)

@@ -46,7 +46,7 @@ from fastapi import APIRouter, HTTPException, Request
 from apps.channels import TurtleEvent, TurtleResponse, dispatch_event
 from apps.channels.telegram_gateway import _normalize_dashes, markdown_to_telegram_html
 from core.config import settings
-from core.identity import identity_manager
+from core.identity import CHANNEL_INVITE_ONLY_MESSAGE, resolve_channel_user
 
 router = APIRouter(prefix="/channels/telegram", tags=["telegram"])
 
@@ -203,7 +203,12 @@ async def telegram_webhook(request: Request):
 
     try:
         tg_user_id = str(user.get("id", ""))
-        user_id = await identity_manager.resolve_user("telegram", tg_user_id)
+        user_id = await resolve_channel_user("telegram", tg_user_id)
+        if user_id is None:
+            # TURTLE_CHANNEL_SIGNUP=invite and this sender is unknown —
+            # reply with the invite message and mint nothing.
+            await _send_reply(chat.get("id"), CHANNEL_INVITE_ONLY_MESSAGE)
+            return {"ok": True}
         sender_name = (
             str(user.get("first_name") or "").strip()
             or str(user.get("username") or "").strip()
