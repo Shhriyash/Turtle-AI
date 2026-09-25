@@ -66,9 +66,16 @@ jobs:
         id: deploy
         run: |
           set -euo pipefail
+          # `tail -n1`: on a zero-exit deploy, `vercel deploy` prints the
+          # deployment URL as its stdout, but a future CLI version could add
+          # an extra informational line (an update notice, a warning) ahead
+          # of it on the same zero-exit path. Without trimming, `url` would
+          # become multi-line and `echo "url=$url" >> "$GITHUB_OUTPUT"` would
+          # write invalid key=value syntax, breaking this step in a way
+          # that's hard to read from the log. Keep only the last line.
           url=$(vercel deploy --prod --yes --skip-domain \
             --env TURTLE_BUILD_SHA="$BUILD_SHA" \
-            --token="$VERCEL_TOKEN")
+            --token="$VERCEL_TOKEN" | tail -n1)
           echo "url=$url" >> "$GITHUB_OUTPUT"
           {
             echo "### Deployed to production (unpromoted)"
@@ -86,9 +93,11 @@ jobs:
       # curl: we want the real body + status code back even on a non-200 so
       # the check below can report it, rather than have curl itself decide
       # pass/fail. If `vercel curl` fails outright (e.g. it cannot reach the
-      # deployment at all), the `response=$(...)` assignment's own non-zero
-      # exit status still trips `set -e` immediately — that failure mode is
-      # not swallowed either.
+      # deployment at all), `response=$(...)` is a plain assignment, not a
+      # condition (not inside `if`/`&&`/`||`/a negation, which are the actual
+      # `set -e` exceptions) — so it is not exempt, and its non-zero exit
+      # still trips `set -e` immediately. That failure mode is not
+      # swallowed either.
       - name: Probe /healthz and assert deployed SHA
         id: healthz
         env:
@@ -117,8 +126,9 @@ jobs:
 
       # Same non-swallowing reasoning as /healthz above: no `--fail` on curl,
       # so a 503 comes back as a normal response we inspect explicitly; a
-      # `vercel curl` process failure still trips `set -e` via the `$(...)`
-      # assignment.
+      # `vercel curl` process failure still trips `set -e` because the
+      # `response=$(...)` assignment is not a condition and so isn't exempt
+      # from `set -e` the way an `if`/`&&`/`||`/negated command would be.
       - name: Probe /readyz
         id: readyz
         env:
@@ -174,7 +184,10 @@ jobs:
         # Remote build (Vercel's own infra) does.
         id: deploy
         run: |
-          url=$(vercel deploy --yes --env TURTLE_BUILD_SHA="$BUILD_SHA" --token="$VERCEL_TOKEN")
+          # tail -n1: keep only the last stdout line in case a future CLI
+          # version emits an extra line ahead of the URL on a zero-exit path
+          # (see deploy-production's comment on the same pattern).
+          url=$(vercel deploy --yes --env TURTLE_BUILD_SHA="$BUILD_SHA" --token="$VERCEL_TOKEN" | tail -n1)
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "### Preview deployed" >> "$GITHUB_STEP_SUMMARY"
           echo "$url" >> "$GITHUB_STEP_SUMMARY"
