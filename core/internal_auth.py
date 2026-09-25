@@ -136,6 +136,35 @@ def require_secret(secret: object, env_var_name: str) -> str:
     return value
 
 
+async def claim_once(prefix: str, identifier: str, ttl_seconds: int) -> bool:
+    """Atomic first-claim-wins replay guard: ``SET <prefix><identifier> 1 NX
+    EX <ttl_seconds>``. Returns True the first time a given
+    ``(prefix, identifier)`` pair is claimed, False if it was already
+    claimed (a replay). This is the one atomic Redis claim primitive in the
+    codebase (the house style elsewhere for atomic claims is Postgres
+    INSERT...ON CONFLICT DO NOTHING, see
+    core/storage/cloud/routine_last_fired_store.py::try_claim_fire) — no
+    existing Redis idiom to match, so this establishes one.
+
+    Factored out of ``verify_request`` (WP 1.F / ledger 1b.4, S-7.8) so a
+    second, unrelated caller (apps/channels/discord.py's Discord
+    ``interaction_id`` dedup) can reuse the same atomic-claim primitive under
+    its OWN key prefix and TTL, without duplicating this line. Deliberately
+    does NOT wrap/interpret exceptions — ``get_redis_client()`` raises
+    ``CloudBackendUnavailable`` only for an unset REDIS_URL, while a
+    reachable-but-erroring/refusing/stalling Redis raises the redis-py
+    driver's own exceptions (``ConnectionError``, ``TimeoutError``, ...) from
+    the ``set`` call itself; this function lets BOTH propagate unchanged so
+    each caller can choose its own fail-open/fail-closed posture for its own
+    security domain (``verify_request`` below fails closed; Discord's
+    interaction dedup is a different domain with a different trade-off — see
+    apps/channels/discord.py).
+    """
+    client = await get_redis_client()
+    claimed = await client.set(f"{prefix}{identifier}", "1", nx=True, ex=ttl_seconds)
+    return bool(claimed)
+
+
 def _hmac_hex(secret: str, timestamp: str, nonce: str, body: bytes) -> str:
     """The MAC covers timestamp, nonce AND the body bytes — all three, in a
     fixed, unambiguous framing (length-implicit via the "." separators being
@@ -228,10 +257,7 @@ async def verify_request(
     # core/storage/cloud/routine_last_fired_store.py::try_claim_fire) — no
     # existing Redis idiom to match, so this establishes one.
     try:
-        client = await get_redis_client()
-        claimed = await client.set(
-            f"{_NONCE_KEY_PREFIX}{nonce}", "1", nx=True, ex=NONCE_TTL_S
-        )
+        claimed = await claim_once(_NONCE_KEY_PREFIX, nonce, NONCE_TTL_S)
     except Exception as exc:
         # Fail CLOSED on ANY failure to complete this round trip — an unset
         # REDIS_URL (CloudBackendUnavailable) AND a reachable-but-erroring

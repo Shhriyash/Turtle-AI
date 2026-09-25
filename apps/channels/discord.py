@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 from cryptography.exceptions import InvalidSignature
@@ -57,6 +58,7 @@ from core.identity import CHANNEL_INVITE_ONLY_MESSAGE, resolve_channel_user
 from core.internal_auth import (
     SignatureError,
     check_bearer,
+    claim_once,
     sign_request,
     store_job_payload,
     take_job_payload,
@@ -77,6 +79,43 @@ _INTERACTION_APPLICATION_COMMAND = 2
 _RESPONSE_PONG = 1
 _RESPONSE_CHANNEL_MESSAGE = 4
 _RESPONSE_DEFERRED_CHANNEL_MESSAGE = 5
+
+# WP 1.F (ledger 1b.4, S-7.8): a validly-signed interaction is proof Discord
+# sent it AT SOME POINT, not that it's recent or hasn't already been acted
+# on — a captured request replays forever against signature verification
+# alone. Two independent defenses, both below:
+#
+#   1. Timestamp freshness — reject X-Signature-Timestamp older than 300s.
+#      Symmetric (also rejects a timestamp implausibly far in the FUTURE),
+#      matching core.internal_auth.verify_request's CLOCK_SKEW_S window.
+#      Unlike that self-call envelope (where an attacker who leaks the
+#      shared secret can mint a signature with ANY timestamp they choose,
+#      making an unbounded-future allowance a real hole), Discord itself
+#      signs this timestamp — an outside caller can't forge one without
+#      Discord's private key, so the future side isn't closing a forgery
+#      hole here. It's kept symmetric anyway as cheap, free defense-in-depth
+#      against clock corruption producing a huge/garbage-but-numeric value,
+#      and for consistency with the one other timestamp-window check in this
+#      codebase. A real Discord request is always ~now on either endpoint,
+#      so this never rejects legitimate traffic.
+#   2. interaction_id dedup — SET NX EX claim, own prefix/TTL (see
+#      _INTERACTION_CLAIM_PREFIX below), so even a replay INSIDE the 300s
+#      freshness window is rejected the second time it's seen.
+_TIMESTAMP_WINDOW_S = 300
+
+# Own prefix + TTL, deliberately distinct from core.internal_auth's
+# `turtle:nonce:` (300s) / `turtle:job:` (900s): a Discord interaction_id is
+# a different security domain than Turtle's own self-call nonce (external
+# party, no shared secret involved in minting it), and the two need to be
+# rotatable/reasoned-about independently even though claim_once() is shared
+# plumbing. 900s (matches the ledger's chosen TTL for this WP) is longer
+# than the 300s freshness window on purpose: it isn't sized to the freshness
+# check (an interaction already fails freshness well before its claim would
+# expire) — it's sized to survive Discord's own retry/backoff behavior on a
+# slow endpoint, which can resend the SAME interaction_id a little after the
+# first attempt.
+_INTERACTION_CLAIM_PREFIX = "turtle:discord-interaction:"
+_INTERACTION_CLAIM_TTL_S = 900
 
 # Fallback strong-reference set for the deferred follow-up tasks, in case
 # core.worker.track_task is unavailable for some reason (keeps parity with the
@@ -118,6 +157,70 @@ def _verify_discord_signature(body: bytes, signature_hex: str, timestamp: str) -
         return True
     except (InvalidSignature, ValueError):
         return False
+
+
+def _timestamp_is_fresh(timestamp: str) -> bool:
+    """True iff ``timestamp`` (Discord's X-Signature-Timestamp: Unix seconds,
+    as a string) is within _TIMESTAMP_WINDOW_S of now, in either direction.
+
+    ``timestamp`` is external input from an unauthenticated-until-this-point
+    caller (this check runs on the raw header, same as the signature check
+    it accompanies) — missing, empty, non-numeric, or absurdly large/negative
+    values must all resolve to "not fresh" rather than raise into the route
+    handler. int() on an oversized-but-numeric string is fine (Python ints
+    are unbounded); a garbage value just fails the window comparison.
+    """
+    if not timestamp:
+        return False
+    try:
+        ts = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    now = int(time.time())
+    return abs(now - ts) <= _TIMESTAMP_WINDOW_S
+
+
+async def _claim_interaction_id(interaction_id: str) -> bool:
+    """Dedup an APPLICATION_COMMAND's interaction_id via claim_once() (SET NX
+    EX) under this module's own prefix/TTL (see the constants above).
+    Returns True for a fresh (never-seen) id — proceed; False for a replay
+    — reject.
+
+    FAILS OPEN when the claim store can't be reached: an unset REDIS_URL
+    (local mode always hits this — it has no Redis at all) raises
+    CloudBackendUnavailable from get_redis_client(), and a live Redis outage
+    in cloud raises the redis-py driver's own exception (ConnectionError /
+    TimeoutError / ...) from the SET itself — claim_once() lets both through
+    unchanged (see its docstring), and both are caught here, together,
+    deliberately.
+
+    This is the OPPOSITE posture from core.internal_auth.verify_request's
+    nonce claim, which fails closed — and that's a deliberate choice, not a
+    copy-paste of a different WP's trade-off:
+      - verify_request's nonce claim is that self-call envelope's ONLY
+        replay defense; losing it on a Redis outage would let a captured
+        internal request replay freely, and that endpoint has an in-process
+        fallback path on the CALLING side already, so failing closed there
+        costs nothing but robustness on an internal path nobody outside
+        Turtle can reach.
+      - Here, the signature check is what actually authenticates the
+        caller as Discord; the interaction_id dedup is a SECOND, narrower
+        layer on top of it (closing the "same valid request replayed inside
+        the freshness window" gap _timestamp_is_fresh doesn't cover). Failing
+        closed would mean a Redis blip makes the PUBLIC, customer-facing
+        Discord webhook reject every single interaction — not just replays —
+        for as long as the outage lasts. Failing open instead only widens
+        the replay window back to what _timestamp_is_fresh still bounds
+        (<=300s); it never admits an unsigned or forged request. That is a
+        strictly better trade for a public availability-sensitive endpoint
+        than trading total channel downtime for closing an already-bounded
+        window.
+    """
+    try:
+        return await claim_once(_INTERACTION_CLAIM_PREFIX, interaction_id, _INTERACTION_CLAIM_TTL_S)
+    except Exception as exc:
+        print(f"[Discord] interaction dedup store unavailable, failing OPEN: {exc}")
+        return True
 
 
 def _track(task_obj: asyncio.Task) -> None:
@@ -291,6 +394,21 @@ async def discord_interactions(request: Request):
     if not _verify_discord_signature(body, signature, timestamp):
         raise HTTPException(status_code=401, detail="Invalid request signature")
 
+    # WP 1.F: freshness check runs SECOND, right after signature
+    # verification and before anything else (including the PING
+    # short-circuit) — a replay check must never run against an
+    # unauthenticated request (that's its own DoS: burning claims for a
+    # caller who hasn't proven they're Discord), so it can only go after the
+    # signature check succeeds. It applies uniformly to every interaction
+    # type, PING included: a real endpoint-validation PING is always signed
+    # with a ~now timestamp, so this never breaks Discord's own probe / the
+    # "save the Interactions Endpoint URL" flow. Reject with the exact same
+    # 401 shape as a bad signature (per the WP: keep the handler's contract
+    # with Discord — which only distinguishes "not a valid signature" from
+    # everything else — consistent).
+    if not _timestamp_is_fresh(timestamp):
+        raise HTTPException(status_code=401, detail="Invalid request signature")
+
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
@@ -308,6 +426,18 @@ async def discord_interactions(request: Request):
         interaction_id = str(payload.get("id", ""))
         interaction_token = payload.get("token", "")
         channel_id = str(payload.get("channel_id", ""))
+
+        # WP 1.F: dedup claim runs right after we have interaction_id (still
+        # before the bot-loop check / text extraction below — no point doing
+        # more work for a request we're about to reject), and only for
+        # APPLICATION_COMMAND — a PING carries no interaction id worth
+        # claiming and must stay a fast, unconditional PONG for Discord's
+        # endpoint-registration probe. A repeat of the same interaction_id
+        # (a captured-and-replayed request, or Discord's own retry landing
+        # after we already accepted the first delivery) is rejected with the
+        # same 401 shape the signature/freshness checks use.
+        if interaction_id and not await _claim_interaction_id(interaction_id):
+            raise HTTPException(status_code=401, detail="Invalid request signature")
 
         # Author id + bot flag live under member.user (guild) or user (DM).
         member = payload.get("member") or {}
