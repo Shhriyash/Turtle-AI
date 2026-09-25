@@ -31,7 +31,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from apps.channels import TurtleEvent, TurtleResponse, dispatch_event
 from core.config import settings
-from core.identity import identity_manager
+from core.identity import CHANNEL_INVITE_ONLY_MESSAGE, resolve_channel_user
 
 router = APIRouter(prefix="/channels/slack", tags=["slack"])
 
@@ -145,7 +145,12 @@ async def slack_events(request: Request):
     import asyncio
 
     async def _process():
-        user_id = await identity_manager.resolve_user("slack", slack_user_id)
+        user_id = await resolve_channel_user("slack", slack_user_id)
+        if user_id is None:
+            # TURTLE_CHANNEL_SIGNUP=invite and this sender is unknown —
+            # reply with the invite message and mint nothing.
+            await _post_slack_message(channel_id, CHANNEL_INVITE_ONLY_MESSAGE, thread_ts=thread_ts)
+            return
         turtle_event = TurtleEvent(
             user_id=user_id,
             channel="slack",
@@ -153,6 +158,12 @@ async def slack_events(request: Request):
             content=text,
             message_id=event_ts,
             thread_id=thread_ts,
+            # WP 1.D follow-up: this was previously left unset, which meant
+            # _channel_dispatch_handler's rate-limit key, lock key, and
+            # account-link re-resolve guard all silently fell back to
+            # event.user_id for this channel instead of the raw channel
+            # identity.
+            channel_user_id=slack_user_id,
         )
         response: TurtleResponse = await dispatch_event(turtle_event)
         await _post_slack_message(channel_id, response.content, thread_ts=thread_ts)

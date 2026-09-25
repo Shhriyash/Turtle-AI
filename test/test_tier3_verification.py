@@ -469,9 +469,7 @@ class TestF6Discord:
         with mock.patch("apps.channels.discord._verify_discord_signature", return_value=True), \
              mock.patch("apps.channels.discord.dispatch_event", side_effect=_fake_dispatch), \
              mock.patch("apps.channels.discord._send_followup", side_effect=_fake_followup), \
-             mock.patch.object(
-                 __import__("apps.channels.discord", fromlist=["identity_manager"]).identity_manager,
-                 "resolve_user", side_effect=_fake_resolve):
+             mock.patch("apps.channels.discord.resolve_channel_user", side_effect=_fake_resolve):
             with TestClient(test_app) as client:
                 resp = client.post(
                     "/channels/discord",

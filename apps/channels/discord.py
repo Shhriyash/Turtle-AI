@@ -53,7 +53,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from apps.channels import TurtleEvent, TurtleResponse, dispatch_event
 from core.config import settings
-from core.identity import identity_manager
+from core.identity import CHANNEL_INVITE_ONLY_MESSAGE, resolve_channel_user
 from core.internal_auth import (
     SignatureError,
     check_bearer,
@@ -168,7 +168,12 @@ async def _process_deferred_interaction(payload: dict) -> None:
     interaction_token = payload["interaction_token"]
     try:
         discord_user_id = payload["discord_user_id"]
-        user_id = await identity_manager.resolve_user("discord", discord_user_id)
+        user_id = await resolve_channel_user("discord", discord_user_id)
+        if user_id is None:
+            # TURTLE_CHANNEL_SIGNUP=invite and this sender is unknown — reply
+            # with the invite message and mint nothing (see core/identity.py).
+            await _send_followup(interaction_token, CHANNEL_INVITE_ONLY_MESSAGE)
+            return
         turtle_event = TurtleEvent(
             user_id=user_id,
             channel="discord",
