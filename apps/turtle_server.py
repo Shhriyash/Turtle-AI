@@ -2772,6 +2772,44 @@ async def _validate_google_calendar_credentials() -> None:
 
 
 @app.on_event("startup")
+async def _warn_on_missing_calendar_token_key() -> None:
+    """Loudly flag CALENDAR_TOKEN_KEY being unset in cloud mode.
+
+    core/config.py's field_validator already catches a MALFORMED key at
+    settings-construction time (before this even runs) — that one fails
+    process boot outright, because a malformed key is unambiguously a typo
+    to fix before anything else happens. An UNSET key in cloud is different:
+    it is a valid, working configuration for a deploy that simply hasn't
+    wired up Calendar OAuth token encryption yet, and calendar is one
+    optional integration — the rest of the app (chat, memory, every other
+    tool) works fine without it. So this warns instead of refusing to start,
+    mirroring _warn_on_vercel_deploy_mode_mismatch above rather than
+    _require_cloud_backends_configured's refuse-to-boot posture: without
+    this warning, the only signal an operator gets is a user hitting a 503
+    on /integrations/google_calendar/callback — possibly days after
+    deploying, and reported as a complaint rather than caught in logs.
+
+    No-op in local mode: CALENDAR_TOKEN_KEY there is optional by design
+    (falls back to plaintext-on-disk, today's dev-box behaviour — see
+    core/calendar_token_crypto.py), so an unset key locally is not
+    noteworthy.
+    """
+    if not settings.is_cloud:
+        return
+    if settings.calendar_token_key is not None:
+        return
+    print(
+        "LOG: WARNING - CALENDAR_TOKEN_KEY is unset in cloud mode. Google "
+        "Calendar connections will be refused (503 on "
+        "/integrations/google_calendar/callback) rather than silently "
+        "storing tokens unencrypted in Postgres. Generate one with: "
+        "python -c \"import secrets, base64; print(base64.urlsafe_b64encode"
+        "(secrets.token_bytes(32)).decode())\" and set CALENDAR_TOKEN_KEY.",
+        flush=True,
+    )
+
+
+@app.on_event("startup")
 async def _start_routine_scheduler() -> None:
     global _routine_scheduler, _APP_LOOP
     # Capture the running app loop so the scheduler thread can bridge routine

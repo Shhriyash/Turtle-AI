@@ -20,6 +20,15 @@ httpx==0.28.1
 google-genai==1.66.0
 google-auth==2.49.0
 google-api-python-client==2.184.0  # googleapiclient.discovery — tools/calendar_tool.py
+
+# AES-256-GCM encryption at rest for stored Calendar OAuth tokens
+# (core/calendar_token_crypto.py, WP1.E2 / ledger 1b.3). Was already present
+# at 46.0.6 as a TRANSITIVE dependency (via google-auth, Authlib, aiortc,
+# pyOpenSSL) — that is an accident of what those packages happen to pull in,
+# not a guarantee, and a clean install could silently stop providing it if
+# any of them drop cryptography as a dependency. Pinned explicitly now that
+# token-at-rest encryption actually depends on it.
+cryptography==46.0.6
 opentelemetry-api==1.39.1  # pinned: google-api-core wants >=1.44 but logfire's opentelemetry-sdk wants ==1.39.1
 
 # RAG / Embeddings

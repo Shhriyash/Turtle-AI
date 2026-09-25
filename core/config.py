@@ -209,6 +209,25 @@ class TurtleSettings(BaseSettings):
     google_calendar_token_json: Optional[str] = Field(
         default=None, alias="GOOGLE_CALENDAR_TOKEN_JSON"
     )
+    # AES-256-GCM key for encrypting stored per-user Calendar OAuth tokens at
+    # rest (core/calendar_token_crypto.py). urlsafe-base64, 32 raw bytes.
+    # Optional in local mode (falls back to plaintext, today's behaviour on a
+    # single-tenant dev box); effectively required in cloud mode, where
+    # writing a token without it is refused rather than silently storing
+    # plaintext in a shared Postgres row (see calendar_token_crypto.
+    # encrypt_for_storage). Validated below at settings-construction time —
+    # a malformed value fails process boot, not the first calendar connect.
+    calendar_token_key: Optional[SecretStr] = Field(default=None, alias="CALENDAR_TOKEN_KEY")
+
+    @field_validator("calendar_token_key")
+    @classmethod
+    def _validate_calendar_token_key(cls, value: Optional[SecretStr]) -> Optional[SecretStr]:
+        if value is None:
+            return value
+        from core.calendar_token_crypto import parse_key
+
+        parse_key(value.get_secret_value())  # raises CalendarTokenKeyError if malformed
+        return value
 
     # Google Maps Platform — Places API (New) + Routes API.
     # A single API key covers both surfaces. Enable the "Places API (New)" and

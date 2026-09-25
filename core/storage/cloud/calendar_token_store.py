@@ -23,6 +23,19 @@ and the write/delete/exists call sites in apps/calendar_oauth_routes.py are
 wrapped in asyncio.to_thread at their call sites for the same reason — a
 consistent posture across both the async-route and to-thread-worker contexts
 without a second (async) driver need.
+
+Encryption at rest (core/calendar_token_crypto.py): this module is
+deliberately encryption-agnostic — token_json is an opaque string as far as
+this table is concerned. It holds either a bare plaintext token JSON blob
+(pre-encryption tokens, and any local-mode token written with no
+CALENDAR_TOKEN_KEY configured) or a `{"key_version": N, "blob": "..."}`
+envelope. There is no separate `key_version` SQL column on purpose: the
+value already has to round-trip through a single TEXT column on the local
+disk (a JSON file, no schema at all) via the exact same envelope shape, so
+key_version is carried inside the stored value itself instead of splitting
+it across a Postgres-only column that the local backend could not mirror.
+apps/calendar_oauth_routes.py's _read_token/_write_token do the
+encrypt/decrypt/migrate-on-next-write around calls to this module.
 """
 from __future__ import annotations
 
