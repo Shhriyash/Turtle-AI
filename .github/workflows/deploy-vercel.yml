@@ -140,10 +140,24 @@ jobs:
           echo "- /healthz: OK (sha=$actual_sha matches $BUILD_SHA)" >> "$GITHUB_STEP_SUMMARY"
 
       # Same non-swallowing reasoning as /healthz above: no `--fail` on curl,
-      # so a 503 comes back as a normal response we inspect explicitly; a
-      # `vercel curl` process failure still trips `set -e` because the
-      # `response=$(...)` assignment is not a condition and so isn't exempt
-      # from `set -e` the way an `if`/`&&`/`||`/negated command would be.
+      # so a 503 comes back as a normal response we inspect explicitly.
+      #
+      # Retries: on a brand-new deployment, /readyz is the FIRST database
+      # call — it has to build the asyncpg pool AND wake a suspended Neon
+      # compute (see core/storage/cloud/__init__.py's READYZ_TIMEOUT_S
+      # comment). That is sometimes slower than even the raised 8s server
+      # budget on a genuinely cold compute, which is transient, not a
+      # backend fault (confirmed: a re-run of the same commit minutes later
+      # passed, and warm production answers in 0.3-1.0s). So this loop
+      # retries up to 5 times, 5s apart, succeeding on the first HTTP 200 and
+      # failing the step only once every attempt has failed.
+      #
+      # Bash correctness: this step still runs under `set -euo pipefail`.
+      # Inside the loop, `response=$(... ) || true` explicitly neutralises a
+      # non-zero exit from the `vercel curl` pipeline (a plain assignment is
+      # NOT a `set -e` exception — only `if`/`&&`/`||`/negated commands are —
+      # so without the trailing `|| true` a single failed attempt would abort
+      # the whole step instead of letting the loop retry).
       - name: Probe /readyz
         id: readyz
         env:
@@ -153,18 +167,32 @@ jobs:
           DEPLOY_URL: ${{ steps.deploy.outputs.url }}
         run: |
           set -euo pipefail
-          response=$(timeout 30 vercel curl /readyz \
-            --deployment "$DEPLOY_URL" --yes \
-            -- --silent --show-error --max-time 20 -w '\n%{http_code}')
-          http_code=$(echo "$response" | tail -n1)
-          body=$(echo "$response" | sed '$d')
-          echo "$body"
-          if [ "$http_code" != "200" ]; then
-            echo "::error::/readyz returned HTTP $http_code: $body"
-            echo "- /readyz: FAILED (HTTP $http_code): $body" >> "$GITHUB_STEP_SUMMARY"
+          max_attempts=5
+          sleep_s=5
+          succeeded=""
+          for attempt in $(seq 1 "$max_attempts"); do
+            response=$(timeout 30 vercel curl /readyz \
+              --deployment "$DEPLOY_URL" --yes \
+              -- --silent --show-error --max-time 20 -w '\n%{http_code}') || true
+            http_code=$(echo "$response" | tail -n1)
+            body=$(echo "$response" | sed '$d')
+            if [ "$http_code" = "200" ]; then
+              echo "$body"
+              echo "- /readyz: OK (HTTP 200, attempt $attempt/$max_attempts)" >> "$GITHUB_STEP_SUMMARY"
+              succeeded="1"
+              break
+            fi
+            echo "attempt $attempt/$max_attempts: /readyz returned HTTP $http_code: $body"
+            if [ "$attempt" != "$max_attempts" ]; then
+              sleep "$sleep_s"
+            fi
+          done
+          if [ -z "$succeeded" ]; then
+            echo "$body"
+            echo "::error::/readyz returned HTTP $http_code after $max_attempts attempts: $body"
+            echo "- /readyz: FAILED after $max_attempts attempts (HTTP $http_code): $body" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          echo "- /readyz: OK (HTTP 200)" >> "$GITHUB_STEP_SUMMARY"
 
       # Only reached if the deploy step succeeded AND both probes above
       # returned success (see the note on the deploy step). A failed check
