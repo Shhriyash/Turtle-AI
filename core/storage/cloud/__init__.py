@@ -12,9 +12,14 @@ runs the full local/SQLite test suite untouched.
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
+import os
 from typing import Any, Optional
 
 from core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class CloudBackendUnavailable(RuntimeError):
@@ -212,8 +217,61 @@ def close_redis_sync_client() -> None:
 # ---------------------------------------------------------------------------
 # A module-level default so tests can shrink the budget (e.g. to prove a
 # hanging backend doesn't make /readyz hang) without actually waiting out a
-# real 2s timeout. The /readyz route never hardcodes this value itself.
-READYZ_TIMEOUT_S = 2.0
+# real timeout. The /readyz route never hardcodes this value itself.
+#
+# 8.0s (raised from an original 2.0s): on a brand-new deployment, /readyz is
+# the FIRST database call — it must build the asyncpg pool (DNS + TLS +
+# connect) and wake a suspended Neon compute, both inside this one budget.
+# Redis (Upstash, HTTP-ish, no suspend) comfortably beat 2s; Postgres cold
+# start did not, producing a false-negative 503 on an otherwise-healthy
+# deploy. probe_postgres() and probe_redis() are awaited concurrently via
+# asyncio.gather() in the /readyz handler, so raising this to 8.0 does NOT
+# make the route's worst case 16s — both probes share the one wall-clock
+# budget, run in parallel, and the route returns as soon as both resolve.
+#
+# Overridable via TURTLE_READYZ_TIMEOUT_S so the budget can be tuned without
+# a deploy. Read here (not core/config.py, which this WP does not own) and
+# guarded so a malformed value falls back to the default rather than raising
+# at import time — an exception here would break every cloud boot.
+_READYZ_TIMEOUT_DEFAULT = 8.0
+
+
+def _read_readyz_timeout_s() -> float:
+    raw = os.environ.get("TURTLE_READYZ_TIMEOUT_S")
+    if raw is None or not raw.strip():
+        # Unset/empty is normal, not an error — no warning.
+        return _READYZ_TIMEOUT_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "TURTLE_READYZ_TIMEOUT_S=%r is not a valid number; falling back to "
+            "the %.1fs default.",
+            raw,
+            _READYZ_TIMEOUT_DEFAULT,
+        )
+        return _READYZ_TIMEOUT_DEFAULT
+    # asyncio.wait_for(timeout=0 or negative) raises TimeoutError instantly,
+    # which would make /readyz a permanent 503 in cloud mode; a non-finite
+    # value (inf/nan) either never times out (nan — the exact opposite of
+    # this module's "a hanging backend doesn't make /readyz hang" promise)
+    # or is simply nonsensical (inf). math.isfinite(nan) is False, so this
+    # one check catches both non-finite cases; `value > 0` catches zero and
+    # negatives WITHOUT relying on `value <= 0`, since every comparison
+    # against nan (including `nan <= 0`) is False and would silently let
+    # nan slip through a naive check.
+    if not math.isfinite(value) or not value > 0:
+        logger.warning(
+            "TURTLE_READYZ_TIMEOUT_S=%r must be a finite, strictly positive "
+            "number; falling back to the %.1fs default.",
+            raw,
+            _READYZ_TIMEOUT_DEFAULT,
+        )
+        return _READYZ_TIMEOUT_DEFAULT
+    return value
+
+
+READYZ_TIMEOUT_S = _read_readyz_timeout_s()
 
 
 async def probe_postgres(timeout: Optional[float] = None) -> bool:

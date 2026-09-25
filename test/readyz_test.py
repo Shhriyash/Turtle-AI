@@ -11,6 +11,7 @@ Fully offline: probes are monkeypatched, no real Postgres/Redis is touched.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import unittest
 from unittest.mock import patch
 
@@ -230,6 +231,90 @@ class HealthzShaTest(unittest.TestCase):
         body = resp.json()
         self.assertIn("sha", body)
         self.assertIsNone(body["sha"])
+
+
+class ReadyzTimeoutBudgetTest(unittest.TestCase):
+    """WP0.F: the server-side READYZ_TIMEOUT_S budget, and its env override."""
+
+    def _reload_cloud_module(self):
+        import core.storage.cloud as cloud_mod
+
+        importlib.reload(cloud_mod)
+        return cloud_mod
+
+    def tearDown(self) -> None:
+        # Always reload once more with the env var cleared, so the module's
+        # module-level READYZ_TIMEOUT_S doesn't leak a test override into
+        # later tests/modules that import core.storage.cloud.
+        import os as _os
+
+        _os.environ.pop("TURTLE_READYZ_TIMEOUT_S", None)
+        self._reload_cloud_module()
+
+    def test_default_budget_is_eight_seconds_when_unset(self) -> None:
+        import os as _os
+
+        _os.environ.pop("TURTLE_READYZ_TIMEOUT_S", None)
+        cloud_mod = self._reload_cloud_module()
+        self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
+
+    def test_valid_override_is_honoured(self) -> None:
+        with patch.dict("os.environ", {"TURTLE_READYZ_TIMEOUT_S": "3.5"}):
+            cloud_mod = self._reload_cloud_module()
+            self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 3.5)
+
+    def test_unparseable_override_falls_back_to_default(self) -> None:
+        with patch.dict("os.environ", {"TURTLE_READYZ_TIMEOUT_S": "abc"}):
+            cloud_mod = self._reload_cloud_module()
+            self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
+
+    def test_empty_override_falls_back_to_default(self) -> None:
+        with patch.dict("os.environ", {"TURTLE_READYZ_TIMEOUT_S": ""}):
+            cloud_mod = self._reload_cloud_module()
+            self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
+
+    def test_zero_override_falls_back_to_default(self) -> None:
+        """0 would make asyncio.wait_for raise TimeoutError instantly, making
+        /readyz a permanent 503 in cloud mode — must fall back instead."""
+        with patch.dict("os.environ", {"TURTLE_READYZ_TIMEOUT_S": "0"}):
+            cloud_mod = self._reload_cloud_module()
+            self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
+
+    def test_negative_override_falls_back_to_default(self) -> None:
+        with patch.dict("os.environ", {"TURTLE_READYZ_TIMEOUT_S": "-5"}):
+            cloud_mod = self._reload_cloud_module()
+            self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
+
+    def test_nan_override_falls_back_to_default(self) -> None:
+        """nan must not slip through a naive `value <= 0` check — every
+        comparison against nan is False, so `nan <= 0` is also False. This
+        pins that math.isfinite() (not a bare `<= 0` comparison) is what
+        catches it: with nan, asyncio.wait_for never times out at all,
+        the exact opposite of this module's hang-safety promise."""
+        with patch.dict("os.environ", {"TURTLE_READYZ_TIMEOUT_S": "nan"}):
+            cloud_mod = self._reload_cloud_module()
+            self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
+
+    def test_infinite_override_falls_back_to_default(self) -> None:
+        with patch.dict("os.environ", {"TURTLE_READYZ_TIMEOUT_S": "1e400"}):
+            cloud_mod = self._reload_cloud_module()
+            self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
+
+    def test_probe_exceeding_raised_budget_still_returns_false(self) -> None:
+        """Raising the default to 8.0 must not make the timeout path
+        unreachable — pass an explicit small `timeout=` so this stays fast
+        rather than actually waiting out 8s."""
+        cloud_mod = self._reload_cloud_module()
+
+        async def _run() -> bool:
+            async def hanging_pool():
+                await asyncio.sleep(5)
+                raise AssertionError("should have timed out long before this")
+
+            with patch.object(cloud_mod, "get_pg_pool", side_effect=hanging_pool):
+                return await cloud_mod.probe_postgres(timeout=0.05)
+
+        self.assertFalse(asyncio.run(_run()))
 
 
 if __name__ == "__main__":
