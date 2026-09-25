@@ -54,6 +54,16 @@ _ROUTES_ENDPOINT = "https://routes.googleapis.com/directions/v2:computeRoutes"
 #   pool=3.0    — waiting for a free connection out of httpx's pool.
 # Worst case ~12s end-to-end, matching the previous flat ceiling, but each
 # phase now fails on its own schedule instead of one undifferentiated timer.
+#
+# Applied PER-REQUEST (as the `timeout=` kwarg on each client.post/get call
+# in _post_json/_get_json), not just as the fallback httpx.AsyncClient's
+# constructor default. apps/turtle_server.py always injects a shared
+# http_client built as a plain httpx.AsyncClient() with no timeout of its
+# own, so relying on the constructor-time default alone would make these
+# tuned values dead code in the deployed app — every Places/Routes call
+# would silently fall back to httpx's generic default instead. httpx
+# supports overriding a client's timeout per request, which works whether or
+# not a client was injected, so that's what's used here.
 _DEFAULT_TIMEOUT = httpx.Timeout(connect=3.0, read=8.0, write=3.0, pool=3.0)
 
 # Cache TTLs (S-7.9): search results churn faster (open/closed, new listings)
@@ -505,16 +515,24 @@ async def _post_json(
         "X-Goog-FieldMask": field_mask,
     }
     owns_client = http_client is None
-    client = http_client or httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT)
+    client = http_client or httpx.AsyncClient()
     try:
-        resp = await client.post(url, json=payload, headers=headers)
+        resp = await client.post(
+            url, json=payload, headers=headers, timeout=_DEFAULT_TIMEOUT
+        )
     except httpx.TimeoutException:
         return None, ToolResult.upstream_error(
             message="Google API timed out.", code="timeout", retryable=True
         )
     except httpx.HTTPError as exc:
+        # Never surface str(exc) to the model — an httpx.ConnectError etc.
+        # can carry an internal hostname or an API-key-shaped string in its
+        # message. Fixed, non-leaky message to the model; full detail to the
+        # server-side log only, mirroring _http_error_result's HTTP-status
+        # path.
+        logger.warning("Google API network error: call=%s error=%s", context, exc)
         return None, ToolResult.upstream_error(
-            message=f"Google API network error: {exc}", code="network_error", retryable=True
+            message="Google API network error.", code="network_error", retryable=True
         )
     finally:
         if owns_client:
@@ -545,16 +563,18 @@ async def _get_json(
         "X-Goog-FieldMask": field_mask,
     }
     owns_client = http_client is None
-    client = http_client or httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT)
+    client = http_client or httpx.AsyncClient()
     try:
-        resp = await client.get(url, headers=headers)
+        resp = await client.get(url, headers=headers, timeout=_DEFAULT_TIMEOUT)
     except httpx.TimeoutException:
         return None, ToolResult.upstream_error(
             message="Google API timed out.", code="timeout", retryable=True
         )
     except httpx.HTTPError as exc:
+        # See _post_json's identical branch: str(exc) is never model-safe.
+        logger.warning("Google API network error: call=%s error=%s", context, exc)
         return None, ToolResult.upstream_error(
-            message=f"Google API network error: {exc}", code="network_error", retryable=True
+            message="Google API network error.", code="network_error", retryable=True
         )
     finally:
         if owns_client:
@@ -584,10 +604,12 @@ async def find_place(
     """Text search: return the top matching places for a natural-language query.
 
     user_id scopes the per-user daily call cap only (tools/places_guardrails.py)
-    — the response cache itself is intentionally global, not per-user. Not yet
-    threaded through from apps/turtle_server.py's tool-registration closure
-    (see this WP's report); defaults to a shared "anonymous" bucket until that
-    one-line wiring lands.
+    — the response cache itself is intentionally global, not per-user. Wired
+    through from apps/turtle_server.py's tool-registration closure
+    (user_id=ctx.deps.user_id), so the cap keys on the real caller in
+    production. The "anonymous" fallback below only fires for a caller that
+    genuinely has no user id (e.g. a direct call with user_id left unset,
+    such as in tests) — it is not the default production path.
     """
     query = args.query.strip()
     if not query:
@@ -660,8 +682,8 @@ async def place_details(
 ) -> ToolResult[PlaceDetailsResult]:
     """Fetch full details for a specific place_id from Places API (New).
 
-    See find_place's docstring for the user_id caveat (not yet wired from
-    apps/turtle_server.py this wave).
+    See find_place's docstring for the user_id note — same wiring, same
+    "anonymous" fallback.
     """
     pid = args.place_id.strip()
     if not pid:

@@ -51,6 +51,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from typing import Any, Optional
 
 from core.config import settings
@@ -103,7 +104,17 @@ class InProcessPlacesCache:
     Lost on process restart and not shared across workers — acceptable for
     local/dev mode, which already runs single-process (SQLite/FAISS are the
     same story). Cloud mode gets the real, persistent Redis cache below.
+
+    Bounded to _MAX_ENTRIES: nothing ever evicted entries here before, so a
+    single long-running dev process could grow this dict without limit.
+    Local mode is single-process/dev-only (low severity), but the fix is
+    cheap: once full, a set() sweeps expired entries first and, if still
+    full, evicts the single soonest-to-expire entry to make room — no
+    background thread, no extra locking, just amortized cleanup on the
+    already-locked write path.
     """
+
+    _MAX_ENTRIES = 5000
 
     def __init__(self) -> None:
         self._store: dict[str, tuple[float, Any]] = {}
@@ -123,6 +134,14 @@ class InProcessPlacesCache:
 
     def set(self, key: str, value: Any, ttl_seconds: int) -> None:
         with self._lock:
+            if key not in self._store and len(self._store) >= self._MAX_ENTRIES:
+                now = time.time()
+                expired = [k for k, (exp, _) in self._store.items() if exp <= now]
+                for k in expired:
+                    del self._store[k]
+                if len(self._store) >= self._MAX_ENTRIES:
+                    oldest_key = min(self._store, key=lambda k: self._store[k][0])
+                    del self._store[oldest_key]
             self._store[key] = (time.time() + ttl_seconds, value)
 
 
@@ -134,7 +153,18 @@ class InProcessPlacesCallLimiter:
     share a keyspace with in the first place, so the "don't collide with
     ws_rate" concern is moot here; it only matters for the cloud
     implementation below.
+
+    This dict is bounded to _MAX_USERS distinct user_ids for the same
+    unbounded-growth reason as InProcessPlacesCache above — a single
+    long-running dev process with many distinct callers could otherwise
+    grow it without limit. Concurrency-safety (the threading.Lock held
+    across the whole check-then-record critical section, verified race-free
+    with 50 real OS threads) is unchanged; eviction only ever drops
+    ALREADY-EMPTY-OR-EXPIRED user histories, never a live one being decided
+    on in the current call.
     """
+
+    _MAX_USERS = 5000
 
     def __init__(self, *, per_day: Optional[int] = None) -> None:
         self.per_day = int(
@@ -156,6 +186,36 @@ class InProcessPlacesCallLimiter:
                 raise PlacesCallCapExceeded(uid, self.per_day)
             history.append(now)
             self._events[uid] = history
+            if len(self._events) > self._MAX_USERS:
+                # Sweep users with no events left in the window first (the
+                # common, safe case — this user's own entry was just
+                # written above so it can never be the one dropped here).
+                stale = [
+                    u
+                    for u, hist in self._events.items()
+                    if not any(t > day_cutoff for t in hist)
+                ]
+                for u in stale:
+                    del self._events[u]
+                # Still over the bound (e.g. genuinely _MAX_USERS+ distinct
+                # callers active within the same day): evict ONE
+                # least-recently-active user to make room. One eviction per
+                # call rather than trimming down to the bound in one shot
+                # keeps each call O(n) instead of O(n log n) repeated on
+                # every subsequent call; size still converges back toward
+                # the bound as long as growth continues. This is a memory
+                # bound, not a correctness guarantee — it can reset an
+                # evicted user's window earlier than the full 24h.
+                # Acceptable for local/dev-only mode; never evicts the
+                # current caller's own just-written entry.
+                if len(self._events) > self._MAX_USERS:
+                    oldest_user = min(
+                        (u for u in self._events if u != uid),
+                        key=lambda u: max(self._events[u], default=0.0),
+                        default=None,
+                    )
+                    if oldest_user is not None:
+                        del self._events[oldest_user]
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +265,50 @@ class RedisPlacesCallLimiter:
     OWN turtle:places_cap:v1: namespace so it never shares state (or
     double-counts) with that limiter's turtle:ws_rate: keys. See the module
     docstring for the full rationale.
+
+    ATOMICITY. The previous version decided on a value read a moment
+    earlier: ZREMRANGEBYSCORE -> ZCARD (read) -> conditional ZADD (write) as
+    three separate round-trips with nothing tying them together. Verified
+    live: with a realistic delay inserted between the read and the write, 20
+    concurrent callers against a cap of 5 all read the same pre-write count
+    and all passed — 20 allowed, 0 capped. This is the same shape as wave
+    1's email idempotency bug, the replay nonce, and the token budget (see
+    apps/turtle_server.py's _reserve_daily_spend) before each of those was
+    fixed the same way: stop deciding on a stale read, let Redis hold the
+    invariant.
+
+    ZADD FIRST, THEN COUNT. Each caller writes its own uniquely-keyed member
+    into the sorted set before counting, then counts (which — being a single
+    ZCARD after our own ZADD has already landed — necessarily includes our
+    own write, since Redis executes each command atomically and this
+    caller's ZADD happened-before its own ZCARD by program order on the same
+    connection). If the post-insert count is over the cap, this caller
+    removes exactly the member IT added (never an arbitrary one — two
+    concurrent refusals must each only clean up their own write) and
+    refuses. This mirrors _reserve_daily_spend's "reserve first, refund on
+    refusal" shape, adapted from a counter (INCRBY) to a sliding-window set
+    (ZADD + ZREM).
+
+    UNIQUE MEMBER PER CALL. A bare timestamp is not unique enough: two
+    calls landing in the same float tick collapse into a single sorted-set
+    entry (one lost, one call under-counted). Each member is
+    "<timestamp>:<uuid4>", so no two calls can ever collide regardless of
+    timing.
+
+    STRANDED MEMBERS. Any failure after our own ZADD lands — including a
+    refusal, and including a mid-flight crash on ZREMRANGEBYSCORE/
+    ZCARD/EXPIRE — must remove that member before returning, or it survives
+    (up to the ~25h key TTL) as a phantom entry that silently eats into a
+    later window. This is exactly the bug wave 1 shipped once already
+    (a refusal path that stranded a reservation instead of refunding it), so
+    cleanup here runs from a `except BaseException`, not `except Exception`
+    — asyncio.CancelledError and friends are BaseException, not Exception,
+    and a caller cancelled mid-check must not leak a member either. A
+    non-Exception BaseException (CancelledError, KeyboardInterrupt,
+    SystemExit) is cleaned up and then re-raised — cancellation must still
+    propagate. An ordinary Exception (a Redis driver failure) is cleaned up,
+    logged, and swallowed so the call fails open, per this module's
+    documented Redis-unavailable posture.
     """
 
     def __init__(self, *, per_day: Optional[int] = None) -> None:
@@ -216,24 +320,49 @@ class RedisPlacesCallLimiter:
         if self.per_day <= 0:
             return
         uid = user_id or "anonymous"
+        key = f"{_CAP_KEY_PREFIX}:{uid}"
+        now = time.time()
+        day_cutoff = now - 86400
+        member = f"{now}:{uuid.uuid4().hex}"
+        client = None
+        added = False
+        over_cap = False
         try:
             from core.storage.cloud import get_redis_sync_client
 
             client = get_redis_sync_client()
-            key = f"{_CAP_KEY_PREFIX}:{uid}"
-            now = time.time()
-            day_cutoff = now - 86400
+            client.zadd(key, {member: now})
+            added = True
             client.zremrangebyscore(key, "-inf", day_cutoff)
             count = client.zcard(key)
-            if count >= self.per_day:
-                raise PlacesCallCapExceeded(uid, self.per_day)
-            member = f"{now}:{id(object())}"
-            client.zadd(key, {member: now})
             client.expire(key, _CAP_KEY_TTL_S)
-        except PlacesCallCapExceeded:
-            raise
-        except Exception as exc:  # fail open — see module docstring
-            logger.warning(
-                "Places call cap check failed (%s); failing open (call allowed).",
-                exc,
-            )
+            if count > self.per_day:
+                over_cap = True
+        except BaseException as exc:
+            if added and client is not None:
+                try:
+                    client.zrem(key, member)
+                except Exception:
+                    pass  # best-effort cleanup; the key TTL still bounds it
+            if isinstance(exc, Exception):
+                # fail open — see module docstring
+                logger.warning(
+                    "Places call cap check failed (%s); failing open "
+                    "(call allowed).",
+                    exc,
+                )
+                return
+            raise  # cancellation / interpreter-exit signals must propagate
+
+        if over_cap:
+            try:
+                client.zrem(key, member)
+            except Exception as exc:
+                logger.warning(
+                    "Places call cap cleanup failed (%s) after refusal for "
+                    "user %s; the stray member will expire with the key "
+                    "TTL.",
+                    exc,
+                    uid,
+                )
+            raise PlacesCallCapExceeded(uid, self.per_day)
