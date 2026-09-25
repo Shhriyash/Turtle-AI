@@ -1846,6 +1846,22 @@ class RememberArgs(_RememberBaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# link_account tool args (WP1.J — two-sided link-code binding, ledger 1b.6)
+# ---------------------------------------------------------------------------
+class LinkAccountArgs(_RememberBaseModel):
+    expected_email: str = _RememberField(
+        ...,
+        description=(
+            "The email address of the Turtle WEB account the user will sign in "
+            "with to finish linking. Ask for it if they haven't given it. This is "
+            "never treated as proof of anything by itself — the authenticated web "
+            "session is still what proves ownership — it only lets the server "
+            "refuse a code redeemed by the wrong account."
+        ),
+    )
+
+
 def _build_model_from_str(model_str: str, settings: Any) -> Any | None:
     """Parse 'provider:model_name' and return a pydantic-ai model object."""
     if not model_str:
@@ -2406,7 +2422,7 @@ class AgentManager:
                 return ToolResult.empty("No relevant information found.").to_agent_string()
             return ToolResult.ok(recall_text).to_agent_string()
 
-        async def link_account(ctx: RunContext[SharedState]) -> str:
+        async def link_account(ctx: RunContext[SharedState], args: LinkAccountArgs) -> str:
             """Issue a claim code to link this channel identity to a web account."""
             deps = ctx.deps
             channel = str(getattr(deps, "channel", "") or "")
@@ -2429,6 +2445,21 @@ class AgentManager:
                     "first would end up with your memory. Send me a direct "
                     "message and I'll set it up there."
                 ).to_agent_string()
+            # Two-sided binding (WP1.J, ledger 1b.6): the caller states which web
+            # account they intend to redeem with. This is NOT trusted as proof of
+            # anything — the authenticated web session at redemption is still the
+            # only thing that proves account ownership — it only lets redemption
+            # REFUSE a session that doesn't match. See core/account_linking.py's
+            # module docstring for the full threat-model writeup.
+            from core.identity import normalize_email
+
+            expected_email = normalize_email(args.expected_email)
+            if not expected_email or "@" not in expected_email:
+                return ToolResult.invalid(
+                    "I need the email address of the Turtle web account you'll "
+                    "sign in with to finish linking — that's what lets me refuse "
+                    "the code if anyone but you tries to redeem it."
+                ).to_agent_string()
             try:
                 from core.account_linking import LINK_CODE_TTL_MINUTES
                 from core.storage.factory import get_link_code_store
@@ -2439,6 +2470,7 @@ class AgentManager:
                     channel=channel,
                     channel_user_id=channel_uid,
                     source_user_id=deps.user_id,
+                    expected_email=expected_email,
                 )
             except Exception as e:
                 return ToolResult.upstream_error(
@@ -2446,9 +2478,10 @@ class AgentManager:
                 ).to_agent_string()
             return ToolResult.ok(
                 f"Link code: {issued.code}\n"
-                f"To finish linking, sign in to Turtle on the web and enter this code "
-                f"in Settings -> Link account. It expires in {LINK_CODE_TTL_MINUTES} minutes "
-                f"and can only be used once. Signing in is what proves the web account is "
+                f"To finish linking, sign in to Turtle on the web as {expected_email} and "
+                f"enter this code in Settings -> Link account. It expires in "
+                f"{LINK_CODE_TTL_MINUTES} minutes, can only be used once, and only that "
+                f"account can redeem it. Signing in is what proves the web account is "
                 f"yours — I can't link on an email address alone."
             ).to_agent_string()
 
@@ -3858,6 +3891,42 @@ async def confirm_memory(request: Request):
     return JSONResponse({"status": "ok", "applied": accepted})
 
 
+async def _get_target_account_email(user_id: str) -> str | None:
+    """The authoritative email on file for ``user_id`` (the ``users.primary_email``
+    column) — used ONLY to check the two-sided link binding (WP1.J, ledger
+    1b.6). Deliberately a raw query against the SAME `users` table
+    core.identity.IdentityManager / core.storage.cloud.identity_store.
+    PostgresIdentityManager already own, rather than a new method on either —
+    both files belong to a parallel WP and are not touched here. This value
+    is NOT something the redeemer supplies; it's whatever the web sign-in
+    flow (magic-link claim / dev fast-path) already put in the users table,
+    so there is nothing for a redeemer to spoof by typing a different email
+    into this endpoint.
+    """
+    if not user_id:
+        return None
+    if settings.is_cloud:
+        from core.storage.cloud import get_pg_pool
+
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT primary_email FROM users WHERE user_id = $1", user_id
+            )
+            return row["primary_email"] if row else None
+
+    import aiosqlite
+
+    from core.identity import identity_manager
+
+    async with aiosqlite.connect(identity_manager.db_path) as db:
+        async with db.execute(
+            "SELECT primary_email FROM users WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
 @app.post("/api/account/link")
 async def link_account_redeem(request: Request):
     """Redeem a channel claim code against the CALLER's authenticated account.
@@ -3867,6 +3936,11 @@ async def link_account_redeem(request: Request):
     authentication proves they own the target Turtle account. Neither alone is
     sufficient, which is why linking is never done from a self-claimed email —
     that would let anyone inherit another person's memory.
+
+    WP1.J two-sided binding: if the code names an expected redeemer email
+    (claim.expected_email), the authenticated caller's own account email must
+    match it or redemption is refused — see the binding check below for the
+    full reasoning.
 
     On success the channel mapping is re-pointed at the caller and the channel
     account's memory is folded into theirs.
@@ -3917,6 +3991,34 @@ async def link_account_redeem(request: Request):
             {"error": "That code is invalid or has expired"}, status_code=400
         )
     assert claim is not None  # status=="ok" always yields a claim
+
+    # ── TWO-SIDED BINDING (WP1.J, ledger 1b.6) ───────────────────────────────
+    # claim.expected_email is what the channel-side issuer said their web
+    # account would be — a self-claimed assertion that proves nothing by
+    # itself, so it is never used to grant anything. It is only ever used to
+    # REFUSE a redeemer whose actually-authenticated account doesn't match,
+    # closing the gap where ANY authenticated session (not just the one the
+    # channel user intended) could previously redeem a leaked/intercepted
+    # code. A code minted before this shipped has expected_email=None and is
+    # treated as unbound — see core/account_linking.py's module docstring for
+    # why that's the deliberate, TTL-bounded choice, not an oversight.
+    #
+    # The mismatch response is byte-for-byte the SAME "invalid or expired"
+    # 400 used above for an unknown/locked code (never a distinct message or
+    # status): a prober holding a stolen code who tries authenticating as
+    # different accounts must not be able to learn "wrong account" vs "code
+    # doesn't exist" vs "someone else already claimed it" — that would turn
+    # this endpoint into an oracle for which email a given code is bound to.
+    if claim.expected_email:
+        target_email = await _get_target_account_email(user_id)
+        if not target_email or target_email.strip().lower() != claim.expected_email:
+            # Release rather than let the wrong target squat on the
+            # reservation for the full 60s TTL — the intended redeemer should
+            # not have to wait out someone else's failed attempt.
+            await asyncio.to_thread(release_reservation, store, code, user_id)
+            return JSONResponse(
+                {"error": "That code is invalid or has expired"}, status_code=400
+            )
 
     if claim.source_user_id == user_id:
         # Nothing to merge; burn the reservation so it can't be replayed.

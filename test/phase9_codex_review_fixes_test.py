@@ -58,7 +58,9 @@ def test_link_account_refuses_on_a_public_surface():
         channel_is_private=False,   # public guild channel
     )
     ctx = types.SimpleNamespace(deps=deps)
-    out = asyncio.run(tool.function(ctx))
+    import apps.turtle_server as ts_mod
+    args = ts_mod.LinkAccountArgs(expected_email="victim@example.com")
+    out = asyncio.run(tool.function(ctx, args))
     assert "code" not in out.lower() or "shared channel" in out.lower()
     assert "direct message" in out.lower(), f"expected a refusal, got: {out[:200]}"
 
@@ -90,7 +92,9 @@ def test_link_account_issues_in_a_dm(tmp_path, monkeypatch):
         channel_user_id="759",
         channel_is_private=True,    # DM
     )
-    out = asyncio.run(tool.function(types.SimpleNamespace(deps=deps)))
+    import apps.turtle_server as ts_mod
+    args = ts_mod.LinkAccountArgs(expected_email="owner@example.com")
+    out = asyncio.run(tool.function(types.SimpleNamespace(deps=deps), args))
     assert "Link code:" in out
 
 
