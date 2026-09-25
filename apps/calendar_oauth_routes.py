@@ -46,9 +46,16 @@ router = APIRouter(prefix="/integrations/google_calendar", tags=["google_calenda
 
 ALGORITHM = "HS256"
 _STATE_TTL_SECONDS = 600  # 10 minutes is plenty for a consent-screen round trip
-_SCOPE = "https://www.googleapis.com/auth/calendar"
+# Narrowed from the full "https://www.googleapis.com/auth/calendar" (read/
+# write access to calendar LIST management too) to event-level access only.
+# Verified against what this codebase actually calls: tools/calendar_tool.py
+# only ever does events().insert / events().list on calendarId="primary" —
+# it never touches calendars().list/insert/delete, so calendar.events covers
+# every real call site.
+_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 _AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 _TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+_REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 
 _TOKEN_FILENAME = "google_calendar_token.json"
 
@@ -66,26 +73,64 @@ def token_path_for_user(user_id: str):
     return personal_memory_dir(user_id) / _TOKEN_FILENAME
 
 
+def _token_key() -> bytes | None:
+    """Parsed CALENDAR_TOKEN_KEY, or None when unset.
+
+    Already validated for shape at settings-construction time
+    (core/config.py's field_validator) — a malformed key never reaches here,
+    it fails process boot instead. This only needs to decode it.
+    """
+    from core.calendar_token_crypto import parse_key
+
+    secret = settings.calendar_token_key
+    return parse_key(secret.get_secret_value()) if secret is not None else None
+
+
 async def _read_token(user_id: str) -> str | None:
     """Local disk locally; Postgres in cloud mode (survives a cold start,
     unlike the local file — see core/storage/cloud/calendar_token_store.py).
+
+    Transparently decrypts (core/calendar_token_crypto.decrypt_stored): a
+    plaintext token written before encryption existed reads back exactly as
+    it always did — no key needed, no error — and stays plaintext on disk/in
+    Postgres until the next _write_token call re-encrypts it.
     """
+    from core.calendar_token_crypto import decrypt_stored
+
     if settings.is_cloud:
         from core.storage.cloud.calendar_token_store import get_token_json
 
-        return await asyncio.to_thread(get_token_json, user_id)
-    path = token_path_for_user(user_id)
-    return path.read_text(encoding="utf-8") if path.exists() else None
+        stored = await asyncio.to_thread(get_token_json, user_id)
+    else:
+        path = token_path_for_user(user_id)
+        stored = path.read_text(encoding="utf-8") if path.exists() else None
+    if stored is None:
+        return None
+    plaintext, _key_version = decrypt_stored(stored, _token_key())
+    return plaintext
 
 
 async def _write_token(user_id: str, token_json: str) -> None:
+    """Encrypt-then-store. See core/calendar_token_crypto.encrypt_for_storage
+    for the local-vs-cloud CALENDAR_TOKEN_KEY-unset posture: local silently
+    falls back to plaintext (today's behaviour on a single-tenant dev box);
+    cloud raises CalendarTokenKeyRequired, which this turns into a legible
+    503 rather than writing plaintext into a shared Postgres row."""
+    from core.calendar_token_crypto import CalendarTokenKeyRequired, encrypt_for_storage
+
+    try:
+        stored = encrypt_for_storage(token_json, _token_key(), is_cloud=settings.is_cloud)
+    except CalendarTokenKeyRequired as exc:
+        logger.error("calendar oauth: refusing to store token unencrypted: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
     if settings.is_cloud:
         from core.storage.cloud.calendar_token_store import put_token_json
 
-        await asyncio.to_thread(put_token_json, user_id, token_json)
+        await asyncio.to_thread(put_token_json, user_id, stored)
         return
     path = token_path_for_user(user_id)
-    path.write_text(token_json, encoding="utf-8")
+    path.write_text(stored, encoding="utf-8")
     try:
         path.chmod(0o600)
     except OSError:
@@ -267,7 +312,10 @@ async def connect(req: Request) -> RedirectResponse:
         # granted consent before — without this, a reconnect after revoking
         # access silently comes back with no refresh_token at all.
         "prompt": "consent",
-        "include_granted_scopes": "true",
+        # Deliberately NOT sending include_granted_scopes: it would silently
+        # widen this token to every scope the user ever granted Turtle
+        # (across other flows/reconnects), not just calendar.events. Consent
+        # should reflect only what THIS connect asks for.
         "state": state_token,
     }
     return RedirectResponse(f"{_AUTH_ENDPOINT}?{urlencode(params)}", status_code=302)
@@ -381,16 +429,117 @@ async def callback(req: Request, code: str = "", state: str = "", error: str = "
     )
 
 
+# The exact scope this deploy currently mints tokens with — see _SCOPE above.
+_CURRENT_SCOPE_MARKER = "calendar.events"
+
+
+def _scope_is_stale(token_json: str) -> bool:
+    """True when the stored token's granted scope predates the
+    calendar.events narrowing (WP1.E2) — i.e. it still carries the old full
+    read/write ``https://www.googleapis.com/auth/calendar`` grant (or
+    anything else that doesn't include calendar.events). Drives the
+    "Reconnect Calendar" prompt: /status reports it, web/js/calendar.js
+    renders it.
+
+    Google's token endpoint echoes back the space-separated scopes actually
+    granted in the "scope" field of the token response, which is exactly
+    what gets persisted verbatim in token_json — no separate bookkeeping
+    needed, this just reads what is already there.
+    """
+    try:
+        data = json.loads(token_json)
+    except (json.JSONDecodeError, TypeError):
+        return False  # can't tell; don't nag on unparseable data
+    scope_field = data.get("scope")
+    if not scope_field or not isinstance(scope_field, str):
+        return False  # no scope recorded (older/manual token) — don't nag on missing data
+    return not any(_CURRENT_SCOPE_MARKER in s for s in scope_field.split())
+
+
 @router.get("/status")
 async def status(req: Request) -> dict[str, bool]:
-    """Whether the signed-in user currently has a Calendar token stored."""
+    """Whether the signed-in user currently has a Calendar token stored, and
+    whether it was minted under the old, broader scope and should be
+    reconnected (web/js/calendar.js shows a "Reconnect Calendar" prompt when
+    scope_stale is true)."""
     user_id = _require_user(req)
-    return {"connected": await _token_exists(user_id)}
+    token_json = await _read_token(user_id)
+    connected = token_json is not None
+    scope_stale = _scope_is_stale(token_json) if token_json else False
+    return {"connected": connected, "scope_stale": scope_stale}
+
+
+async def _revoke_at_google(token_json: str) -> bool:
+    """POST the stored refresh_token to Google's /revoke endpoint.
+
+    Sends the refresh_token, not the access_token: revoking a refresh token
+    invalidates every access token minted from it too, while revoking a bare
+    (frequently already-expired, since this codebase never persists a
+    refreshed one) access token would leave the refresh grant itself live,
+    able to mint new access tokens moments later.
+
+    Returns True when Google confirms the grant is gone — including a 400
+    "invalid_token" response, which Google also returns for a token that was
+    already revoked/expired, i.e. nothing left to clean up. Returns False on
+    a genuine failure (network error, non-400 error status) that may leave
+    the grant live at Google. Bounded 10s timeout: this sits on a
+    user-facing request (POST /disconnect).
+    """
+    try:
+        data = json.loads(token_json)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    token_to_revoke = data.get("refresh_token") or data.get("access_token")
+    if not token_to_revoke:
+        return True  # nothing was ever minted to revoke
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            resp = await http_client.post(_REVOKE_ENDPOINT, data={"token": token_to_revoke})
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "calendar oauth: revoke request failed: %s: %s", type(exc).__name__, exc
+        )
+        return False
+    if resp.status_code == 200:
+        return True
+    if resp.status_code == 400:
+        logger.info(
+            "calendar oauth: revoke returned 400 (token already invalid): %s",
+            resp.text[:200],
+        )
+        return True
+    logger.warning(
+        "calendar oauth: revoke failed status=%s body=%s", resp.status_code, resp.text[:200]
+    )
+    return False
 
 
 @router.post("/disconnect")
 async def disconnect(req: Request) -> dict[str, bool]:
-    """Delete the signed-in user's stored Calendar token."""
+    """Revoke the signed-in user's Calendar token at Google, then delete it
+    locally (Postgres row / local file).
+
+    Local deletion always proceeds even when the upstream revoke call fails
+    (network error, Google 5xx): a user asking to disconnect must not stay
+    connected in Turtle because Google's /revoke endpoint hiccuped — mirrors
+    this codebase's forget-me posture elsewhere, where the
+    user-controllable, local half of a deletion request is never held
+    hostage by an upstream call. The response's "revoked" field reports
+    whether the upstream grant is confirmed gone rather than swallowing a
+    genuine revoke failure silently, so a caller that cares (or the UI) can
+    tell the user to also revoke access manually at
+    https://myaccount.google.com/permissions.
+    """
     user_id = _require_user(req)
+    token_json = await _read_token(user_id)
+    revoked = True
+    if token_json:
+        revoked = await _revoke_at_google(token_json)
+        if not revoked:
+            logger.error(
+                "calendar oauth: could not confirm revoke at Google for "
+                "user_id=%s — deleting the local token anyway; the grant "
+                "may still be live at Google", user_id,
+            )
     await _delete_token(user_id)
-    return {"connected": False}
+    return {"connected": False, "revoked": revoked}

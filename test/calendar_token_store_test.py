@@ -118,6 +118,7 @@ class CalendarToolCloudModeTest(unittest.TestCase):
 
         with patch.object(ct, "settings") as fake_settings:
             fake_settings.is_cloud = True
+            fake_settings.calendar_token_key = None
             fake_settings.google_calendar_token_json = '{"refresh_token": "global-legacy"}'
             with patch(
                 "core.storage.cloud.calendar_token_store.get_token_json",
@@ -131,6 +132,7 @@ class CalendarToolCloudModeTest(unittest.TestCase):
 
         with patch.object(ct, "settings") as fake_settings:
             fake_settings.is_cloud = True
+            fake_settings.calendar_token_key = None
             fake_settings.google_calendar_token_json = '{"refresh_token": "global-legacy"}'
             with patch(
                 "core.storage.cloud.calendar_token_store.get_token_json",

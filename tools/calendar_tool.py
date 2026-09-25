@@ -178,21 +178,36 @@ def _load_token_json(user_id: Optional[str]) -> Optional[str]:
     (psycopg, sync) never blocks the event loop.
     """
     if user_id:
+        stored: Optional[str] = None
         if settings.is_cloud:
             try:
                 from core.storage.cloud.calendar_token_store import get_token_json
 
-                token_json = get_token_json(user_id)
-                if token_json:
-                    return token_json
+                stored = get_token_json(user_id)
             except Exception:
-                pass  # fall through to the legacy env var
+                stored = None  # fall through to the legacy env var
         else:
             try:
                 from core.paths import personal_memory_dir
                 token_path = personal_memory_dir(user_id) / "google_calendar_token.json"
                 if token_path.exists():
-                    return token_path.read_text(encoding="utf-8")
+                    stored = token_path.read_text(encoding="utf-8")
+            except Exception:
+                stored = None  # fall through to the legacy env var
+        if stored:
+            # Transparently decrypts a key_version>=1 envelope, or returns a
+            # pre-encryption plaintext blob unchanged — see
+            # core/calendar_token_crypto.py and
+            # apps/calendar_oauth_routes.py's _read_token, which this mirrors
+            # (the connect-flow route module owns writing; this tool only
+            # ever reads).
+            try:
+                from core.calendar_token_crypto import decrypt_stored, parse_key
+
+                key_secret = settings.calendar_token_key
+                key = parse_key(key_secret.get_secret_value()) if key_secret is not None else None
+                token_json, _key_version = decrypt_stored(stored, key)
+                return token_json
             except Exception:
                 pass  # fall through to the legacy env var
     return settings.google_calendar_token_json
@@ -219,9 +234,14 @@ def _load_credentials(user_id: Optional[str] = None):
 
     if cred_type == "service_account":
         from google.oauth2 import service_account  # type: ignore[import]
+        # Narrowed from the full https://www.googleapis.com/auth/calendar to
+        # event-level access (WP1.E2 / ledger 1b.3, matching the OAuth scope
+        # narrowing in apps/calendar_oauth_routes.py) — this module only ever
+        # calls events().insert/events().list on calendarId="primary" below,
+        # never calendars().list/insert/delete.
         return service_account.Credentials.from_service_account_info(
             creds_data,
-            scopes=["https://www.googleapis.com/auth/calendar"],
+            scopes=["https://www.googleapis.com/auth/calendar.events"],
         )
 
     # OAuth2 client credentials + user token
