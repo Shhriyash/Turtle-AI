@@ -184,9 +184,16 @@ jobs:
         # Remote build (Vercel's own infra) does.
         id: deploy
         run: |
+          set -euo pipefail
           # tail -n1: keep only the last stdout line in case a future CLI
           # version emits an extra line ahead of the URL on a zero-exit path
-          # (see deploy-production's comment on the same pattern).
+          # (see deploy-production's comment on the same pattern). This step
+          # has no `shell:` key, so GitHub Actions' Linux default of
+          # `bash -e {0}` applies, which does NOT set `-o pipefail` on its
+          # own — without the explicit `set -euo pipefail` above, a failed
+          # `vercel deploy` piped into `tail` would be masked (`tail` reads
+          # empty input and exits 0), and this step would pass with an empty
+          # `url`.
           url=$(vercel deploy --yes --env TURTLE_BUILD_SHA="$BUILD_SHA" --token="$VERCEL_TOKEN" | tail -n1)
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "### Preview deployed" >> "$GITHUB_STEP_SUMMARY"
