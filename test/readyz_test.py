@@ -168,6 +168,45 @@ class CloudStartupValidationTest(unittest.TestCase):
                     pass
         self.assertIn("REDIS_URL", str(ctx.exception))
 
+    def test_whitespace_only_database_url_raises_same_as_unset(self) -> None:
+        """bool(SecretStr(" ")) is True, so a whitespace-only DATABASE_URL would
+        sail past a plain `not settings.database_url` check unless the startup
+        hook strips it first — a stray-space copy-paste is the same class of
+        mistake as commit 71c3378's DATABASE_URL="" (just a different
+        character), and it must fail startup identically."""
+        from core.config import settings as real_settings
+        from pydantic import SecretStr
+        from unittest.mock import patch as _patch
+
+        with _patch.object(real_settings, "deploy_mode", "cloud"), _patch.object(
+            real_settings, "database_url", SecretStr("   ")
+        ), _patch.object(
+            real_settings, "redis_url_primary", SecretStr("redis://fake-upstash.example:6379")
+        ):
+            with self.assertRaises(Exception) as ctx:
+                with TestClient(ts.app):
+                    pass
+        self.assertIn("DATABASE_URL", str(ctx.exception))
+
+    def test_whitespace_only_redis_url_raises_same_as_unset(self) -> None:
+        """Same regression guard as above for the Redis side. redis_url already
+        calls .strip() internally (core/config.py) so this currently passes
+        because of that existing behaviour — the test still belongs here to
+        pin the symmetry: it will fail if the strip is ever removed."""
+        from core.config import settings as real_settings
+        from pydantic import SecretStr
+        from unittest.mock import patch as _patch
+
+        with _patch.object(real_settings, "deploy_mode", "cloud"), _patch.object(
+            real_settings, "database_url", SecretStr("postgresql://fake:fake@fake-neon.example/db")
+        ), _patch.object(real_settings, "redis_url_primary", SecretStr("   ")), _patch.object(
+            real_settings, "redis_url_upstash", SecretStr("   ")
+        ):
+            with self.assertRaises(Exception) as ctx:
+                with TestClient(ts.app):
+                    pass
+        self.assertIn("REDIS_URL", str(ctx.exception))
+
 
 class HealthzShaTest(unittest.TestCase):
     def setUp(self) -> None:

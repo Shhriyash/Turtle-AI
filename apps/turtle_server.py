@@ -2605,7 +2605,17 @@ async def _require_cloud_backends_configured() -> None:
     """
     if not settings.is_cloud:
         return
-    if not settings.database_url:
+    # bool(SecretStr("")) is False, so a plain unset/blank DATABASE_URL is
+    # already caught by `not settings.database_url` — the 71c3378 class of
+    # bug (Vercel once held TURTLE_DEPLOY="" rather than unset). But
+    # bool(SecretStr(" ")) is True, so a whitespace-only value would sail
+    # past that check unless we strip first. settings.redis_url already
+    # strips internally (core/config.py); mirror that here rather than add a
+    # field there.
+    database_url_value = (
+        settings.database_url.get_secret_value().strip() if settings.database_url else ""
+    )
+    if not database_url_value:
         raise RuntimeError(
             "TURTLE_DEPLOY=cloud requires DATABASE_URL to be set (the Neon "
             "pooled connection string) — refusing to start without it."
