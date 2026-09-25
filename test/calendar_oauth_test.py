@@ -824,3 +824,47 @@ def test_load_token_json_decrypts_cloud_mode(monkeypatch):
         resolved = ct._load_token_json("u123")
     assert resolved is not None
     assert json.loads(resolved)["refresh_token"] == "cloud-token"
+
+
+# ---------------------------------------------------------------------------
+# apps.turtle_server._warn_on_missing_calendar_token_key — boot-time warning
+# for CALENDAR_TOKEN_KEY unset in cloud mode (owner follow-up on WP1.E2).
+# ---------------------------------------------------------------------------
+
+@pytestmark_fastapi
+def test_calendar_token_key_warning_fires_in_cloud_when_unset(monkeypatch, capsys):
+    import apps.turtle_server as server
+
+    with mock.patch.object(server, "settings") as fake_settings:
+        fake_settings.is_cloud = True
+        fake_settings.calendar_token_key = None
+        asyncio.run(server._warn_on_missing_calendar_token_key())
+    out = capsys.readouterr().out
+    assert "CALENDAR_TOKEN_KEY is unset" in out
+    assert "cloud mode" in out
+    assert "503" in out
+    assert "base64.urlsafe_b64encode" in out  # the reused generation command
+
+
+@pytestmark_fastapi
+def test_calendar_token_key_warning_silent_in_cloud_when_key_set(monkeypatch, capsys):
+    import apps.turtle_server as server
+
+    with mock.patch.object(server, "settings") as fake_settings:
+        fake_settings.is_cloud = True
+        fake_settings.calendar_token_key = SecretStr(_TEST_TOKEN_KEY_B64)
+        asyncio.run(server._warn_on_missing_calendar_token_key())
+    out = capsys.readouterr().out
+    assert "CALENDAR_TOKEN_KEY" not in out
+
+
+@pytestmark_fastapi
+def test_calendar_token_key_warning_silent_in_local_mode(monkeypatch, capsys):
+    import apps.turtle_server as server
+
+    with mock.patch.object(server, "settings") as fake_settings:
+        fake_settings.is_cloud = False
+        fake_settings.calendar_token_key = None
+        asyncio.run(server._warn_on_missing_calendar_token_key())
+    out = capsys.readouterr().out
+    assert "CALENDAR_TOKEN_KEY" not in out
