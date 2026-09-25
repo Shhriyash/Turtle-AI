@@ -343,6 +343,17 @@ class TestF3Slack:
 # F6 — Discord adapter (interactions webhook + gateway import guard)
 # ---------------------------------------------------------------------------
 
+def _fresh_discord_ts() -> str:
+    """A X-Signature-Timestamp value inside WP 1.F's 300s freshness window —
+    every pre-existing test below mocks _verify_discord_signature directly
+    (so the literal signature bytes don't matter), but they still flow
+    through the REAL _timestamp_is_fresh() freshness check now sitting right
+    after it, so the timestamp header itself must be plausible.
+    """
+    import time
+    return str(int(time.time()))
+
+
 class TestF6Discord:
     """F6: Discord Interactions webhook — Ed25519 sig, PING, deferred command."""
 
@@ -412,7 +423,7 @@ class TestF6Discord:
                 resp = client.post(
                     "/channels/discord",
                     json={"type": 1},
-                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": "0"},
+                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": _fresh_discord_ts()},
                 )
         assert resp.status_code == 200
         assert resp.json().get("type") == 1
@@ -433,7 +444,7 @@ class TestF6Discord:
                 resp = client.post(
                     "/channels/discord",
                     json={"type": 1},
-                    headers={"X-Signature-Ed25519": "bad", "X-Signature-Timestamp": "0"},
+                    headers={"X-Signature-Ed25519": "bad", "X-Signature-Timestamp": _fresh_discord_ts()},
                 )
         assert resp.status_code == 401
         print("[PASS] Discord returns 401 on invalid signature")
@@ -474,7 +485,7 @@ class TestF6Discord:
                 resp = client.post(
                     "/channels/discord",
                     json=payload,
-                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": "0"},
+                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": _fresh_discord_ts()},
                 )
         assert resp.status_code == 200
         assert resp.json().get("type") == 5
@@ -505,12 +516,291 @@ class TestF6Discord:
                 resp = client.post(
                     "/channels/discord",
                     json=payload,
-                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": "0"},
+                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": _fresh_discord_ts()},
                 )
         assert resp.status_code == 200
         assert resp.json().get("type") != 5  # not deferred — ignored
         dispatch_spy.assert_not_called()
         print("[PASS] Discord bot-authored interaction ignored — no dispatch loop")
+
+    # -- WP 1.F (ledger 1b.4, S-7.8): timestamp freshness + interaction_id dedup --
+
+    def test_stale_timestamp_rejected(self):
+        """A validly-'signed' interaction (mocked True) 301s old is rejected."""
+        import time
+        import unittest.mock as mock
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from apps.channels.discord import router
+
+        test_app = FastAPI()
+        test_app.include_router(router)
+
+        stale_ts = str(int(time.time()) - 301)
+        with mock.patch("apps.channels.discord._verify_discord_signature", return_value=True):
+            with TestClient(test_app) as client:
+                resp = client.post(
+                    "/channels/discord",
+                    json={"type": 1},
+                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": stale_ts},
+                )
+        assert resp.status_code == 401
+        print("[PASS] Discord rejects a 301s-old timestamp even with a valid signature")
+
+    def test_fresh_timestamp_accepted(self):
+        """A timestamp well inside the 300s window is accepted (PING path)."""
+        import unittest.mock as mock
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from apps.channels.discord import router
+
+        test_app = FastAPI()
+        test_app.include_router(router)
+
+        with mock.patch("apps.channels.discord._verify_discord_signature", return_value=True):
+            with TestClient(test_app) as client:
+                resp = client.post(
+                    "/channels/discord",
+                    json={"type": 1},
+                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": _fresh_discord_ts()},
+                )
+        assert resp.status_code == 200
+        assert resp.json().get("type") == 1
+        print("[PASS] Discord accepts a fresh timestamp")
+
+    def test_non_numeric_empty_and_missing_timestamp_rejected(self):
+        """Non-numeric, empty, and missing timestamps are each rejected
+        without raising into the handler (500)."""
+        import unittest.mock as mock
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from apps.channels.discord import router
+
+        test_app = FastAPI()
+        test_app.include_router(router)
+
+        with mock.patch("apps.channels.discord._verify_discord_signature", return_value=True):
+            with TestClient(test_app) as client:
+                # non-numeric
+                resp = client.post(
+                    "/channels/discord",
+                    json={"type": 1},
+                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": "not-a-number"},
+                )
+                assert resp.status_code == 401
+                # empty
+                resp = client.post(
+                    "/channels/discord",
+                    json={"type": 1},
+                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": ""},
+                )
+                assert resp.status_code == 401
+                # missing entirely
+                resp = client.post(
+                    "/channels/discord",
+                    json={"type": 1},
+                    headers={"X-Signature-Ed25519": "aa"},
+                )
+                assert resp.status_code == 401
+        print("[PASS] Discord rejects non-numeric / empty / missing timestamps, no 500")
+
+    def test_repeat_interaction_id_rejected_second_time(self):
+        """The same interaction_id twice: first accepted, second rejected."""
+        import unittest.mock as mock
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from apps.channels.discord import router
+        from apps.channels import TurtleResponse
+
+        test_app = FastAPI()
+        test_app.include_router(router)
+
+        async def _fake_dispatch(event):
+            return TurtleResponse(content="hi", channel="discord", user_id=event.user_id)
+
+        async def _fake_resolve(channel, uid):
+            return "usr_test"
+
+        async def _fake_followup(token, text):
+            return None
+
+        payload = {
+            "type": 2,
+            "id": "interaction_dedup_1",
+            "token": "tok_dedup",
+            "channel_id": "chan_dedup",
+            "member": {"user": {"id": "111", "bot": False}},
+            "data": {"name": "turtle", "options": [{"name": "message", "value": "hi"}]},
+        }
+        headers = {"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": _fresh_discord_ts()}
+
+        # In-process fake claim store: first caller to claim an id wins, so
+        # this exercises the real dedup DECISION logic in discord.py without
+        # needing a real/fake Redis wired through core.internal_auth.
+        claimed_ids: set[str] = set()
+
+        async def _fake_claim_once(prefix, identifier, ttl_seconds):
+            key = f"{prefix}{identifier}"
+            if key in claimed_ids:
+                return False
+            claimed_ids.add(key)
+            return True
+
+        with mock.patch("apps.channels.discord._verify_discord_signature", return_value=True), \
+             mock.patch("apps.channels.discord.dispatch_event", side_effect=_fake_dispatch), \
+             mock.patch("apps.channels.discord._send_followup", side_effect=_fake_followup), \
+             mock.patch("apps.channels.discord.resolve_channel_user", side_effect=_fake_resolve), \
+             mock.patch("apps.channels.discord.claim_once", side_effect=_fake_claim_once):
+            with TestClient(test_app) as client:
+                first = client.post("/channels/discord", json=payload, headers=headers)
+                second = client.post("/channels/discord", json=payload, headers=headers)
+        assert first.status_code == 200
+        assert first.json().get("type") == 5
+        assert second.status_code == 401
+        print("[PASS] Discord: first interaction_id delivery accepted, replay rejected")
+
+    def test_two_different_interaction_ids_both_accepted(self):
+        """Two distinct interaction_ids are each accepted independently."""
+        import unittest.mock as mock
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from apps.channels.discord import router
+        from apps.channels import TurtleResponse
+
+        test_app = FastAPI()
+        test_app.include_router(router)
+
+        async def _fake_dispatch(event):
+            return TurtleResponse(content="hi", channel="discord", user_id=event.user_id)
+
+        async def _fake_resolve(channel, uid):
+            return "usr_test"
+
+        async def _fake_followup(token, text):
+            return None
+
+        headers = {"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": _fresh_discord_ts()}
+
+        claimed_ids: set[str] = set()
+
+        async def _fake_claim_once(prefix, identifier, ttl_seconds):
+            key = f"{prefix}{identifier}"
+            if key in claimed_ids:
+                return False
+            claimed_ids.add(key)
+            return True
+
+        def _payload(interaction_id):
+            return {
+                "type": 2,
+                "id": interaction_id,
+                "token": f"tok_{interaction_id}",
+                "channel_id": "chan_dedup",
+                "member": {"user": {"id": "111", "bot": False}},
+                "data": {"name": "turtle", "options": [{"name": "message", "value": "hi"}]},
+            }
+
+        with mock.patch("apps.channels.discord._verify_discord_signature", return_value=True), \
+             mock.patch("apps.channels.discord.dispatch_event", side_effect=_fake_dispatch), \
+             mock.patch("apps.channels.discord._send_followup", side_effect=_fake_followup), \
+             mock.patch("apps.channels.discord.resolve_channel_user", side_effect=_fake_resolve), \
+             mock.patch("apps.channels.discord.claim_once", side_effect=_fake_claim_once):
+            with TestClient(test_app) as client:
+                resp_a = client.post("/channels/discord", json=_payload("interaction_aaa"), headers=headers)
+                resp_b = client.post("/channels/discord", json=_payload("interaction_bbb"), headers=headers)
+        assert resp_a.status_code == 200 and resp_a.json().get("type") == 5
+        assert resp_b.status_code == 200 and resp_b.json().get("type") == 5
+        print("[PASS] Discord: two distinct interaction_ids both accepted")
+
+    def test_ping_not_consumed_by_dedup(self):
+        """A PING is never routed through the interaction_id claim at all —
+        claim_once must not be called for it, and it still returns PONG."""
+        import unittest.mock as mock
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from apps.channels.discord import router
+
+        test_app = FastAPI()
+        test_app.include_router(router)
+
+        claim_spy = mock.AsyncMock(return_value=True)
+        with mock.patch("apps.channels.discord._verify_discord_signature", return_value=True), \
+             mock.patch("apps.channels.discord.claim_once", claim_spy):
+            with TestClient(test_app) as client:
+                resp = client.post(
+                    "/channels/discord",
+                    json={"type": 1},
+                    headers={"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": _fresh_discord_ts()},
+                )
+        assert resp.status_code == 200
+        assert resp.json().get("type") == 1
+        claim_spy.assert_not_called()
+        print("[PASS] Discord PING bypasses interaction_id dedup entirely")
+
+    def test_interaction_dedup_fails_open_on_real_unreachable_redis(self):
+        """WP 1.F's chosen posture for the interaction_id dedup: FAIL OPEN
+        when the claim store can't be reached — pinned against a REAL
+        driver-level failure (an actual closed TCP port), not a mocked
+        CloudBackendUnavailable, per the WP's own warning about wave 1's
+        near-miss (its tests mocked the wrong exception once already).
+        An interaction must still be accepted (and its dispatch still
+        happen) even though the underlying Redis command raised a real
+        redis-py ConnectionError.
+        """
+        import unittest.mock as mock
+        import redis.asyncio as redis_asyncio
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from apps.channels.discord import router
+        from apps.channels import TurtleResponse
+        import core.storage.cloud as cloud_mod
+
+        test_app = FastAPI()
+        test_app.include_router(router)
+
+        async def _fake_dispatch(event):
+            return TurtleResponse(content="hi", channel="discord", user_id=event.user_id)
+
+        async def _fake_resolve(channel, uid):
+            return "usr_test"
+
+        async def _fake_followup(token, text):
+            return None
+
+        payload = {
+            "type": 2,
+            "id": "interaction_redis_down",
+            "token": "tok_down",
+            "channel_id": "chan_down",
+            "member": {"user": {"id": "222", "bot": False}},
+            "data": {"name": "turtle", "options": [{"name": "message", "value": "hi"}]},
+        }
+        headers = {"X-Signature-Ed25519": "aa", "X-Signature-Timestamp": _fresh_discord_ts()}
+
+        orig_client = cloud_mod._redis_client
+        # Port 1 (privileged): nothing listens there in this test
+        # environment, so the OS refuses the connection immediately — a
+        # real redis-py ConnectionError, not a mock, from claim_once()'s
+        # own SET call (which internal_auth.claim_once routes through
+        # core.storage.cloud.get_redis_client()).
+        cloud_mod._redis_client = redis_asyncio.from_url(
+            "redis://127.0.0.1:1/0",
+            decode_responses=True,
+            socket_connect_timeout=1.0,
+            socket_timeout=1.0,
+        )
+        try:
+            with mock.patch("apps.channels.discord._verify_discord_signature", return_value=True), \
+                 mock.patch("apps.channels.discord.dispatch_event", side_effect=_fake_dispatch), \
+                 mock.patch("apps.channels.discord._send_followup", side_effect=_fake_followup), \
+                 mock.patch("apps.channels.discord.resolve_channel_user", side_effect=_fake_resolve):
+                with TestClient(test_app) as client:
+                    resp = client.post("/channels/discord", json=payload, headers=headers)
+        finally:
+            cloud_mod._redis_client = orig_client
+        assert resp.status_code == 200
+        assert resp.json().get("type") == 5
+        print("[PASS] Discord interaction dedup fails OPEN against a real unreachable Redis")
 
     def test_gateway_imports_and_noops_without_token(self):
         """Gateway module imports cleanly and no-ops with no token.
