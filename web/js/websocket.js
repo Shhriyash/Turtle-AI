@@ -8,7 +8,7 @@ import { addMessage, showThinking, hideThinking, setBubbleState } from './chat.j
 import { playAudioBlob, handleServerInterrupt } from './voice.js';
 import { updateTimings } from './devmode.js';
 import { renderConfirmationPrompt } from './memory.js';
-import { showHeard, clearHeard } from './ambient.js';
+import { showHeard } from './ambient.js';
 
 /** Connect (or reconnect) to the WebSocket server */
 export function connectWebSocket() {
@@ -75,7 +75,6 @@ function handleServerMessage(msg) {
             addMessage('assistant', msg.content);
             setStatus('ready', 'Ready');
             setBubbleState('idle');
-            if (msg.content) { showHeard(msg.content, 'spoken'); clearHeard(6000); }
             break;
         case 'timing':
             updateTimings(msg);

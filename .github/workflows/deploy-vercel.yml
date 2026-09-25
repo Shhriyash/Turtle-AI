@@ -44,27 +44,25 @@ jobs:
       - name: Install Vercel CLI
         run: npm install -g vercel@latest
 
-      - name: Pull Vercel project settings (production)
-        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-
-      - name: Build
-        run: vercel build --prod --token="$VERCEL_TOKEN"
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-
       - name: Deploy to production
+        # No local `vercel pull` / `vercel build` step: building locally needs
+        # `uv` on the runner's PATH, which actions/setup-python doesn't
+        # provide, and fails with "uv is required but was not found in PATH"
+        # (found the hard way on this workflow's first real run). `vercel
+        # deploy --prod` without --prebuilt instead ships the source and lets
+        # Vercel's own remote build environment (which does have uv) build
+        # it — the same path a plain `vercel deploy --prod` from a developer
+        # machine takes, and confirmed working that way already.
         id: deploy
         run: |
-          url=$(vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN")
+          url=$(vercel deploy --prod --yes --token="$VERCEL_TOKEN")
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "### Deployed to production" >> "$GITHUB_STEP_SUMMARY"
           echo "$url" >> "$GITHUB_STEP_SUMMARY"
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
 
   deploy-preview:
     if: >
@@ -83,27 +81,20 @@ jobs:
       - name: Install Vercel CLI
         run: npm install -g vercel@latest
 
-      - name: Pull Vercel project settings (preview)
-        run: vercel pull --yes --environment=preview --token="$VERCEL_TOKEN"
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-
-      - name: Build
-        run: vercel build --token="$VERCEL_TOKEN"
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-
       - name: Deploy preview
+        # See deploy-production's comment: no local pull/build step, since
+        # `vercel build` needs `uv` on PATH and the runner doesn't have it.
+        # Remote build (Vercel's own infra) does.
         id: deploy
         run: |
-          url=$(vercel deploy --prebuilt --token="$VERCEL_TOKEN")
+          url=$(vercel deploy --yes --token="$VERCEL_TOKEN")
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "### Preview deployed" >> "$GITHUB_STEP_SUMMARY"
           echo "$url" >> "$GITHUB_STEP_SUMMARY"
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
 
       - name: Comment preview URL on the PR
         # workflow_run only carries pull_requests[] when the run and the PR
