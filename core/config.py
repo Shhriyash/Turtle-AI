@@ -67,10 +67,34 @@ class TurtleSettings(BaseSettings):
     # own alias (UPSTASH_REDIS_URL); redis_url resolves whichever is set.
     redis_url_primary: Optional[SecretStr] = Field(default=None, alias="REDIS_URL")
     redis_url_upstash: Optional[SecretStr] = Field(default=None, alias="UPSTASH_REDIS_URL")
-    # Shared secret the GitHub-Actions cron-tick workflow presents as a bearer
-    # token to the /internal/cron-tick endpoint (Phase 2). No default: the
-    # endpoint refuses to run without it in cloud.
+    # RETIRED (WP 1.B / S-7.3): used to be the ONE secret both GitHub Actions'
+    # cron-tick call AND Turtle's own self-invoked job calls (Discord
+    # deferred processing, the embed-personal-memory self-invoke)
+    # authenticated with — one leaked value bought an attacker both
+    # surfaces, and receiving endpoints trusted identity fields straight out
+    # of the body. Split below into cron_tick_secret (GitHub Actions only)
+    # and internal_job_secret (Turtle-to-Turtle self-calls only, paired with
+    # an HMAC envelope — see core/internal_auth.py). Nothing reads this field
+    # any more; left declared (not deleted) so a running instance that still
+    # has CRON_SHARED_SECRET set in its environment doesn't fail to boot.
+    # Safe for the owner to remove from the environment (and eventually this
+    # field) once the split has deployed everywhere.
     cron_shared_secret: Optional[SecretStr] = Field(default=None, alias="CRON_SHARED_SECRET")
+    # The ONLY secret GitHub Actions holds — presented as a bearer token by
+    # .github/workflows/cron-tick.yml to POST /internal/cron-tick
+    # (apps/cron_tick_routes.py). Scoped to that one endpoint; cannot be used
+    # to authenticate a Turtle-to-Turtle job self-call (see
+    # internal_job_secret below). No default: the endpoint refuses to run
+    # without it in cloud.
+    cron_tick_secret: Optional[SecretStr] = Field(default=None, alias="CRON_TICK_SECRET")
+    # NEVER leaves Vercel — authenticates Turtle's own self-invoked internal
+    # job calls: apps/channels/discord.py's deferred-interaction self-invoke
+    # (POST /channels/discord/process) and core/worker.py's
+    # embed-personal-memory self-invoke (POST /internal/embed-personal-memory).
+    # Used both as a bearer token AND as the HMAC key for the signed-request
+    # envelope (core/internal_auth.py) those two endpoints require. GitHub
+    # Actions never sees this value.
+    internal_job_secret: Optional[SecretStr] = Field(default=None, alias="INTERNAL_JOB_SECRET")
     # Secret token verified on the Telegram webhook (Phase 4), sent by Telegram
     # in the X-Telegram-Bot-Api-Secret-Token header (set via setWebhook).
     telegram_webhook_secret: Optional[SecretStr] = Field(

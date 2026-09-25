@@ -12,6 +12,7 @@ from typing import Optional
 import httpx
 from bs4 import BeautifulSoup
 
+from . import safe_fetch
 from .models import UrlAnalysisResult
 
 _SPA_THRESHOLD = 200  # chars of visible text below which we consider the page a SPA
@@ -30,6 +31,16 @@ async def _fetch_with_scraped_do(
     timeout: float,
 ) -> tuple[str, int, str]:
     """Fetch via Scrape.do API (render=true) — cloud JS-rendering + geo bypass."""
+    # The outer request always goes to the fixed api.scrape.do host (plain
+    # http, port 80 — permitted by our own rules), so SSRF validation of
+    # *that* URL buys nothing. What matters is the model-supplied target
+    # embedded in the query string: we refuse to ask a third party to fetch
+    # an internal address on our behalf, which also stops this tool being
+    # used as an abuse proxy against arbitrary internal hosts.
+    try:
+        safe_fetch.validate_public_url(url)
+    except safe_fetch.UnsafeUrlError as exc:
+        raise safe_fetch.UnsafeUrlError(safe_fetch.REFUSAL_MESSAGE) from exc
     target = (
         f"http://api.scrape.do"
         f"?token={token}&url={urllib.parse.quote(url, safe='')}&render=true"
@@ -48,12 +59,72 @@ async def _fetch_with_playwright(
     """Fetch via local Playwright headless browser for JS-rendered pages."""
     from playwright.async_api import async_playwright
 
+    # A local Chromium instance navigating straight to the target — the
+    # sharpest SSRF edge on this path, since the browser reaches the host's
+    # own network stack. Validate before launching the browser at all, so an
+    # obviously-bad URL fails fast without paying browser-startup cost.
+    try:
+        safe_fetch.validate_public_url(url)
+    except safe_fetch.UnsafeUrlError as exc:
+        raise safe_fetch.UnsafeUrlError(safe_fetch.REFUSAL_MESSAGE) from exc
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         try:
             page = await browser.new_page()
             await page.set_extra_http_headers(headers)
-            resp = await page.goto(url, wait_until="networkidle", timeout=int(timeout * 1000))
+
+            # Re-validate every *navigation* Chromium performs (the initial
+            # goto plus every server redirect it follows internally) via
+            # request interception — mirroring safe_get's manual redirect
+            # loop for the httpx path, and enforcing the same MAX_REDIRECTS
+            # hop limit. This must be registered before page.goto(), or the
+            # first navigation escapes it entirely.
+            #
+            # Deliberately scoped to navigation requests
+            # (request.is_navigation_request()) rather than every request:
+            # blocking/validating every subresource load (JS, CSS, images,
+            # XHR/fetch) would routinely break legitimate JS-rendered pages,
+            # which is the entire reason this fallback exists. This is a
+            # real, named residual gap, not an oversight: a page's own
+            # script can still issue an XHR/fetch to an internal address
+            # (e.g. the cloud metadata endpoint) after the page loads, and
+            # that traffic is NOT validated by this handler.
+            nav_state = {"count": 0, "blocked": False}
+
+            async def _validate_navigation(route, request):
+                if not request.is_navigation_request():
+                    await route.continue_()
+                    return
+                nav_state["count"] += 1
+                if nav_state["count"] > safe_fetch.MAX_REDIRECTS + 1:
+                    nav_state["blocked"] = True
+                    await route.abort()
+                    return
+                try:
+                    safe_fetch.validate_public_url(request.url)
+                except safe_fetch.UnsafeUrlError:
+                    nav_state["blocked"] = True
+                    await route.abort()
+                    return
+                await route.continue_()
+
+            await page.route("**/*", _validate_navigation)
+
+            try:
+                resp = await page.goto(url, wait_until="networkidle", timeout=int(timeout * 1000))
+            except Exception as exc:
+                if nav_state["blocked"]:
+                    # Translate Playwright's own navigation-failure exception
+                    # (e.g. net::ERR_FAILED for an aborted request) into our
+                    # fixed refusal — never leak the raw Playwright error
+                    # string, which could contain the blocked target URL.
+                    raise safe_fetch.UnsafeUrlError(safe_fetch.REFUSAL_MESSAGE) from exc
+                raise
+
+            if nav_state["blocked"]:
+                raise safe_fetch.UnsafeUrlError(safe_fetch.REFUSAL_MESSAGE)
+
             status = resp.status if resp else 200
             content_type = (
                 resp.headers.get("content-type", "text/html").lower() if resp else "text/html"
@@ -218,11 +289,16 @@ async def fetch_url_content_async(
     headers = _build_headers()
 
     try:
-        # ── Step 1: httpx ──────────────────────────────────────────────────
-        response = await http_client.get(
-            url, headers=headers, timeout=timeout, follow_redirects=True
+        # ── Step 1: httpx (SSRF-validated, redirect-safe, body-capped) ──────
+        response = await safe_fetch.safe_get(
+            http_client, url, headers=headers, timeout=timeout
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            return UrlAnalysisResult(
+                title="", description=None, keywords=None, headings=[],
+                content="", links=[], url=url, success=False,
+                error_message=f"HTTP {response.status_code}",
+            )
         content_type = response.headers.get("content-type", "").lower()
         html_text = response.text
         status_code = response.status_code
@@ -230,7 +306,7 @@ async def fetch_url_content_async(
         # JSON — return as-is
         if "json" in content_type:
             try:
-                formatted = json.dumps(response.json(), indent=2)
+                formatted = json.dumps(json.loads(html_text), indent=2)
             except Exception:
                 formatted = html_text
             return UrlAnalysisResult(
@@ -277,6 +353,14 @@ async def fetch_url_content_async(
         # ── Step 3: parse HTML ─────────────────────────────────────────────
         return _parse_html(html_text, parsed, url, max_content_length, status_code, content_type)
 
+    except safe_fetch.UnsafeUrlError:
+        # Fixed, non-leaky refusal text — never echo the resolved IP or the
+        # internal validation reason back to the model.
+        return UrlAnalysisResult(
+            title="", description=None, keywords=None, headings=[],
+            content="", links=[], url=url, success=False,
+            error_message=safe_fetch.REFUSAL_MESSAGE,
+        )
     except httpx.TimeoutException:
         return UrlAnalysisResult(
             title="", description=None, keywords=None, headings=[],

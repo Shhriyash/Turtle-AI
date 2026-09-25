@@ -23,15 +23,15 @@ jobs:
       - name: Call the cron-tick endpoint
         env:
           CRON_TICK_URL: ${{ secrets.CRON_TICK_URL }}
-          CRON_SHARED_SECRET: ${{ secrets.CRON_SHARED_SECRET }}
+          CRON_TICK_SECRET: ${{ secrets.CRON_TICK_SECRET }}
         run: |
-          if [ -z "$CRON_TICK_URL" ] || [ -z "$CRON_SHARED_SECRET" ]; then
-            echo "CRON_TICK_URL or CRON_SHARED_SECRET secret is not set — skipping." >&2
+          if [ -z "$CRON_TICK_URL" ] || [ -z "$CRON_TICK_SECRET" ]; then
+            echo "CRON_TICK_URL or CRON_TICK_SECRET secret is not set — skipping." >&2
             exit 1
           fi
           status=$(curl -sS -o /tmp/cron_tick_response.json -w "%{http_code}" \
             -X POST "$CRON_TICK_URL" \
-            -H "Authorization: Bearer $CRON_SHARED_SECRET")
+            -H "Authorization: Bearer $CRON_TICK_SECRET")
           echo "HTTP status: $status"
           cat /tmp/cron_tick_response.json
           echo ""
