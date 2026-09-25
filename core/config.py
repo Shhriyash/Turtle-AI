@@ -265,6 +265,15 @@ class TurtleSettings(BaseSettings):
     ws_messages_per_day: int = Field(
         default=1000, alias="TURTLE_WS_MESSAGES_PER_DAY"
     )
+    # Per-user daily cap on Google Places/Routes API calls (find_place +
+    # place_details + get_directions combined), enforced by
+    # tools/places_guardrails.py under its own turtle:places_cap: key
+    # namespace — deliberately NOT the same counter as ws_messages_per_day
+    # above, which budgets inbound chat messages, not billed upstream API
+    # calls. 0 disables the cap. A cache hit does not count against it.
+    places_daily_call_cap: int = Field(
+        default=100, alias="TURTLE_PLACES_DAILY_CALL_CAP"
+    )
     # Sign-up policy for the 8 channel adapters (discord, imessage, telegram,
     # whatsapp, twilio voice, slack, ...). Accepted values (case/whitespace
     # insensitive — see normalize_channel_signup below): "open" (default)
