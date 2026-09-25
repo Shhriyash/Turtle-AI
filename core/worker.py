@@ -223,17 +223,28 @@ async def _self_invoke_embed_job(user_id: str, topic_name: str, lines: list[str]
     generous connect/write timeout guarantees the request was fully SENT
     (so the target invocation is genuinely dispatched) without waiting for
     it to finish.
+
+    WP 1.B / S-7.3: authenticates with INTERNAL_JOB_SECRET (not the retired
+    CRON_SHARED_SECRET), and sends only an opaque job id — the real payload
+    (including user_id) is stashed in Redis first
+    (core.internal_auth.store_job_payload) so it's never trusted from the
+    wire by apps/cron_tick_routes.py's endpoint.
     """
+    import json
+
     import httpx
 
-    secret = settings.cron_shared_secret.get_secret_value() if settings.cron_shared_secret else ""
+    from core.internal_auth import sign_request, store_job_payload
+    from core.storage.cloud import CloudBackendUnavailable
+
+    secret = settings.internal_job_secret.get_secret_value() if settings.internal_job_secret else ""
     if not secret:
         # No internal-automation secret configured — run the job in this
         # same detached task rather than silently dropping the embed. Less
         # robust on serverless, but strictly no worse than before this fix,
         # and one env var away from the safe path.
         logger.warning(
-            "CRON_SHARED_SECRET unset — embedding %s/%s in-process (detached task)",
+            "INTERNAL_JOB_SECRET unset — embedding %s/%s in-process (detached task)",
             user_id, topic_name,
         )
         func = _REGISTRY.get("embed_personal_memory")
@@ -241,14 +252,33 @@ async def _self_invoke_embed_job(user_id: str, topic_name: str, lines: list[str]
             await func(user_id=user_id, topic_name=topic_name, lines=lines)
         return
 
-    url = f"{settings.public_base_url.rstrip('/')}/internal/embed-personal-memory"
     payload = {"user_id": user_id, "topic_name": topic_name, "lines": lines}
+    try:
+        job_id = await store_job_payload(payload)
+        body = json.dumps({"job_id": job_id}).encode("utf-8")
+        envelope = sign_request(secret, body)
+    except CloudBackendUnavailable as exc:
+        logger.warning(
+            "job store unavailable, embedding %s/%s in-process: %s",
+            user_id, topic_name, exc,
+        )
+        func = _REGISTRY.get("embed_personal_memory")
+        if func is not None:
+            await func(user_id=user_id, topic_name=topic_name, lines=lines)
+        return
+
+    url = f"{settings.public_base_url.rstrip('/')}/internal/embed-personal-memory"
+    headers = {
+        "Authorization": f"Bearer {secret}",
+        "Content-Type": "application/json",
+        **envelope.headers(),
+    }
     try:
         async with httpx.AsyncClient() as client:
             await client.post(
                 url,
-                json=payload,
-                headers={"Authorization": f"Bearer {secret}"},
+                content=body,
+                headers=headers,
                 timeout=httpx.Timeout(connect=5.0, read=0.1, write=5.0, pool=5.0),
             )
     except httpx.ReadTimeout:

@@ -8,6 +8,7 @@ whole turtle_server.app.
 """
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import UTC, datetime
 from unittest.mock import Mock, patch
@@ -19,6 +20,9 @@ from apps.cron_tick_routes import router
 
 
 class CronTickAuthTest(unittest.TestCase):
+    """WP 1.B / S-7.3: /internal/cron-tick now authenticates with
+    CRON_TICK_SECRET only (the retired CRON_SHARED_SECRET is never read)."""
+
     def setUp(self) -> None:
         app = FastAPI()
         app.include_router(router)
@@ -26,19 +30,19 @@ class CronTickAuthTest(unittest.TestCase):
 
     def test_no_secret_configured_returns_503(self) -> None:
         with patch("apps.cron_tick_routes.settings") as fake_settings:
-            fake_settings.cron_shared_secret = None
+            fake_settings.cron_tick_secret = None
             resp = self.client.post("/internal/cron-tick")
         self.assertEqual(resp.status_code, 503)
 
     def test_missing_bearer_token_returns_401(self) -> None:
         with patch("apps.cron_tick_routes.settings") as fake_settings:
-            fake_settings.cron_shared_secret.get_secret_value.return_value = "secret123"
+            fake_settings.cron_tick_secret.get_secret_value.return_value = "secret123"
             resp = self.client.post("/internal/cron-tick")
         self.assertEqual(resp.status_code, 401)
 
     def test_wrong_bearer_token_returns_401(self) -> None:
         with patch("apps.cron_tick_routes.settings") as fake_settings:
-            fake_settings.cron_shared_secret.get_secret_value.return_value = "secret123"
+            fake_settings.cron_tick_secret.get_secret_value.return_value = "secret123"
             resp = self.client.post(
                 "/internal/cron-tick", headers={"Authorization": "Bearer wrong"}
             )
@@ -46,7 +50,7 @@ class CronTickAuthTest(unittest.TestCase):
 
     def test_correct_token_but_not_cloud_mode_returns_503(self) -> None:
         with patch("apps.cron_tick_routes.settings") as fake_settings:
-            fake_settings.cron_shared_secret.get_secret_value.return_value = "secret123"
+            fake_settings.cron_tick_secret.get_secret_value.return_value = "secret123"
             fake_settings.is_cloud = False
             resp = self.client.post(
                 "/internal/cron-tick", headers={"Authorization": "Bearer secret123"}
@@ -55,11 +59,17 @@ class CronTickAuthTest(unittest.TestCase):
 
     def test_correct_token_and_cloud_mode_runs_the_tick(self) -> None:
         with patch("apps.cron_tick_routes.settings") as fake_settings:
-            fake_settings.cron_shared_secret.get_secret_value.return_value = "secret123"
+            fake_settings.cron_tick_secret.get_secret_value.return_value = "secret123"
             fake_settings.is_cloud = True
             with patch(
                 "apps.cron_tick_routes._run_tick",
-                return_value={"users_checked": 0, "routines_fired": 0, "errors": [], "ticked_at": "x"},
+                return_value={
+                    "correlation_id": "corr-1",
+                    "users_checked": 0,
+                    "routines_fired": 0,
+                    "error_count": 0,
+                    "ticked_at": "x",
+                },
             ) as fake_run:
                 resp = self.client.post(
                     "/internal/cron-tick", headers={"Authorization": "Bearer secret123"}
@@ -67,7 +77,19 @@ class CronTickAuthTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["users_checked"], 0)
+        self.assertEqual(body["correlation_id"], "corr-1")
         fake_run.assert_called_once()
+
+    def test_internal_job_secret_is_rejected_on_cron_tick(self) -> None:
+        # The two secrets are NOT interchangeable: a caller holding only
+        # INTERNAL_JOB_SECRET must not be able to authenticate to cron-tick.
+        with patch("apps.cron_tick_routes.settings") as fake_settings:
+            fake_settings.cron_tick_secret.get_secret_value.return_value = "cron-secret"
+            resp = self.client.post(
+                "/internal/cron-tick",
+                headers={"Authorization": "Bearer job-secret-value"},
+            )
+        self.assertEqual(resp.status_code, 401)
 
 
 class RunTickOrchestrationTest(unittest.TestCase):
@@ -103,7 +125,8 @@ class RunTickOrchestrationTest(unittest.TestCase):
 
         self.assertEqual(result["users_checked"], 1)
         self.assertEqual(result["routines_fired"], 1)
-        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["error_count"], 0)
+        self.assertIn("correlation_id", result)
         fake_claim.assert_called_once_with("usr_a", "workflow.morning_routine", "2026-09-12T09:00")
         fake_fire.assert_called_once()
 
@@ -128,6 +151,7 @@ class RunTickOrchestrationTest(unittest.TestCase):
             result = _run_tick(now)
 
         self.assertEqual(result["routines_fired"], 0)
+        self.assertEqual(result["error_count"], 0)
         fake_fire.assert_not_called()
 
     def test_skips_rejected_and_unapplied_routines(self) -> None:
@@ -158,6 +182,15 @@ class RunTickOrchestrationTest(unittest.TestCase):
         fake_fire.assert_not_called()
 
     def test_journal_read_error_recorded_but_does_not_abort_tick(self) -> None:
+        # WP 1.B / S-7.3 output hygiene: _run_tick's RETURNED dict (what
+        # becomes the HTTP response, and what the GH Actions workflow echoes
+        # to its log) must carry only a count, never the user id — the
+        # original assertion here (`self.assertIn("usr_broken",
+        # result["errors"][0])`) asserted the exact thing this WP requires
+        # removed, so it's replaced with an assertion that the user id is
+        # NOT present anywhere in the response. Per-user detail still goes
+        # to the server's own logger (not the HTTP response) — see
+        # test_journal_read_error_is_logged_with_correlation_id below.
         from apps.cron_tick_routes import _run_tick
 
         now = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
@@ -171,8 +204,24 @@ class RunTickOrchestrationTest(unittest.TestCase):
             result = _run_tick(now)
 
         self.assertEqual(result["users_checked"], 2)
-        self.assertEqual(len(result["errors"]), 1)
-        self.assertIn("usr_broken", result["errors"][0])
+        self.assertEqual(result["error_count"], 1)
+        self.assertNotIn("errors", result)
+        self.assertNotIn("usr_broken", json.dumps(result))
+
+    def test_journal_read_error_is_logged_with_correlation_id(self) -> None:
+        from apps.cron_tick_routes import _run_tick
+
+        now = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+        with patch(
+            "core.storage.cloud.journal_store.list_user_ids_pg",
+            return_value=["usr_broken"],
+        ), patch(
+            "core.routine_scheduler.get_active_routines_for_user",
+            side_effect=RuntimeError("boom"),
+        ), self.assertLogs("apps.cron_tick_routes", level="WARNING") as logs:
+            result = _run_tick(now)
+
+        self.assertTrue(any(result["correlation_id"] in line for line in logs.output))
 
 
 if __name__ == "__main__":
