@@ -46,6 +46,4 @@ User: "How long to drive from Bangalore to Mysore?"
 User: "How far is the beach from Mercure Hotel Al Barsha on foot?"
 → call `get_directions(origin="Mercure Hotel Al Barsha, Dubai", destination="Jumeirah Beach", travel_mode="WALK")`
 
-**Example 3 — public transport**
-User: "What's the fastest way to get to the airport by metro?"
-→ call `get_directions(origin="<user's known location>", destination="<airport>", travel_mode="TRANSIT")`
+If the user doesn't state an origin (e.g. "what's the fastest way to the airport by metro?"), ASK where they're starting from — never invent an origin from context ("the user's known location").

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import functools
 import base64
 import hashlib
 import hmac
@@ -100,7 +101,14 @@ from core.email_flow import (
     validate_recipients,
     validate_send_email_args,
 )
-from core.output_clean import clean_text_for_model, clean_text_for_tts, clean_text_for_display
+from core.output_clean import (
+    clean_text_for_model,
+    clean_text_for_tts,
+    clean_text_for_display,
+    sanitize_for_envelope,
+    wrap_untrusted,
+    extract_tool_result_urls,
+)
 from core.confirmation_gate import ConfirmationGate
 from core.guardrails import StorageCapExceededError, WebSocketRateLimitExceeded
 from core.storage.factory import get_channel_gate_buffer, get_ws_rate_limiter
@@ -442,6 +450,12 @@ class SharedState:
     # Phase 1: the memory block for the current turn. Delivered to the model
     # via per-turn instructions (never inside the persisted user prompt).
     memory_context: str = ""
+    # WP1.H: URLs a TOOL actually returned this turn (extracted from the
+    # sanitised, pre-envelope text at the registration-loop wrapper). Reset
+    # at the top of each turn; the "done" frame carries this list so the
+    # client can allow-list anchors instead of trusting anything the model
+    # wrote in prose.
+    tool_sourced_urls: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -829,6 +843,46 @@ def _truncate_tool_output(text: str, *, label: str) -> str:
         f"{text[:TOOL_OUTPUT_MAX_CHARS]}\n\n"
         f"[Output truncated: {label} was too long. Ask follow-up questions for specific details.]"
     )
+
+
+def _wrap_tool_with_envelope(name: str, fn):
+    """Wrap a registered tool's coroutine so its return is always the
+    sanitised, enveloped ``<untrusted source="name">...</untrusted>`` text —
+    see the WP1.H comment at the call site (``_register_tools``) for why this
+    is the one place that can cover all twelve tools regardless of what each
+    closure returns internally.
+
+    ``functools.wraps`` matters beyond cosmetics here: pydantic-ai builds each
+    tool's arguments schema from ``inspect.signature``/``get_type_hints`` on
+    the function object passed to ``Agent.tool()``. Both follow the
+    ``__wrapped__`` pointer ``functools.wraps`` sets, so the wrapper — despite
+    taking ``*args, **kwargs`` — is introspected as if it were the original
+    ``(ctx, args)`` closure, and pydantic-ai builds the correct schema.
+    """
+
+    @functools.wraps(fn)
+    async def _wrapped(*args, **kwargs):
+        raw = await fn(*args, **kwargs)
+        raw = raw if isinstance(raw, str) else str(raw)
+        sanitized = sanitize_for_envelope(raw, max_chars=TOOL_OUTPUT_MAX_CHARS)
+
+        # Collect this turn's tool-sourced URLs onto SharedState (first
+        # positional arg is always `ctx: RunContext[SharedState]` per the
+        # tool signatures above) so the "done" frame can allow-list them.
+        ctx = args[0] if args else kwargs.get("ctx")
+        deps = getattr(ctx, "deps", None)
+        url_bucket = getattr(deps, "tool_sourced_urls", None)
+        if url_bucket is not None:
+            try:
+                for _url in extract_tool_result_urls(sanitized):
+                    if _url not in url_bucket:
+                        url_bucket.append(_url)
+            except Exception:
+                pass
+
+        return wrap_untrusted(name, sanitized)
+
+    return _wrapped
 
 
 def _compose_prompt_with_memory(user_text: str, memory_context: str | list[str]) -> str:
@@ -2617,6 +2671,21 @@ class AgentManager:
             ("get_directions", get_directions),
             ("remember", remember),
             ("link_account", link_account),
+        ]
+        # WP1.H (ledger 1b.2): every tool result is attacker-influenced text
+        # (a fetched page, a search snippet, a place review) handed to the
+        # model with nothing marking it as data. Of the twelve tools above,
+        # five never call ToolResult.to_agent_string() on their happy path,
+        # two never touch ToolResult at all, and one re-wraps a
+        # to_agent_string() value through clean_text_for_model — four
+        # distinct return shapes. An envelope placed inside any one of those
+        # shapes would cover under half the surface while looking complete.
+        # This registration loop is the one place every tool's return passes
+        # through regardless of its internal shape, so the envelope is
+        # applied here, once, to all twelve.
+        _tool_registry = [
+            (_name, _wrap_tool_with_envelope(_name, _fn))
+            for _name, _fn in _tool_registry
         ]
         for _target_agent in [self.main_assistant, *self.main_assistant_fallbacks]:
             for _contract_name, _tool_fn in _tool_registry:
@@ -5010,6 +5079,10 @@ async def _execute_turn(
     """
     timings: dict[str, float] = {}
     overall_start = time.time()
+    # WP1.H: reset this turn's tool-sourced URL bucket. Populated by the
+    # envelope wrapper (_wrap_tool_with_envelope) as tools run below, read
+    # when the "done" frame is sent.
+    state.tool_sourced_urls = []
     # Hoisted to the top (rather than created just before the agent call, as
     # it used to be) so it exists on EVERY exit path — including one that
     # raises before ever reaching the agent call — for
@@ -5153,7 +5226,11 @@ async def _execute_turn(
         # Send complete response. The chat gets the display-cleaned text (markdown
         # links preserved → clickable), while final_output (links flattened) feeds
         # TTS/RAG.
-        await _emit(ws, {"type": "done", "content": clean_text_for_display(response.output)})
+        await _emit(ws, {
+            "type": "done",
+            "content": clean_text_for_display(response.output),
+            "tool_urls": list(state.tool_sourced_urls),
+        })
 
         # Update session
         message_history = _persist_history(message_history, response)
@@ -5305,6 +5382,8 @@ async def _execute_turn_streaming(
     the caller can transparently fall back to the batch path for this turn.
     """
     # --- pre-run: identical inputs to the batch path -----------------------
+    # WP1.H: reset this turn's tool-sourced URL bucket (mirrors _execute_turn).
+    state.tool_sourced_urls = []
     if state.user_id:
         emit_event_once(state.user_id, "first_message_sent", channel=channel)
 
@@ -5409,7 +5488,11 @@ async def _execute_turn_streaming(
 
     # Send the full reply text for the transcript UI once synthesis is underway.
     # Display-cleaned (markdown links preserved) so the chat renders clickable links.
-    await _ws_send_json(ws, {"type": "done", "content": clean_text_for_display(collector.output or "")})
+    await _ws_send_json(ws, {
+        "type": "done",
+        "content": clean_text_for_display(collector.output or ""),
+        "tool_urls": list(state.tool_sourced_urls),
+    })
 
     # --- post-run: identical bookkeeping to the batch path -----------------
     message_history = _persist_history(message_history, collector)
