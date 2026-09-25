@@ -224,10 +224,27 @@ def test_link_endpoint_requires_authentication(monkeypatch):
     """In cloud there is no dev fallback — unauthenticated must 401,
     never link. Authentication IS the proof of target-account ownership."""
     from fastapi.testclient import TestClient
+    from pydantic import SecretStr
     import apps.turtle_server as ts
 
     monkeypatch.setattr(ts.settings, "deploy_mode", "cloud", raising=False)
     monkeypatch.setattr(ts.settings, "dev_anon", False, raising=False)
+    # WP0.A: cloud startup now refuses to boot without DATABASE_URL/REDIS_URL
+    # (a deploy that cannot reach its backends should not serve). Fake, obviously
+    # non-real values so the startup hook is satisfied and this test can get to
+    # the auth behaviour it actually cares about. Do not strip these as noise.
+    monkeypatch.setattr(
+        ts.settings,
+        "database_url",
+        SecretStr("postgresql://fake:fake@fake-neon.example/db"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ts.settings,
+        "redis_url_primary",
+        SecretStr("redis://fake-upstash.example:6379"),
+        raising=False,
+    )
     with TestClient(ts.app) as client:
         resp = client.post("/api/account/link", json={"code": "WHATEVER"})
     assert resp.status_code == 401

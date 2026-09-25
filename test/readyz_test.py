@@ -129,6 +129,45 @@ class CloudStartupValidationTest(unittest.TestCase):
         with TestClient(ts.app):
             pass  # must not raise
 
+    def test_blank_database_url_raises_same_as_unset(self) -> None:
+        """Regression guard for the exact bug behind commit 71c3378: Vercel once
+        had TURTLE_DEPLOY set to an empty string rather than unset. The same
+        class of mistake (DATABASE_URL="") must fail startup identically to a
+        genuinely unset value — exercised against the REAL settings object (not
+        a full mock) so the SecretStr("") falsiness is actually proven, not
+        assumed."""
+        from core.config import settings as real_settings
+        from pydantic import SecretStr
+        from unittest.mock import patch as _patch
+
+        with _patch.object(real_settings, "deploy_mode", "cloud"), _patch.object(
+            real_settings, "database_url", SecretStr("")
+        ), _patch.object(
+            real_settings, "redis_url_primary", SecretStr("redis://fake-upstash.example:6379")
+        ):
+            with self.assertRaises(Exception) as ctx:
+                with TestClient(ts.app):
+                    pass
+        self.assertIn("DATABASE_URL", str(ctx.exception))
+
+    def test_blank_redis_url_raises_same_as_unset(self) -> None:
+        """Same regression guard as above, for the REDIS_URL/UPSTASH_REDIS_URL
+        pair — redis_url is a computed property, not a plain field, so this
+        proves the property's own blank-string handling, not just the guard."""
+        from core.config import settings as real_settings
+        from pydantic import SecretStr
+        from unittest.mock import patch as _patch
+
+        with _patch.object(real_settings, "deploy_mode", "cloud"), _patch.object(
+            real_settings, "database_url", SecretStr("postgresql://fake:fake@fake-neon.example/db")
+        ), _patch.object(real_settings, "redis_url_primary", SecretStr("")), _patch.object(
+            real_settings, "redis_url_upstash", SecretStr("")
+        ):
+            with self.assertRaises(Exception) as ctx:
+                with TestClient(ts.app):
+                    pass
+        self.assertIn("REDIS_URL", str(ctx.exception))
+
 
 class HealthzShaTest(unittest.TestCase):
     def setUp(self) -> None:
