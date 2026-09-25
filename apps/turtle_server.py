@@ -1820,7 +1820,16 @@ class AgentManager:
         self.main_assistant_fallbacks: list[Agent] = []
         self.email_agent: Agent | None = None
         self.email_agent_fallbacks: list[Agent] = []
-        self.usage_limits = UsageLimits(request_limit=30)
+        # WP1.D2 (ledger 1a.4 part 4): total_tokens_limit bounds ONE turn's
+        # worst case, independent of the daily budget check (which only sees
+        # spend recorded by turns that already finished). 100_000 is ~10% of
+        # the default daily budget (TURTLE_DAILY_TOKEN_BUDGET=1_000_000) — a
+        # single pathological cascade (many fallback rungs, each burning a
+        # fraction of the 30-request cap with its own prompt+context) can cap
+        # out there without ever touching it in normal 1-3 rung turns, while
+        # still keeping the worst-case daily-budget overshoot from one turn
+        # to a tenth of a day's allowance rather than unbounded.
+        self.usage_limits = UsageLimits(request_limit=30, total_tokens_limit=100_000)
         self.stt = FastRTCSTT(groq_client=groq_client)
         self.rebuild(config)  # stt rebuilt inside rebuild()
 
@@ -4594,6 +4603,124 @@ def _classify_handler_error(exc: Exception) -> tuple[str, str]:
     return "internal_error", "Something went wrong. The error has been logged."
 
 
+# ---------------------------------------------------------------------------
+# Daily token budget (WP1.D2 / ledger 1a.4 part 4)
+# ---------------------------------------------------------------------------
+#
+# Cloud-mode only: local has no Redis to track spend against, so
+# _daily_spend_check/_record_daily_spend are no-ops off-cloud — every local
+# turn is unmetered. This mirrors how get_ws_rate_limiter()/get_channel_gate_
+# buffer() branch (Redis in cloud, an in-process/no-op stand-in locally):
+# there is no local equivalent of a cross-tenant spend cap because a local
+# deployment IS single-tenant already.
+#
+# REDIS-UNAVAILABLE POSTURE: fail OPEN (allow the turn, log it). Wave 1's
+# email reservation fails CLOSED because a duplicate send is unrecoverable —
+# the cost of a false negative there is a real external side effect. Here the
+# cost of a false negative is "one user's spend for one turn goes untracked
+# during a Redis blip" — recoverable, bounded, and self-healing on the next
+# successful check/record. Fail-closed here would instead turn a Redis blip
+# into a full outage for every metered user simultaneously (nobody can talk
+# to Turtle at all), which is a strictly worse failure mode than an
+# uncommon, temporary loss of metering precision.
+#
+# CHECK-VS-RECORD ORDERING / OVERSHOOT: a turn's cost is only known after it
+# finishes, so _daily_spend_check (called BEFORE the agent runs) can only ever
+# compare a user's already-recorded spend from EARLIER turns against today's
+# limit — never against the turn that's about to run. That means a user who
+# is JUST under budget can still start one more turn, and that turn is free
+# to spend up to UsageLimits.total_tokens_limit (see AgentManager.__init__)
+# before pydantic-ai itself cuts it off. So the daily budget can be overshot,
+# but only by at most one turn's worth of tokens — bounded by
+# total_tokens_limit (100_000, ~10% of the default 1_000_000/day budget), not
+# unbounded. _record_daily_spend runs in _execute_turn's `finally` block (see
+# below), so spend is recorded even for a turn that errored out — an
+# expensive failed cascade is exactly the case most worth counting.
+#
+# STREAMING GAP: _execute_turn_streaming (the voice/streaming path) does NOT
+# populate a CascadeStats and therefore is NOT metered by this budget at all
+# — see the comment at its call to stream_agent_text_with_fallbacks. This is
+# the ledger's accepted gap ("streaming joins in Phase 4"), not an oversight.
+
+def _utc_day_str() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).strftime("%Y%m%d")
+
+
+def _spend_key(user_id: str) -> str:
+    return f"turtle:spend:{user_id}:{_utc_day_str()}"
+
+
+def _next_utc_midnight_str() -> str:
+    """Human-readable UTC reset time for the refusal message."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return tomorrow.strftime("%H:%M UTC on %Y-%m-%d")
+
+
+def _is_unmetered(user_id: str) -> bool:
+    from core.config import parse_unmetered_user_ids
+
+    return bool(user_id) and user_id in parse_unmetered_user_ids(settings.unmetered_user_ids)
+
+
+def _daily_spend_check(user_id: str) -> str | None:
+    """Return a refusal message (naming the UTC reset time) if ``user_id`` is
+    at or over their daily token budget, else None (turn may proceed).
+
+    Local mode and unmetered users always return None. See the module-level
+    comment above for the ordering/overshoot and Redis-failure reasoning.
+    """
+    if not settings.is_cloud or not user_id:
+        return None
+    limit = int(settings.daily_token_budget or 0)
+    if limit <= 0:
+        return None
+    if _is_unmetered(user_id):
+        return None
+    try:
+        from core.storage.cloud import get_redis_sync_client
+
+        client = get_redis_sync_client()
+        spent = int(client.get(_spend_key(user_id)) or 0)
+    except Exception as exc:
+        print(f"LOG: daily budget check: Redis unavailable ({exc}) — failing open, turn allowed")
+        return None
+    if spent >= limit:
+        reset_at = _next_utc_midnight_str()
+        return (
+            f"You've reached today's usage limit for now. It resets at {reset_at}."
+        )
+    return None
+
+
+def _record_daily_spend(user_id: str, tokens: int) -> None:
+    """Advance ``user_id``'s spend key by ``tokens`` (2-day expiry, rolling).
+
+    Best-effort: a Redis failure here loses that turn's metering (already
+    accepted above as the cost of fail-open), never raises into the turn
+    pipeline.
+    """
+    if not settings.is_cloud or not user_id or tokens <= 0:
+        return
+    if _is_unmetered(user_id):
+        return
+    try:
+        from core.storage.cloud import get_redis_sync_client
+
+        client = get_redis_sync_client()
+        key = _spend_key(user_id)
+        pipe = client.pipeline()
+        pipe.incrby(key, tokens)
+        pipe.expire(key, 172800)  # 2 days, per the ledger's chosen option
+        pipe.execute()
+    except Exception as exc:
+        print(f"LOG: daily budget record failed for spend key ({exc}) — this turn's spend was not recorded")
+
+
 class TurnOutcome(NamedTuple):
     """Return value of the canonical turn pipeline.
 
@@ -4653,6 +4780,18 @@ async def _execute_turn(
 
     if state.user_id:
         emit_event_once(state.user_id, "first_message_sent", channel=channel)
+
+    # WP1.D2 (ledger 1a.4 part 4): refuse BEFORE any LLM call when the user is
+    # already over their daily token budget — checked first so a refused turn
+    # costs nothing (no "thinking" frame, no memory-context resolution, no
+    # agent call). See the _daily_spend_check module comment above
+    # TurnOutcome for local-mode/Redis-failure/overshoot reasoning.
+    _budget_refusal = _daily_spend_check(state.user_id)
+    if _budget_refusal is not None:
+        await _emit(ws, {"type": "done", "content": _budget_refusal})
+        timings["total_ms"] = round((time.time() - overall_start) * 1000)
+        await _emit(ws, {"type": "timing", **timings})
+        return TurnOutcome(message_history, _budget_refusal, _budget_refusal)
 
     if send_status:
         await _emit(ws, {"type": "status", "status": "thinking"})
@@ -4754,6 +4893,17 @@ async def _execute_turn(
                     _turn_span.set_attribute(ATTR_TOKENS_OUT, cascade_stats.total_output_tokens)
                 except Exception:
                     pass
+                # WP1.D2 (ledger 1a.4 part 4): record spend here too, in the
+                # same best-effort finally — this is the one place a batch
+                # turn's real token cost is known, success or failure. See the
+                # _daily_spend_check/_record_daily_spend module comment above
+                # class TurnOutcome for the ordering/overshoot/Redis-failure
+                # reasoning. NOTE: _execute_turn_streaming has no equivalent
+                # call — streamed turns are not metered by this budget yet.
+                _record_daily_spend(
+                    state.user_id,
+                    cascade_stats.total_input_tokens + cascade_stats.total_output_tokens,
+                )
         timings["llm_ms"] = round((time.time() - llm_start) * 1000)
 
         final_output = clean_text_for_model(response.output)
@@ -4925,6 +5075,15 @@ async def _execute_turn_streaming(
 
     async def _token_source():
         # Yields raw model text deltas; StreamCollector captures the finished run.
+        # WP1.D2 (ledger 1a.4 part 4): NOT metered by the daily token budget —
+        # stream_agent_text_with_fallbacks takes no `stats=` (no CascadeStats
+        # here to read token counts from), so this streamed/voice path is
+        # invisible to _daily_spend_check/_record_daily_spend in
+        # _execute_turn. This is the ledger's accepted, explicit gap
+        # ("streaming joins in Phase 4") — not an oversight, and not fixed
+        # here (usage_limits.total_tokens_limit still bounds one streamed
+        # turn's own worst case via pydantic-ai, it just isn't accumulated
+        # into turtle:spend:{uid}:{yyyymmdd}).
         async for delta in stream_agent_text_with_fallbacks(
             agents_mgr.main_assistant,
             agents_mgr.main_assistant_fallbacks,

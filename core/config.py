@@ -28,6 +28,12 @@ CHANNEL_SIGNUP_OPEN = "open"
 CHANNEL_SIGNUP_INVITE = "invite"
 _CHANNEL_SIGNUP_VALUES = (CHANNEL_SIGNUP_OPEN, CHANNEL_SIGNUP_INVITE)
 
+# WP1.D2 (ledger 1a.4 part 4): per-tenant daily token budget default. 1M
+# tokens/user/day at today's cascade shape (max_tokens=1024 output, a handful
+# of tool-calling requests per turn) comfortably covers heavy daily use while
+# still bounding a runaway/abusive tenant's cost.
+DEFAULT_DAILY_TOKEN_BUDGET = 1_000_000
+
 
 def normalize_channel_signup(raw: str) -> str:
     """Case/whitespace-tolerant parse of TURTLE_CHANNEL_SIGNUP.
@@ -60,6 +66,21 @@ def normalize_channel_signup(raw: str) -> str:
             f"invite-only. Fix the value to actually close it."
         )
     return CHANNEL_SIGNUP_OPEN
+
+
+def parse_unmetered_user_ids(raw: str) -> frozenset[str]:
+    """Parse TURTLE_UNMETERED_USER_IDS — a comma-separated allowlist of
+    user_ids exempt from the daily token budget (the owner, typically).
+
+    Whitespace-tolerant and empty-entry-tolerant (a trailing comma or double
+    comma must not produce a "" that then vacuously matches a blank/unset
+    user_id somewhere else). Unlike normalize_channel_signup this is not an
+    enum with a fixed accepted set, so there is no "unrecognised value"
+    warning to give — any non-empty entry is a plausible user_id.
+    """
+    if not raw:
+        return frozenset()
+    return frozenset(uid.strip() for uid in raw.split(",") if uid.strip())
 
 
 class TurtleSettings(BaseSettings):
@@ -268,6 +289,21 @@ class TurtleSettings(BaseSettings):
         # construction (tests do this routinely via monkeypatch), which a
         # field_validator alone would not re-run.
         return normalize_channel_signup(value)
+
+    # WP1.D2 (ledger 1a.4 part 4): per-tenant daily token budget, enforced in
+    # cloud mode only (see apps/turtle_server.py's _daily_spend_check —
+    # local mode has no Redis and this is simply not metered there). 0 or
+    # negative disables the budget outright (unmetered for everyone).
+    daily_token_budget: int = Field(
+        default=DEFAULT_DAILY_TOKEN_BUDGET, alias="TURTLE_DAILY_TOKEN_BUDGET"
+    )
+    # Comma-separated user_ids exempt from the daily budget (the owner).
+    # Parsed via parse_unmetered_user_ids at the call site (not just here)
+    # for the same reason channel_signup re-normalizes at call time: tests
+    # and hot-config-reload can reassign settings.unmetered_user_ids after
+    # construction, which a field_validator alone would not re-run against.
+    unmetered_user_ids: str = Field(default="", alias="TURTLE_UNMETERED_USER_IDS")
+
     # Phase 7: gate /admin/* endpoints. None = endpoints return 503.
     admin_token: Optional[SecretStr] = Field(default=None, alias="TURTLE_ADMIN_TOKEN")
 
