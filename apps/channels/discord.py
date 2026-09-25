@@ -44,7 +44,6 @@ Required env vars:
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 
 import httpx
@@ -55,6 +54,15 @@ from fastapi import APIRouter, HTTPException, Request
 from apps.channels import TurtleEvent, TurtleResponse, dispatch_event
 from core.config import settings
 from core.identity import identity_manager
+from core.internal_auth import (
+    SignatureError,
+    check_bearer,
+    sign_request,
+    store_job_payload,
+    take_job_payload,
+    verify_request,
+)
+from core.storage.cloud import CloudBackendUnavailable
 
 router = APIRouter(prefix="/channels/discord", tags=["discord"])
 
@@ -202,23 +210,41 @@ async def _kick_off_deferred_processing(payload: dict) -> None:
         _track(asyncio.create_task(_process_deferred_interaction(payload)))
         return
 
-    secret = settings.cron_shared_secret.get_secret_value() if settings.cron_shared_secret else ""
+    secret = settings.internal_job_secret.get_secret_value() if settings.internal_job_secret else ""
     if not secret:
         # No internal-automation secret configured — degrade to the
         # in-process task rather than silently dropping the interaction.
         # Less robust on serverless, but strictly no worse than before this
         # fix existed, and it's a one-line env var away from the safe path.
-        print("[Discord] CRON_SHARED_SECRET unset — falling back to in-process deferred task")
+        print("[Discord] INTERNAL_JOB_SECRET unset — falling back to in-process deferred task")
+        _track(asyncio.create_task(_process_deferred_interaction(payload)))
+        return
+
+    # WP 1.B / S-7.3: payload-by-reference — stash the real payload (which
+    # carries discord_user_id) in Redis and send only its id. If Redis isn't
+    # reachable, that's the same "can't complete the internal-automation
+    # round trip" case as no secret being set — degrade the same way.
+    try:
+        job_id = await store_job_payload(payload)
+        body = json.dumps({"job_id": job_id}).encode("utf-8")
+        envelope = sign_request(secret, body)
+    except CloudBackendUnavailable as e:
+        print(f"[Discord] job store unavailable, falling back to in-process: {e}")
         _track(asyncio.create_task(_process_deferred_interaction(payload)))
         return
 
     url = f"{settings.public_base_url.rstrip('/')}/channels/discord/process"
+    headers = {
+        "Authorization": f"Bearer {secret}",
+        "Content-Type": "application/json",
+        **envelope.headers(),
+    }
     try:
         async with httpx.AsyncClient() as client:
             await client.post(
                 url,
-                json=payload,
-                headers={"Authorization": f"Bearer {secret}"},
+                content=body,
+                headers=headers,
                 timeout=httpx.Timeout(connect=5.0, read=0.1, write=5.0, pool=5.0),
             )
     except httpx.ReadTimeout:
@@ -332,19 +358,43 @@ async def discord_process_deferred(request: Request):
     why cloud mode self-invokes this instead of a detached background task.
 
     Never called by Discord itself (it has no idea this route exists) —
-    protected by the shared internal-automation secret (CRON_SHARED_SECRET,
-    the same one apps/cron_tick_routes.py uses), not a Discord signature.
+    protected by INTERNAL_JOB_SECRET (WP 1.B / S-7.3: no longer the same
+    secret apps/cron_tick_routes.py's /internal/cron-tick uses), checked as
+    both a bearer token AND the key for a signed-request envelope (timestamp
+    + nonce + raw body, core.internal_auth.verify_request) — not a Discord
+    signature. The body itself carries only an opaque job id; the real
+    payload (including discord_user_id) is read-and-deleted from Redis
+    (core.internal_auth.take_job_payload), never trusted from the wire.
     """
-    secret = settings.cron_shared_secret.get_secret_value() if settings.cron_shared_secret else ""
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else ""
-    if not secret or not token or not hmac.compare_digest(token, secret):
+    secret_value = settings.internal_job_secret.get_secret_value() if settings.internal_job_secret else ""
+    authorization = request.headers.get("Authorization", "")
+    if not check_bearer(secret_value, authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    body = await request.body()
     try:
-        payload = await request.json()
+        await verify_request(
+            secret_value,
+            request.headers.get("X-Turtle-Timestamp"),
+            request.headers.get("X-Turtle-Nonce"),
+            request.headers.get("X-Turtle-Signature"),
+            body,
+        )
+    except SignatureError as exc:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: {exc}") from exc
+
+    try:
+        envelope = json.loads(body)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    job_id = envelope.get("job_id")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id is required")
+
+    payload = await take_job_payload(job_id)
+    if payload is None:
+        raise HTTPException(status_code=401, detail="Unknown or expired job id")
 
     required = {"interaction_token", "discord_user_id", "text", "interaction_id", "channel_id"}
     if not required.issubset(payload):
