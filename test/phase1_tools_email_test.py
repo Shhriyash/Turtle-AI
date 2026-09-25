@@ -276,21 +276,148 @@ def test_all_three_smtp_ssl_call_sites_pass_timeout():
         assert "timeout=20" in line, line
 
 
+# ---------------------------------------------------------------------------
+# Verifier follow-up: a send that RAISES (not returns) must still release
+# the reservation, or a client disconnect mid-SMTP traps every retry behind
+# a stale "pending" reservation for the rest of the 60s window.
+# ---------------------------------------------------------------------------
+
+def test_send_with_reservation_raise_releases_and_retry_gets_fresh_reservation(monkeypatch, tmp_path):
+    import asyncio
+
+    import tools.idempotency as idem
+
+    monkeypatch.setattr(idem, "_DB_PATH", tmp_path / "idempotency.sqlite3")
+    monkeypatch.setattr(idem, "_DB_INITIALIZED", False)
+
+    key = "usr_a:raises_plain"
+    assert idem.is_duplicate_invocation(key) is None  # reservation acquired
+
+    async def _boom():
+        raise RuntimeError("smtp exploded mid-call")
+
+    async def _run():
+        with pytest.raises(RuntimeError, match="smtp exploded mid-call"):
+            await idem.send_with_reservation(key, _boom)
+
+    asyncio.run(_run())
+
+    # The reservation must be released: an immediate retry gets a FRESH
+    # reservation (None), not the stale "still sending" pending message.
+    assert idem.is_duplicate_invocation(key) is None
+
+
+def test_send_with_reservation_cancelled_error_releases_and_propagates(monkeypatch, tmp_path):
+    """asyncio.CancelledError (Python 3.8+ subclasses BaseException, not
+    Exception — a naive `except Exception` would miss it entirely, exactly
+    what happens on a client disconnect mid-SMTP)."""
+    import asyncio
+
+    import tools.idempotency as idem
+
+    monkeypatch.setattr(idem, "_DB_PATH", tmp_path / "idempotency.sqlite3")
+    monkeypatch.setattr(idem, "_DB_INITIALIZED", False)
+
+    key = "usr_a:cancelled"
+    assert idem.is_duplicate_invocation(key) is None  # reservation acquired
+
+    async def _cancelled():
+        raise asyncio.CancelledError()
+
+    async def _run():
+        with pytest.raises(asyncio.CancelledError):
+            await idem.send_with_reservation(key, _cancelled)
+
+    asyncio.run(_run())  # must not swallow the cancellation
+
+    # Retry after a cancelled send must get a fresh reservation, not be
+    # blocked by a stale pending entry for the rest of the window.
+    assert idem.is_duplicate_invocation(key) is None
+
+
+def test_send_with_reservation_success_then_finalize_raises_does_not_release(monkeypatch, tmp_path):
+    """If the send actually succeeded and only the FINALIZE step (recording
+    the result) blows up, the reservation must be left alone — releasing it
+    here would let a concurrent/retried request send a genuine duplicate."""
+    import asyncio
+
+    import tools.idempotency as idem
+
+    monkeypatch.setattr(idem, "_DB_PATH", tmp_path / "idempotency.sqlite3")
+    monkeypatch.setattr(idem, "_DB_INITIALIZED", False)
+
+    key = "usr_a:finalize_boom"
+    assert idem.is_duplicate_invocation(key) is None  # reservation acquired
+
+    async def _succeeds():
+        return "Email sent successfully! it really went out"
+
+    def _broken_record_invocation(*_a, **_kw):
+        raise RuntimeError("disk full while finalizing")
+
+    # Patch only record_invocation, and restore it manually afterwards —
+    # monkeypatch.undo() would revert EVERY patch from this fixture
+    # (including _DB_PATH/_DB_INITIALIZED above), pointing the follow-up
+    # check at an unrelated real DB instead of this test's tmp_path one.
+    real_record_invocation = idem.record_invocation
+    idem.record_invocation = _broken_record_invocation
+    try:
+        async def _run():
+            with pytest.raises(RuntimeError, match="disk full while finalizing"):
+                await idem.send_with_reservation(key, _succeeds)
+
+        asyncio.run(_run())
+    finally:
+        idem.record_invocation = real_record_invocation
+
+    # The key must NOT have been deleted, and a retry must still be deduped
+    # (no duplicate possible), not get a fresh reservation.
+    assert idem.is_duplicate_invocation(key) is not None
+
+
+def test_send_with_reservation_returns_failure_string_still_releases(monkeypatch, tmp_path):
+    """Pre-existing case (send returns, rather than raises, a failure
+    string) must keep working: the reservation is released via the normal
+    non-success prefix filter, and a retry gets a fresh reservation."""
+    import asyncio
+
+    import tools.idempotency as idem
+
+    monkeypatch.setattr(idem, "_DB_PATH", tmp_path / "idempotency.sqlite3")
+    monkeypatch.setattr(idem, "_DB_INITIALIZED", False)
+
+    key = "usr_a:returns_failure"
+    assert idem.is_duplicate_invocation(key) is None  # reservation acquired
+
+    async def _fails():
+        return "Failed to send email: smtp refused"
+
+    async def _run():
+        result = await idem.send_with_reservation(key, _fails)
+        assert result == "Failed to send email: smtp refused"
+
+    asyncio.run(_run())
+
+    assert idem.is_duplicate_invocation(key) is None
+
+
 def test_send_email_now_call_site_is_off_event_loop():
     """apps/turtle_server.py's send_email_assistant tool must invoke the
-    blocking send_email_now via asyncio.to_thread, not directly, so a hung
-    SMTP call can't freeze the event loop (and every connected user with
-    it). Source-level check because building a full RunContext/SharedState
-    to drive the tool end-to-end is out of scope for this WP's file
-    ownership.
+    blocking send_email_now via asyncio.to_thread (inside the
+    send_with_reservation wrapper, not directly), so a hung SMTP call can't
+    freeze the event loop (and every connected user with it), and so a send
+    that raises still releases its reservation. Source-level check because
+    building a full RunContext/SharedState to drive the tool end-to-end is
+    out of scope for this WP's file ownership.
     """
     import inspect
 
     import apps.turtle_server as ts
 
     source = inspect.getsource(ts)
-    assert "await asyncio.to_thread(send_email_now, merged)" in source
+    assert "asyncio.to_thread(send_email_now, merged)" in source
     assert "send_result = send_email_now(merged)" not in source
+    assert "send_with_reservation(" in source
 
 
 def test_remember_tool_contract_and_registration_present():

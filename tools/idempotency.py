@@ -52,7 +52,7 @@ import hashlib
 import sqlite3
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -284,3 +284,55 @@ def record_invocation(idempotency_key: str, result: str) -> None:
         conn.close()
     except Exception as exc:
         print(f"LOG: Idempotency finalize failed ({exc}) — reservation may linger until its TTL")
+
+
+async def send_with_reservation(
+    idempotency_key: str, send_coro_factory: Callable[[], Awaitable[str]]
+) -> str:
+    """Run a reserved send, GUARANTEEING the reservation is finalized or
+    released however it exits.
+
+    Call this only after is_duplicate_invocation(idempotency_key) has
+    already returned None (i.e. the reservation is held). `send_coro_factory`
+    is called with no arguments and awaited to actually perform the send;
+    it is a factory (not a bare coroutine) so this function can be reused
+    safely without "coroutine was never awaited" surprises.
+
+    Without this wrapper, a send that RAISES instead of returning (a
+    cancelled task from a client disconnect mid-SMTP, thread-pool
+    exhaustion, an unhandled bug) leaves the reservation stuck at its
+    "pending" sentinel for the rest of the 60s window: the caller is told
+    the send failed, and then blocked from retrying immediately by the very
+    safety mechanism meant to prevent duplicates. That is a regression
+    relative to the pre-reservation behaviour (a failed send used to leave
+    no trace at all), so this function must not let it happen.
+
+    - Normal return: finalizes with that result via record_invocation
+      (success strings are cached as the duplicate-return value; anything
+      else deletes the reservation so a retry is not blocked).
+    - ANY exception during the send — this deliberately catches
+      BaseException, not Exception, so asyncio.CancelledError (which since
+      Python 3.8 does NOT subclass Exception) is included — means the send
+      never produced a result. The reservation is released (via the same
+      delete-on-non-success path record_invocation already has) and the
+      original exception is then re-raised UNCHANGED: cancellation is never
+      swallowed here, since that would corrupt task-shutdown semantics.
+    - If the send itself succeeded but finalizing that success then raises
+      (e.g. a bug in record_invocation), the reservation is deliberately
+      left AS-IS rather than released: we cannot tell from here whether the
+      underlying send actually went out, and releasing it would let a
+      concurrent/retried request send a genuine duplicate. The raise
+      propagates to the caller, which sees "no result" for this call even
+      though the underlying send may have succeeded — the reservation still
+      protects against a double-send in that window.
+    """
+    try:
+        result = await send_coro_factory()
+    except BaseException:
+        try:
+            record_invocation(idempotency_key, "Failed to send email: the send did not complete")
+        except Exception:
+            pass
+        raise
+    record_invocation(idempotency_key, result)
+    return result

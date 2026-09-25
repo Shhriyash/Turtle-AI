@@ -2249,6 +2249,7 @@ class AgentManager:
                     build_email_idempotency_key,
                     is_duplicate_invocation,
                     record_invocation,
+                    send_with_reservation,
                 )
                 idem_key = build_email_idempotency_key(
                     ctx.deps.user_id,
@@ -2271,8 +2272,13 @@ class AgentManager:
                     print(f"LOG: Email idempotency hit — skipping duplicate send ({idem_key[:12]}...)")
                     return clean_text_for_model(cached_result)
 
-                send_result = await asyncio.to_thread(send_email_now, merged)
-                record_invocation(idem_key, send_result)
+                # send_with_reservation guarantees the reservation is always
+                # finalized or released, however the send exits (including
+                # asyncio.CancelledError on a client disconnect mid-send) —
+                # see its docstring in tools/idempotency.py.
+                send_result = await send_with_reservation(
+                    idem_key, lambda: asyncio.to_thread(send_email_now, merged)
+                )
             except _ModelRetry:
                 # pydantic_ai's retry protocol — swallowing it hands the model
                 # a prose failure instead of a structured retry.
