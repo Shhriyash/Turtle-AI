@@ -129,6 +129,103 @@ def test_non_channel_callers_still_mint_under_invite(fake_manager, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 1a-bis. normalize_channel_signup — a security toggle must never fail open
+# on a typo (coordinator follow-up on WP 1.D). Covers casing, leading/
+# trailing whitespace, an unrecognised value, and that unset still means
+# open. Exercised at TWO levels: the pure function directly (asserts the
+# canonical value AND the warn/silent behaviour), and through
+# resolve_channel_user with settings.channel_signup set to the RAW
+# (unnormalized) string via monkeypatch — matching how a real misconfigured
+# env var would arrive — asserting the resulting mint/no-mint behaviour.
+# ---------------------------------------------------------------------------
+
+from core.config import (  # noqa: E402  (grouped with the rest of this section)
+    CHANNEL_SIGNUP_INVITE,
+    CHANNEL_SIGNUP_OPEN,
+    normalize_channel_signup,
+)
+
+
+def test_normalize_unset_value_is_open_and_silent(capsys):
+    assert normalize_channel_signup("") == CHANNEL_SIGNUP_OPEN
+    assert normalize_channel_signup(None) == CHANNEL_SIGNUP_OPEN
+    out = capsys.readouterr().out
+    assert out == "", "an unset value is the expected default — it must not warn"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["INVITE", "Invite", "invite ", " invite", "  INVITE  "],
+)
+def test_normalize_case_and_whitespace_tolerant_invite(raw, capsys):
+    assert normalize_channel_signup(raw) == CHANNEL_SIGNUP_INVITE
+    out = capsys.readouterr().out
+    assert out == "", f"a valid (if oddly-cased/padded) value must not warn: {raw!r}"
+
+
+@pytest.mark.parametrize("raw", ["OPEN", "Open", "open ", " open"])
+def test_normalize_case_and_whitespace_tolerant_open(raw, capsys):
+    assert normalize_channel_signup(raw) == CHANNEL_SIGNUP_OPEN
+    out = capsys.readouterr().out
+    assert out == ""
+
+
+def test_normalize_unrecognised_value_falls_back_to_open_and_warns(capsys):
+    """The must-fix: an unrecognised value (a typo) must NOT silently behave
+    as invite-only NOR silently behave as open — it falls back to open (the
+    safe default direction) but is LOUD about it."""
+    result = normalize_channel_signup("invyte")
+    assert result == CHANNEL_SIGNUP_OPEN
+    out = capsys.readouterr().out
+    assert "invyte" in out
+    assert "open" in out
+    assert "invite" in out  # names the accepted values, not just the bad one
+
+
+@pytest.mark.parametrize(
+    "raw,expect_none",
+    [
+        ("INVITE", True),
+        ("Invite", True),
+        ("invite ", True),
+        (" invite", True),
+        ("invyte", False),  # unrecognised -> falls back to open -> mints
+    ],
+)
+def test_resolve_channel_user_normalizes_raw_settings_value(
+    raw, expect_none, fake_manager, monkeypatch
+):
+    """settings.channel_signup set to a RAW, unnormalized string (exactly
+    what a misconfigured env var produces) must still gate correctly — this
+    is the regression the coordinator's fail-open report was about."""
+    monkeypatch.setattr(settings, "channel_signup", raw)
+
+    async def scenario():
+        uid = await identity_mod.resolve_channel_user("discord", "unknown_456")
+        if expect_none:
+            assert uid is None, f"{raw!r} must be treated as invite-only"
+            assert fake_manager.minted == []
+        else:
+            assert uid is not None, f"{raw!r} (unrecognised) must fall back to open"
+            assert fake_manager.minted == [uid]
+
+    asyncio.run(scenario())
+
+
+def test_channel_signup_field_validator_normalizes_at_construction():
+    """The TurtleSettings field_validator is the startup-time half of the
+    fix — env vars are read once at process boot, so this is where a real
+    deployment's typo gets caught and logged."""
+    from core.config import TurtleSettings
+
+    s = TurtleSettings(TURTLE_CHANNEL_SIGNUP="  INVITE  ")
+    assert s.channel_signup == CHANNEL_SIGNUP_INVITE
+
+    s2 = TurtleSettings(TURTLE_CHANNEL_SIGNUP="invyte")
+    assert s2.channel_signup == CHANNEL_SIGNUP_OPEN
+
+
+# ---------------------------------------------------------------------------
 # 1b. lookup_user on both identity backends
 # ---------------------------------------------------------------------------
 

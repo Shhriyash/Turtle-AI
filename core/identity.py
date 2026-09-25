@@ -20,7 +20,7 @@ from typing import Optional
 import aiosqlite
 from pydantic import BaseModel
 
-from core.config import settings
+from core.config import CHANNEL_SIGNUP_INVITE, normalize_channel_signup, settings
 from core.io_atomic import atomic_write_json
 
 # The web onboarding channel whose channel_user_id is an email address. Only
@@ -403,14 +403,24 @@ async def resolve_channel_user(channel: str, channel_user_id: str) -> Optional[s
     and are NOT routed through here; they mint by design regardless of this
     policy.
 
-    settings.channel_signup == "open" (default): identical to
-    resolve_user — mints a new identity on a miss, preserving today's
-    behaviour for unconfigured deployments.
+    settings.channel_signup == "open" (default, case/whitespace-insensitive,
+    unrecognised values fall back here too — see
+    core.config.normalize_channel_signup): identical to resolve_user — mints
+    a new identity on a miss, preserving today's behaviour for unconfigured
+    deployments.
 
     settings.channel_signup == "invite": non-minting lookup only. Returns
     None on a miss so the caller can reply with CHANNEL_INVITE_ONLY_MESSAGE
     instead of onboarding a stranger.
+
+    The raw setting is re-normalized here (not just trusted from
+    TurtleSettings' own field_validator) because settings.channel_signup can
+    be reassigned after construction — tests do this routinely via
+    monkeypatch, and a field_validator does not re-run on plain attribute
+    assignment. A security toggle failing OPEN on an un-normalized typo is
+    exactly the bug class this guards against.
     """
-    if settings.channel_signup == "invite":
+    policy = normalize_channel_signup(settings.channel_signup)
+    if policy == CHANNEL_SIGNUP_INVITE:
         return await identity_manager.lookup_user(channel, channel_user_id)
     return await identity_manager.resolve_user(channel, channel_user_id)
