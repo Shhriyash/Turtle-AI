@@ -112,6 +112,16 @@ class CalendarCreateArgs(BaseModel):
         default=True,
         description="If True, attach a Google Meet link to the event.",
     )
+    notify_attendees: bool = Field(
+        default=False,
+        description=(
+            "Send calendar invite emails to attendees. Set True ONLY when "
+            "the user explicitly asked to notify/invite/email the "
+            "attendees. Defaults to False — attendees are added to the "
+            "event silently, with no notification sent, even when "
+            "attendee_emails is non-empty."
+        ),
+    )
 
 
 class CalendarListArgs(BaseModel):
@@ -120,6 +130,27 @@ class CalendarListArgs(BaseModel):
         default=None,
         description="Only return events starting after this ISO 8601 datetime. Defaults to now.",
     )
+
+
+def render_calendar_draft(args: CalendarCreateArgs) -> str:
+    """Render a proposed event legibly enough that a user can spot a wrong
+    date or a wrong attendee before confirming — the entire point of the
+    calendar_create/calendar_confirm draft step."""
+    lines = [
+        "Here's the event I'll create once you confirm:",
+        f"Title: {args.title}",
+        f"Start: {args.start_iso}",
+        f"End: {args.end_iso}",
+    ]
+    lines.append(
+        f"Attendees: {', '.join(args.attendee_emails)}" if args.attendee_emails else "Attendees: (none)"
+    )
+    if args.description:
+        lines.append(f"Description: {args.description}")
+    lines.append(f"Google Meet: {'yes' if args.add_google_meet else 'no'}")
+    lines.append(f"Notify attendees by email: {'yes' if args.notify_attendees else 'no'}")
+    lines.append('\nSay "confirm" to create it, or tell me what to change.')
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +310,9 @@ async def create_calendar_event(
             calendarId="primary",
             body=body,
             conferenceDataVersion=1 if args.add_google_meet else 0,
-            sendUpdates="all" if args.attendee_emails else "none",
+            # "all" only when the user explicitly asked to notify attendees —
+            # never inferred merely from attendee_emails being non-empty.
+            sendUpdates="all" if args.notify_attendees else "none",
         ).execute()
 
         meet_link = ""

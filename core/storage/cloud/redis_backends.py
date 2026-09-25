@@ -187,15 +187,27 @@ def redis_is_duplicate_invocation(idempotency_key: str) -> Optional[str]:
         raise IdempotencyReservationError(str(exc)) from exc
 
 
-def redis_record_invocation(idempotency_key: str, result: str) -> None:
+def redis_record_invocation(idempotency_key: str, result: str, *, success: bool | None = None) -> None:
     """Finalize a reservation taken by redis_is_duplicate_invocation: overwrite
     with the completed result on success, or DELETE it on failure so the
     user's retry is not blocked by a failed send. Drop-in for
-    tools.idempotency.record_invocation."""
+    tools.idempotency.record_invocation.
+
+    `success` is generalised the same way as tools.idempotency.record_invocation:
+    pass it explicitly for non-email callers (e.g. calendar_confirm), whose
+    result string never starts with _SUCCESS_PREFIX ("Email sent
+    successfully") and would otherwise always be treated as a failure —
+    which would silently never cache a successful calendar confirm, making
+    the reservation useless for it. When omitted, falls back to the
+    original email-only string sniff so the existing email call site keeps
+    its exact prior behaviour.
+    """
+    if success is None:
+        success = str(result).startswith(_SUCCESS_PREFIX)
     key = f"turtle:idem:{idempotency_key}"
     try:
         client = get_redis_sync_client()
-        if str(result).startswith(_SUCCESS_PREFIX):
+        if success:
             client.set(key, result, ex=_IDEMPOTENCY_WINDOW_S)
         else:
             client.delete(key)
