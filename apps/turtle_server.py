@@ -3062,6 +3062,33 @@ async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
     now = time.monotonic()
     _evict_stale_channel_states(now)
 
+    # Rate limit FIRST — before provisioning (disk I/O) and before the
+    # per-(user, channel) lock, so a refused request costs neither. Keyed on
+    # the raw CHANNEL identity ("<channel>:<channel_user_id>"), never on
+    # event.user_id: (a) event.user_id can still be re-pointed by the
+    # re-resolve below if an account-link redemption lands mid-flight, which
+    # would let a link be used to dodge the limit; (b) once sign-up is
+    # invite-only (TURTLE_CHANNEL_SIGNUP=invite) an uninvited caller has no
+    # user_id at all — the channel identity is the only thing to key on, and
+    # exactly the requests we most want to rate limit. Reuses the same
+    # mode-aware limiter as the web WebSocket path (get_ws_rate_limiter());
+    # see that path in this module for the sibling usage.
+    channel_identity = f"{event.channel or ''}:{getattr(event, 'channel_user_id', '') or event.user_id}"
+    try:
+        get_ws_rate_limiter().check_and_record(channel_identity)
+    except WebSocketRateLimitExceeded as exc:
+        retry_text = (
+            f"You're sending messages too quickly ({exc.limit}/{exc.window}). "
+            "Please try again later."
+        )
+        return TurtleResponse(
+            content=retry_text,
+            channel=event.channel,
+            user_id=event.user_id,
+            message_id=event.message_id,
+            thread_id=event.thread_id,
+        )
+
     # First-contact provisioning. Web users are seeded at /onboarding/start;
     # channel users arrived as empty shells with no name and no identity.md,
     # so Turtle greeted a stranger every time and had nothing to personalise

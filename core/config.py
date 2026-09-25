@@ -202,6 +202,17 @@ class TurtleSettings(BaseSettings):
     ws_messages_per_day: int = Field(
         default=1000, alias="TURTLE_WS_MESSAGES_PER_DAY"
     )
+    # Sign-up policy for the 8 channel adapters (discord, imessage, telegram,
+    # whatsapp, twilio voice, slack, ...). "open" (default) preserves today's
+    # behaviour: a first message from an unknown channel identity silently
+    # mints a new tenant via identity_manager.resolve_user. Set to "invite" to
+    # close that door — an unknown sender is looked up (never minted) and gets
+    # an invite-only reply instead. The web onboarding flow
+    # (apps/onboarding_routes.py) and the dev fast-path (apps/auth.py) are
+    # NOT channel adapters and keep minting under either setting. Owner opts
+    # in explicitly: TURTLE_CHANNEL_SIGNUP=invite. Defaulting to invite-only
+    # would lock out every existing channel user on an unconfigured deploy.
+    channel_signup: str = Field(default="open", alias="TURTLE_CHANNEL_SIGNUP")
     # Phase 7: gate /admin/* endpoints. None = endpoints return 503.
     admin_token: Optional[SecretStr] = Field(default=None, alias="TURTLE_ADMIN_TOKEN")
 

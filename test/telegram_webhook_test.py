@@ -98,13 +98,12 @@ class MessageHandlingTest(unittest.TestCase):
         with patch.object(
             tw, "_get_bot_username", new=AsyncMock(return_value="turtlebot")
         ), patch.object(
-            tw, "identity_manager"
-        ) as fake_identity, patch.object(
+            tw, "resolve_channel_user", new_callable=AsyncMock, return_value="usr_a"
+        ), patch.object(
             tw, "dispatch_event", new_callable=AsyncMock
         ) as fake_dispatch, patch.object(
             tw, "_send_reply", new_callable=AsyncMock
         ) as fake_send:
-            fake_identity.resolve_user = AsyncMock(return_value="usr_a")
             fake_dispatch.return_value = TurtleResponse(
                 content="hello back", channel="telegram", user_id="usr_a"
             )
@@ -161,13 +160,12 @@ class MessageHandlingTest(unittest.TestCase):
         with patch.object(
             tw, "_get_bot_username", new=AsyncMock(return_value="turtlebot")
         ), patch.object(
-            tw, "identity_manager"
-        ) as fake_identity, patch.object(
+            tw, "resolve_channel_user", new_callable=AsyncMock, return_value="usr_a"
+        ), patch.object(
             tw, "dispatch_event", new_callable=AsyncMock
         ) as fake_dispatch, patch.object(
             tw, "_send_reply", new_callable=AsyncMock
         ):
-            fake_identity.resolve_user = AsyncMock(return_value="usr_a")
             fake_dispatch.return_value = TurtleResponse(
                 content="hi", channel="telegram", user_id="usr_a"
             )
@@ -205,19 +203,40 @@ class MessageHandlingTest(unittest.TestCase):
         with patch.object(
             tw, "_get_bot_username", new=AsyncMock(return_value="turtlebot")
         ), patch.object(
-            tw, "identity_manager"
-        ) as fake_identity, patch.object(
+            tw, "resolve_channel_user", new_callable=AsyncMock, return_value="usr_a"
+        ), patch.object(
             tw, "dispatch_event", new_callable=AsyncMock, side_effect=RuntimeError("boom")
         ), patch.object(
             tw, "_send_reply", new_callable=AsyncMock
         ) as fake_send:
-            fake_identity.resolve_user = AsyncMock(return_value="usr_a")
             resp = self.client.post(
                 "/channels/telegram/webhook", json=self._dm_payload("hi"), headers=self.headers
             )
         self.assertEqual(resp.status_code, 200)
         fake_send.assert_awaited_once()
         self.assertIn("wrong", fake_send.call_args[0][1].lower())
+
+    def test_invite_only_unknown_sender_no_mint_no_dispatch(self) -> None:
+        """WP 1.D (ledger 1a.4): TURTLE_CHANNEL_SIGNUP=invite + unknown
+        sender -> resolve_channel_user returns None (never mints), the
+        adapter replies with the invite message, and no turn is dispatched.
+        """
+        with patch.object(
+            tw, "_get_bot_username", new=AsyncMock(return_value="turtlebot")
+        ), patch.object(
+            tw, "resolve_channel_user", new_callable=AsyncMock, return_value=None
+        ) as fake_resolve, patch.object(
+            tw, "dispatch_event", new_callable=AsyncMock
+        ) as fake_dispatch, patch.object(
+            tw, "_send_reply", new_callable=AsyncMock
+        ) as fake_send:
+            resp = self.client.post(
+                "/channels/telegram/webhook", json=self._dm_payload("hi"), headers=self.headers
+            )
+        self.assertEqual(resp.status_code, 200)
+        fake_resolve.assert_awaited_once_with("telegram", "111")
+        fake_dispatch.assert_not_called()
+        fake_send.assert_awaited_once_with(222, tw.CHANNEL_INVITE_ONLY_MESSAGE)
 
 
 class PureHelperTest(unittest.TestCase):

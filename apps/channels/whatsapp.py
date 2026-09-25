@@ -37,7 +37,7 @@ from fastapi import APIRouter, Form, Header, HTTPException, Request, Response
 
 from apps.channels import TurtleEvent, dispatch_event, TurtleResponse
 from core.config import settings
-from core.identity import identity_manager
+from core.identity import CHANNEL_INVITE_ONLY_MESSAGE, resolve_channel_user
 
 router = APIRouter(prefix="/channels/whatsapp", tags=["whatsapp"])
 
@@ -143,7 +143,12 @@ async def whatsapp_webhook(
         return Response(content="<Response/>", media_type="application/xml")
 
     # Resolve user identity
-    user_id = await identity_manager.resolve_user("whatsapp", From)
+    user_id = await resolve_channel_user("whatsapp", From)
+    if user_id is None:
+        # TURTLE_CHANNEL_SIGNUP=invite and this sender is unknown — reply
+        # with the invite message and mint nothing.
+        await _send_whatsapp_reply(From, CHANNEL_INVITE_ONLY_MESSAGE)
+        return Response(content="<Response/>", media_type="application/xml")
 
     # Dispatch
     event = TurtleEvent(

@@ -44,7 +44,7 @@ from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect
 
 from apps.channels import TurtleEvent, TurtleResponse, dispatch_event
 from core.config import settings
-from core.identity import identity_manager
+from core.identity import CHANNEL_INVITE_ONLY_MESSAGE, resolve_channel_user
 from core.output_clean import clean_text_for_tts
 
 router = APIRouter(prefix="/channels/twilio/voice", tags=["twilio_voice"])
@@ -264,7 +264,26 @@ async def voice_stream(ws: WebSocket):
                 custom = start_data.get("customParameters", {})
                 from_number = custom.get("from", "")
                 if from_number:
-                    user_id = await identity_manager.resolve_user("twilio_voice", from_number)
+                    user_id = await resolve_channel_user("twilio_voice", from_number)
+                    if user_id is None:
+                        # TURTLE_CHANNEL_SIGNUP=invite and this caller is
+                        # unknown — speak the invite message and hang up
+                        # instead of minting a tenant. This is a live audio
+                        # stream, not a text reply, so the refusal has to be
+                        # synthesized and streamed like any other reply.
+                        print(f"[TwilioVoice] Rejecting unknown caller {from_number} (invite-only)")
+                        invite_audio = await _synthesize_ulaw(CHANNEL_INVITE_ONLY_MESSAGE)
+                        chunk_size = _FRAME_SAMPLES
+                        for i in range(0, len(invite_audio), chunk_size):
+                            chunk = invite_audio[i: i + chunk_size]
+                            payload = base64.b64encode(chunk).decode()
+                            await ws.send_text(json.dumps({
+                                "event": "media",
+                                "streamSid": call_sid,
+                                "media": {"payload": payload},
+                            }))
+                        await ws.close()
+                        return
                 print(f"[TwilioVoice] Stream started: call_sid={call_sid} from={from_number}")
 
             elif event_name == "media":

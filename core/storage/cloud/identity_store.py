@@ -147,6 +147,25 @@ class PostgresIdentityManager:
         )
         return previous
 
+    async def lookup_user(self, channel: str, channel_user_id: str) -> Optional[str]:
+        """Non-minting counterpart to resolve_user: returns the existing
+        user_id for (channel, channel_user_id) or None on a miss. Never
+        mints, never rebinds from account markers. See
+        core.identity.IdentityManager.lookup_user for the shared rationale —
+        resolve_user's own existing-mapping check delegates here.
+        """
+        from core.identity import normalize_email  # avoid a circular import at module load
+
+        is_email = channel == WEB_EMAIL_CHANNEL
+        lookup_id = normalize_email(channel_user_id) if is_email else channel_user_id
+        pool = await self._ensure_init()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT user_id FROM channel_mappings WHERE channel = $1 AND channel_user_id = $2",
+                channel, lookup_id,
+            )
+            return row["user_id"] if row else None
+
     async def resolve_user(self, channel: str, channel_user_id: str) -> str:
         from core.identity import normalize_email  # avoid a circular import at module load
 
@@ -154,19 +173,16 @@ class PostgresIdentityManager:
         lookup_id = normalize_email(channel_user_id) if is_email else channel_user_id
 
         pool = await self._ensure_init()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT user_id FROM channel_mappings WHERE channel = $1 AND channel_user_id = $2",
-                channel, lookup_id,
-            )
-            if row:
-                if is_email:
+        existing = await self.lookup_user(channel, channel_user_id)
+        if existing is not None:
+            if is_email:
+                async with pool.acquire() as conn:
                     await conn.execute(
                         "UPDATE users SET primary_email = $1 "
                         "WHERE user_id = $2 AND primary_email IS NULL",
-                        lookup_id, row["user_id"],
+                        lookup_id, existing,
                     )
-                return row["user_id"]
+            return existing
 
         if is_email:
             rebound = await self._rebind_from_markers(channel, lookup_id)

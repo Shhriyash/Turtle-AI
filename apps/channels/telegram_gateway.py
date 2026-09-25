@@ -306,7 +306,7 @@ async def start_telegram_gateway() -> None:
     # Import locally so type-checkers/readers see the guarded module and the
     # imports happen only when we actually run.
     from apps.channels import TurtleEvent, TurtleResponse, dispatch_event
-    from core.identity import identity_manager
+    from core.identity import CHANNEL_INVITE_ONLY_MESSAGE, resolve_channel_user
 
     application = ApplicationBuilder().token(_bot_token()).build()
 
@@ -353,7 +353,12 @@ async def start_telegram_gateway() -> None:
 
         try:
             tg_user_id = str(user.id)
-            user_id = await identity_manager.resolve_user("telegram", tg_user_id)
+            user_id = await resolve_channel_user("telegram", tg_user_id)
+            if user_id is None:
+                # TURTLE_CHANNEL_SIGNUP=invite and this sender is unknown —
+                # reply with the invite message and mint nothing.
+                await message.reply_text(CHANNEL_INVITE_ONLY_MESSAGE)
+                return
             sender_name = (
                 getattr(user, "full_name", "")
                 or getattr(user, "first_name", "")
