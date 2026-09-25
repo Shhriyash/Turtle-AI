@@ -8,13 +8,19 @@ name: deploy-vercel
 # requires workflow_run.conclusion == 'success'.
 #
 # IMPORTANT — this is the ONLY deploy path. Vercel's own dashboard Git
-# integration (if connected) auto-deploys on every push/PR independent of
-# this workflow, which would race it and let an untested commit reach
-# production anyway. Either leave the repo DISCONNECTED from Vercel's Git
-# integration entirely (recommended — this workflow is then the sole way
-# anything reaches Vercel), or if you connect it for its preview-comment UI,
-# go to Project Settings -> Git and disable "Automatically deploy commits
-# pushed to main" so production only ever happens through this gate.
+# integration (if connected) would otherwise auto-deploy on every push/PR
+# independent of this workflow, racing it and letting an untested commit
+# reach production anyway — confirmed happening in practice on commit
+# 5891bb1, where this workflow's probe failed and skipped `promote`, yet
+# production served the new code anyway with a null build SHA (proof it
+# was not this workflow's deploy). That hole is now closed in-repo:
+# vercel.json sets `git.deploymentEnabled: false`, which turns off
+# Git-triggered auto-deployment for every branch and leaves this workflow
+# as the sole way anything reaches Vercel. That setting does NOT affect
+# `vercel deploy`/`vercel promote` run from the CLI with a token (as this
+# workflow does) — those go through the API, not the Git webhook. Do not
+# remove `git.deploymentEnabled` from vercel.json; doing so silently
+# re-opens this race.
 on:
   workflow_run:
     workflows: ["tests"]
