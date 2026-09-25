@@ -437,38 +437,40 @@ _CURRENT_SCOPE_MARKER = "calendar.events"
 
 def _scope_is_stale(token_json: str) -> bool:
     """True when the stored token's granted scope predates the
-    calendar.events narrowing (WP1.E2) — i.e. it still carries the old full
-    read/write ``https://www.googleapis.com/auth/calendar`` grant, OR its
-    scope cannot be confirmed as calendar.events at all. Drives the
-    "Reconnect Calendar" prompt: /status reports it, web/js/calendar.js
-    renders it.
+    calendar.events narrowing (WP1.E2), OR calendar.events cannot be
+    positively confirmed from what's stored at all. Drives the "Reconnect
+    Calendar" prompt: /status reports it, web/js/calendar.js renders it.
+
+    One rule, not a list of special cases: ANY failure to extract a usable
+    scope string — token_json isn't parseable JSON, doesn't parse to a dict,
+    has no "scope" key, or "scope" isn't a non-blank string — counts as
+    stale, exactly like a confirmed old-scope grant does. This is not merely
+    "unknown, don't nag": the two wrong answers here are not symmetric.
+    A false "stale" costs the user one click on a Reconnect prompt — which,
+    for the unparseable-token case specifically, is also the ONLY thing that
+    can repair an already-broken credential (_load_credentials cannot build
+    anything usable from it either). A false "not stale" leaves the user
+    with a calendar that is silently over-broad, or silently non-functional,
+    and either way invisible — /status would report connected:true,
+    scope_stale:false, no prompt, no path to noticing or fixing it. When we
+    cannot positively confirm the narrow scope, we must never default to
+    treating it as already narrow or already fine.
 
     Google's token endpoint echoes back the space-separated scopes actually
     granted in the "scope" field of the token response, which is exactly
     what gets persisted verbatim in token_json — every token minted through
     /callback has this field (RFC 6749 + Google's own documented behaviour
-    for the authorization_code grant), so a missing/empty scope in practice
-    means a manually-pasted or legacy token (the GOOGLE_CALENDAR_TOKEN_JSON
-    env-var path), not a normal connect.
-
-    An absent/empty scope counts as STALE, not "unknown, don't nag": the
-    two wrong answers are not symmetric. A false "stale" costs the user one
-    click on an advisory prompt they didn't strictly need. A false
-    "not stale" means a token still holding the old over-broad grant is
-    never flagged, defeating the entire purpose of this item for that user,
-    silently and permanently. When we cannot confirm the narrow scope, we
-    must not default to treating it as already narrow.
+    for the authorization_code grant), so in practice this function only
+    ever lands in the "stale" bucket for a manually-pasted or legacy token
+    (the GOOGLE_CALENDAR_TOKEN_JSON env-var path), not a normal connect.
     """
     try:
         data = json.loads(token_json)
-    except (json.JSONDecodeError, TypeError):
-        return False  # malformed token_json entirely — a different failure
-        # mode than "no scope field" (this should not happen for anything
-        # this module itself ever wrote); not worth nagging over.
-    scope_field = data.get("scope")
+        scope_field = data.get("scope") if isinstance(data, dict) else None
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        scope_field = None
     if not isinstance(scope_field, str) or not scope_field.strip():
-        return True  # missing/empty/whitespace-only scope — cannot confirm
-        # calendar.events, so treat as stale (see docstring above).
+        return True  # no usable scope extracted, for any reason — treat as stale.
     return not any(_CURRENT_SCOPE_MARKER in s for s in scope_field.split())
 
 

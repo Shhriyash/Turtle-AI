@@ -619,19 +619,25 @@ def test_status_not_connected_when_no_token(monkeypatch):
         json.dumps({"refresh_token": "rt"}),  # scope field entirely absent
         json.dumps({"refresh_token": "rt", "scope": ""}),  # empty string
         json.dumps({"refresh_token": "rt", "scope": "   "}),  # whitespace-only
+        "{not valid json at all",  # unparseable — a corrupt/broken token
+        json.dumps(["not", "a", "dict"]),  # parses, but not an object
+        json.dumps({"refresh_token": "rt", "scope": 12345}),  # scope present but not a string
     ],
-    ids=["absent", "empty", "whitespace-only"],
+    ids=["absent", "empty", "whitespace-only", "unparseable-json", "not-a-dict", "scope-not-a-string"],
 )
 def test_status_treats_missing_or_empty_scope_as_stale(monkeypatch, token_json):
-    """Owner ruling on WP1.E2: an absent/empty/whitespace-only scope cannot
-    be confirmed as calendar.events, so it counts as STALE — not "unknown,
-    don't nag". The asymmetry: a false "stale" costs one click on an
-    advisory prompt; a false "not stale" means a token still on the old
-    over-broad grant is never flagged, defeating the item's purpose for
-    that user, silently and permanently. Every token minted through
-    /callback has a scope field (RFC 6749 + Google's documented behaviour
-    for the authorization_code grant), so this bucket is reached only by
-    manually-pasted/legacy tokens (GOOGLE_CALENDAR_TOKEN_JSON), not normal
+    """Owner ruling on WP1.E2 (extended after follow-up): ANY failure to
+    extract a usable scope string counts as STALE, not "unknown, don't nag"
+    — one rule, not a list of special cases. The asymmetry: a false "stale"
+    costs one click on a Reconnect prompt (which, for an unparseable/broken
+    token, is also the only thing that can repair it — _load_credentials
+    can't build anything usable from it either). A false "not stale" leaves
+    the user with a calendar that is silently over-broad OR silently
+    non-functional, invisibly, with no prompt and no path to fixing it.
+    Every token minted through /callback has a scope field (RFC 6749 +
+    Google's documented behaviour for the authorization_code grant), so this
+    bucket is reached only by manually-pasted/legacy/corrupted tokens
+    (GOOGLE_CALENDAR_TOKEN_JSON or storage corruption), not normal
     connects — this is not expected to fire for everyday users."""
     import apps.calendar_oauth_routes as oauth_routes
 
