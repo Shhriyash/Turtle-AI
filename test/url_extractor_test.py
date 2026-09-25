@@ -380,6 +380,84 @@ class _FakePlaywrightCtx:
         return False
 
 
+@pytest.fixture
+def stub_playwright_module():
+    """Inject a stub `playwright` + `playwright.async_api` package into
+    sys.modules so `_fetch_with_playwright`'s function-local
+    `from playwright.async_api import async_playwright` resolves without
+    the real `playwright` package needing to be installed. It deliberately
+    isn't listed in any requirements file (it's an optional, browser-heavy
+    dependency), so CI does not have it — only this worktree's venv does,
+    which is why patching the real module previously looked green locally
+    but would ModuleNotFoundError in CI.
+
+    Both the parent package (`playwright`) and the submodule
+    (`playwright.async_api`) must be present in sys.modules, not just the
+    submodule: `mock.patch("playwright.async_api.async_playwright", ...)`
+    also needs to resolve that dotted path, and a bare `from playwright.async_api
+    import async_playwright` needs the parent package importable too.
+
+    Restores whatever was previously in sys.modules afterwards (None if it
+    was absent), so this can never leak into another test or shadow a real
+    playwright import elsewhere in the same session.
+    """
+    import sys
+    import types
+
+    prev_pkg = sys.modules.get("playwright")
+    prev_async_api = sys.modules.get("playwright.async_api")
+
+    pkg = types.ModuleType("playwright")
+    async_api_mod = types.ModuleType("playwright.async_api")
+    async_api_mod.async_playwright = lambda: None  # placeholder; each test mock.patches this
+    pkg.async_api = async_api_mod
+
+    sys.modules["playwright"] = pkg
+    sys.modules["playwright.async_api"] = async_api_mod
+    try:
+        yield
+    finally:
+        if prev_pkg is not None:
+            sys.modules["playwright"] = prev_pkg
+        else:
+            sys.modules.pop("playwright", None)
+        if prev_async_api is not None:
+            sys.modules["playwright.async_api"] = prev_async_api
+        else:
+            sys.modules.pop("playwright.async_api", None)
+
+
+@pytest.fixture
+def playwright_genuinely_absent():
+    """Force `import playwright` (and anything importing it) to raise
+    ImportError, regardless of whether the real package happens to be
+    installed in this venv — simulating the actual production/CI
+    condition, where playwright is never installed at all.
+
+    Uses the documented `sys.modules[name] = None` sentinel: the import
+    system raises ImportError for any import of a name mapped to None in
+    sys.modules, without touching the filesystem.
+    """
+    import sys
+
+    prev_pkg = sys.modules.get("playwright")
+    prev_async_api = sys.modules.get("playwright.async_api")
+
+    sys.modules["playwright"] = None
+    sys.modules.pop("playwright.async_api", None)
+    try:
+        yield
+    finally:
+        if prev_pkg is not None:
+            sys.modules["playwright"] = prev_pkg
+        else:
+            sys.modules.pop("playwright", None)
+        if prev_async_api is not None:
+            sys.modules["playwright.async_api"] = prev_async_api
+        else:
+            sys.modules.pop("playwright.async_api", None)
+
+
 class TestSsrfEnforcedAtFetchSites:
     """End-to-end (through fetch_url_content_async) proof that a refusal
     happens *before* the outbound call at every fetch site — no
@@ -432,7 +510,7 @@ class TestSsrfEnforcedAtFetchSites:
         assert result.success is False
         assert result.error_message == safe_fetch.REFUSAL_MESSAGE
 
-    def test_playwright_path_refuses_before_browser_launch(self, monkeypatch):
+    def test_playwright_path_refuses_before_browser_launch(self, monkeypatch, stub_playwright_module):
         """SPA content, no Scrape.do token: the browser must never be
         launched if the (re-)validation inside _fetch_with_playwright
         refuses the URL."""
@@ -464,7 +542,7 @@ class TestSsrfEnforcedAtFetchSites:
         assert result.success is False
         assert result.error_message == safe_fetch.REFUSAL_MESSAGE
 
-    def test_playwright_redirect_to_private_address_is_refused(self, monkeypatch):
+    def test_playwright_redirect_to_private_address_is_refused(self, monkeypatch, stub_playwright_module):
         """The Playwright page itself navigates to a public URL, but the
         server responds with a redirect to a private/loopback address.
         Request interception must catch that second navigation, and the
@@ -503,3 +581,32 @@ class TestSsrfEnforcedAtFetchSites:
         assert result.error_message == safe_fetch.REFUSAL_MESSAGE
         # Never leak the blocked target back to the model.
         assert "127.0.0.1" not in result.error_message
+
+
+    def test_playwright_absent_degrades_gracefully_end_to_end(self, playwright_genuinely_absent, monkeypatch):
+        """The actual production/CI condition: playwright cannot be
+        imported at all (ModuleNotFoundError), not a mocked stand-in for
+        the failure. SPA content with no Scrape.do token must still
+        degrade gracefully to the sparse httpx content instead of
+        propagating an unhandled exception."""
+        import asyncio
+        import socket
+        import unittest.mock as mock
+        from tools.url_tools.extractor import fetch_url_content_async
+
+        SPA_HTML = "<html><body><div id='root'></div></body></html>"
+
+        def fake_getaddrinfo(host, *a, **k):
+            assert host == "example.com"
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+        async def run():
+            mock_client = _make_stream_client(SPA_HTML)
+            with mock.patch("core.config.settings") as cfg_mock:
+                cfg_mock.scraped_do_api_key = None
+                return await fetch_url_content_async(mock_client, "https://example.com")
+
+        result = asyncio.run(run())
+        assert result.success is True

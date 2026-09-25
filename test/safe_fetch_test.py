@@ -17,6 +17,7 @@ import pytest
 
 from tools.url_tools.safe_fetch import (
     MAX_BODY_BYTES,
+    REFUSAL_MESSAGE,
     UnsafeUrlError,
     safe_get,
     validate_public_url,
@@ -81,6 +82,40 @@ class TestSchemeAndPort:
         )
         with pytest.raises(UnsafeUrlError):
             validate_public_url("http://example.com:22/")
+
+
+# ── control characters (must be rejected before any parsing/DNS) ─────────
+
+class TestControlCharacterRejection:
+    def test_null_byte_refused(self):
+        with pytest.raises(UnsafeUrlError):
+            validate_public_url("http://example.com\x00.evil.com/")
+
+    def test_newline_refused(self):
+        with pytest.raises(UnsafeUrlError):
+            validate_public_url("http://example.com/\nattack")
+
+    def test_tab_refused(self):
+        with pytest.raises(UnsafeUrlError):
+            validate_public_url("http://example.com/\tattack")
+
+    def test_carriage_return_refused(self):
+        with pytest.raises(UnsafeUrlError):
+            validate_public_url("http://example.com/\rattack")
+
+
+# ── malformed URLs must not leak a raw exception string ──────────────────
+
+class TestMalformedUrlRefusal:
+    def test_unbalanced_ipv6_bracket_refused_with_fixed_message(self):
+        with pytest.raises(UnsafeUrlError) as exc_info:
+            validate_public_url("http://[::1/")
+        assert str(exc_info.value) == REFUSAL_MESSAGE
+
+    def test_bare_open_bracket_refused_with_fixed_message(self):
+        with pytest.raises(UnsafeUrlError) as exc_info:
+            validate_public_url("http://[")
+        assert str(exc_info.value) == REFUSAL_MESSAGE
 
 
 # ── hostname resolution (DNS mocked) ──────────────────────────────────────

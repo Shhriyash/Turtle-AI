@@ -19,6 +19,7 @@ hardening pass could add one, but it is out of scope here.
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 import urllib.parse
 from dataclasses import dataclass
@@ -41,6 +42,14 @@ REFUSAL_MESSAGE = (
 
 class UnsafeUrlError(Exception):
     """Raised when a URL fails SSRF validation (scheme, port or address)."""
+
+
+# ASCII control characters (0x00-0x1F) and DEL (0x7F) — covers null bytes,
+# newlines, tabs and carriage returns. Rejected outright before any
+# parsing: relying on downstream libraries (httpx.URL, urllib.parse) to
+# reject these is an accidental backstop, not a control of ours, and the
+# Playwright/Scrape.do paths don't go through httpx.URL() at all.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _is_disallowed_address(addr) -> bool:
@@ -111,7 +120,19 @@ def validate_public_url(url: str) -> None:
     Raises UnsafeUrlError on any violation. Callers must not surface the
     exception message to the model/user — use REFUSAL_MESSAGE instead.
     """
-    parsed = urllib.parse.urlsplit(url)
+    if _CONTROL_CHAR_RE.search(url):
+        raise UnsafeUrlError("URL contains control characters")
+
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError as exc:
+        # A malformed URL (e.g. an unbalanced IPv6 bracket, "http://[::1/")
+        # makes urlsplit raise a bare ValueError with a message like
+        # "Invalid IPv6 URL" — that's a raw Python exception string, not
+        # our fixed refusal text, and it fails closed but would otherwise
+        # leak past the two `except UnsafeUrlError` translations in
+        # extractor.py. Normalize it to our own error type/message here.
+        raise UnsafeUrlError(REFUSAL_MESSAGE) from exc
 
     if parsed.scheme.lower() not in ALLOWED_SCHEMES:
         raise UnsafeUrlError(f"scheme not allowed: {parsed.scheme!r}")
