@@ -48,6 +48,100 @@ def clean_text_for_display(text: str) -> str:
     return clean_text_for_model(text, flatten_links=False)
 
 
+# ---------------------------------------------------------------------------
+# Untrusted tool-result envelope (WP1.H / ledger 1b.2)
+# ---------------------------------------------------------------------------
+# Tool results (a fetched page, a search snippet, a place review) are
+# attacker-influenced text handed to the model with nothing marking it as
+# data. These helpers sanitise a tool's raw string return and wrap it in
+# ``<untrusted source="...">...</untrusted>`` so the model — per the single
+# system-prompt rule that references this tag — treats the contents as data,
+# never instructions. Applied once, at the tool-registration loop in
+# apps/turtle_server.py, so every registered tool is covered regardless of
+# what shape its closure returns internally (see the WP1.H recon notes for
+# why ToolResult.to_agent_string() is NOT sufficient by itself).
+#
+# Kept separate from clean_text_for_model rather than folded into it: that
+# function already has several callers outside the tool-result path (email
+# drafts, calendar confirmations) and changing its behaviour would ripple
+# into all of them. A dedicated function applied only at the envelope
+# boundary keeps this control's blast radius to exactly the tools it's
+# meant to cover.
+
+# C0 control characters, excluding tab/newline/CR which are ordinary
+# whitespace in tool output worth keeping.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+# A tool result containing the literal closing delimiter could terminate the
+# envelope early and make everything after it read as trusted text — this is
+# exactly the attack the envelope exists to stop, so it must be neutralised
+# unconditionally (case-insensitively, allowing incidental whitespace inside
+# the tag, since the model would recognise any of those variants as "close").
+_UNTRUSTED_CLOSE_RE = re.compile(r"</\s*untrusted\s*>", re.IGNORECASE)
+
+# Bare tool-result URLs, collected for the "done" frame so the client can
+# allow-list them (see WP1.H item 5). Deliberately scheme-anchored (unlike
+# core.output_clean's TTS domain-matcher) — only a real https?:// URL a tool
+# actually returned is worth surfacing to the client as clickable.
+_ENVELOPE_URL_RE = re.compile(r"https?://[^\s<>\"')\]]+[^\s<>\"')\],.;:!?]")
+
+
+def sanitize_for_envelope(text: str, *, max_chars: int) -> str:
+    """Sanitise a raw tool result before it is wrapped as untrusted data.
+
+    Order matters: strip control characters and well-formed-markdown-link
+    syntax, neutralise a literal closing delimiter, THEN truncate. Truncating
+    first could slice a neutralised-but-still-long closing sequence back into
+    something dangerous; truncating last guarantees the envelope's own
+    closing tag (appended by ``wrap_untrusted`` after this returns) is never
+    split, because nothing after this function's return touches the tag.
+    """
+    if not text:
+        return ""
+    cleaned = _CONTROL_CHARS_RE.sub("", text)
+    # "](" turns well-formed markdown into a link when the model's own
+    # citation format re-parses it later; stripping it here deliberately
+    # breaks any markdown embedded in tool output. That's fine — this text
+    # is DATA the model reads, not text rendered to the user, so losing
+    # markdown formatting inside the envelope costs nothing.
+    cleaned = cleaned.replace("](", "] (")
+    cleaned = _UNTRUSTED_CLOSE_RE.sub("</ untrusted>", cleaned)
+    if len(cleaned) > max_chars:
+        cleaned = (
+            f"{cleaned[:max_chars]}\n\n"
+            "[Output truncated: tool result was too long.]"
+        )
+    return cleaned
+
+
+def wrap_untrusted(source: str, text: str) -> str:
+    """Wrap already-sanitised tool text in the untrusted-source envelope.
+
+    ``source`` is always the tool's registry name (never a URL or other
+    attacker-influenced value) so the attribute itself can't carry injected
+    content. Applied even to empty-string results and to error/invalid/
+    rate_limited results: an upstream error message (e.g. a fetch failure
+    that echoes back part of the requested page) can carry attacker text
+    just as easily as a success payload, and an unwrapped empty result would
+    make "was this tool's output enveloped" a property that depends on what
+    the tool happened to return rather than a constant guarantee the model
+    can rely on.
+    """
+    return f'<untrusted source="{source}">{text}</untrusted>'
+
+
+def extract_tool_result_urls(text: str) -> list[str]:
+    """Pull https?:// URLs out of a (post-sanitisation) tool result.
+
+    Used to populate the "done" frame's tool-sourced URL list — the client
+    renders an anchor only for a URL that appears in that list, labelled
+    with the host, never for a URL the model merely wrote in prose.
+    """
+    if not text:
+        return []
+    return _ENVELOPE_URL_RE.findall(text)
+
+
 def clean_text_for_tts(text: str) -> str:
     """Render model text into speech-friendly plain language."""
     cleaned = clean_text_for_model(text)
