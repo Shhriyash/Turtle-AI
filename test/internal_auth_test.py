@@ -11,6 +11,7 @@ no live Redis reachable in this environment.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import unittest
@@ -195,6 +196,123 @@ class JobPayloadStoreTest(unittest.IsolatedAsyncioTestCase):
         job_id = await store_job_payload({"a": 1})
         raw = await self.fake.get(f"turtle:job:{job_id}")
         self.assertEqual(json.loads(raw), {"a": 1})
+
+
+class RealRedisDriverFailureTest(unittest.IsolatedAsyncioTestCase):
+    """Coordinator fail-fix: get_redis_client() only raises
+    CloudBackendUnavailable for an UNSET REDIS_URL. Once a client object
+    exists, the actual command failing raises the redis-py driver's OWN
+    exception (ConnectionError, TimeoutError, ...) — a materially different,
+    and far likelier, failure mode than "unset". These tests exercise a REAL
+    redis.asyncio client against a real closed TCP port / a real stalling
+    TCP listener (no fakeredis, no mocking CloudBackendUnavailable directly)
+    so they fail honestly against the pre-fix commit instead of testing the
+    failure mode we imagined.
+    """
+
+    async def asyncSetUp(self) -> None:
+        import core.storage.cloud as cloud_mod
+
+        self._cloud_mod = cloud_mod
+        self._orig_client = cloud_mod._redis_client
+
+    async def asyncTearDown(self) -> None:
+        if self._cloud_mod._redis_client is not None:
+            try:
+                await self._cloud_mod._redis_client.aclose()
+            except Exception:
+                pass
+        self._cloud_mod._redis_client = self._orig_client
+
+    async def test_store_job_payload_unreachable_redis_raises_cloud_backend_unavailable(
+        self,
+    ) -> None:
+        import redis.asyncio as redis_asyncio
+
+        # Port 1 (privileged): nothing listens there in this test
+        # environment, so the OS refuses the connection immediately — a
+        # real redis-py ConnectionError, not a mock.
+        self._cloud_mod._redis_client = redis_asyncio.from_url(
+            "redis://127.0.0.1:1/0",
+            decode_responses=True,
+            socket_connect_timeout=1.0,
+            socket_timeout=1.0,
+        )
+        with self.assertRaises(CloudBackendUnavailable):
+            await store_job_payload({"a": 1})
+
+    async def test_take_job_payload_unreachable_redis_raises_cloud_backend_unavailable(
+        self,
+    ) -> None:
+        import redis.asyncio as redis_asyncio
+
+        self._cloud_mod._redis_client = redis_asyncio.from_url(
+            "redis://127.0.0.1:1/0",
+            decode_responses=True,
+            socket_connect_timeout=1.0,
+            socket_timeout=1.0,
+        )
+        with self.assertRaises(CloudBackendUnavailable):
+            await take_job_payload("whatever")
+
+    async def test_verify_request_unreachable_redis_rejected_as_signature_error_not_500(
+        self,
+    ) -> None:
+        import redis.asyncio as redis_asyncio
+
+        self._cloud_mod._redis_client = redis_asyncio.from_url(
+            "redis://127.0.0.1:1/0",
+            decode_responses=True,
+            socket_connect_timeout=1.0,
+            socket_timeout=1.0,
+        )
+        body = b"{}"
+        envelope = sign_request("s3cret", body)
+        with self.assertRaises(SignatureError):
+            await verify_request(
+                "s3cret", envelope.timestamp, envelope.nonce, envelope.signature, body
+            )
+
+    async def test_stalling_redis_is_bounded_by_the_socket_timeout(self) -> None:
+        """A Redis that accepts the TCP connection but never responds (a
+        stall, not a refusal) must still be bounded — not hang the caller
+        indefinitely. Spins up a real local TCP listener that never writes
+        back.
+        """
+        stall_forever = asyncio.Event()
+
+        async def _handler(reader, writer):
+            try:
+                await stall_forever.wait()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                writer.close()
+
+        server = await asyncio.start_server(_handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            import redis.asyncio as redis_asyncio
+
+            self._cloud_mod._redis_client = redis_asyncio.from_url(
+                f"redis://127.0.0.1:{port}/0",
+                decode_responses=True,
+                socket_connect_timeout=1.0,
+                socket_timeout=1.0,
+            )
+            start = time.monotonic()
+            with self.assertRaises(CloudBackendUnavailable):
+                await store_job_payload({"a": 1})
+            elapsed = time.monotonic() - start
+            # Worst case for one command is socket_connect_timeout +
+            # socket_timeout (2.0s with the values get_redis_client() now
+            # uses). A generous ceiling well under "hangs forever" and well
+            # under Discord's 3s ACK deadline.
+            self.assertLess(elapsed, 5.0)
+        finally:
+            stall_forever.set()
+            server.close()
+            await server.wait_closed()
 
 
 if __name__ == "__main__":

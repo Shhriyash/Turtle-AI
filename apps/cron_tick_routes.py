@@ -69,6 +69,7 @@ from core.internal_auth import (
     take_job_payload,
     verify_request,
 )
+from core.storage.cloud import CloudBackendUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +235,13 @@ async def embed_personal_memory_endpoint(
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id is required")
 
-    payload = await take_job_payload(job_id)
+    try:
+        payload = await take_job_payload(job_id)
+    except CloudBackendUnavailable as exc:
+        # Redis went from reachable (the signature check above needs it too)
+        # to unreachable between there and here — surface as a clean 503,
+        # never an unhandled 500 from a raw driver exception.
+        raise HTTPException(status_code=503, detail=f"Job store unavailable: {exc}") from exc
     if payload is None:
         raise HTTPException(status_code=401, detail="Unknown or expired job id")
 

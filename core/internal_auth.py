@@ -31,18 +31,38 @@ primitives:
      just the secret could forge therefore carries no identity field at
      all — the impersonation surface is closed even if the secret leaks.
 
-Fail posture when Redis is unavailable: FAIL CLOSED (refuse the call). This
-module's Redis-touching functions only run in cloud mode, on the two
-self-call paths — both of which already fall back to running the job
-in-process (see apps/channels/discord.py::_kick_off_deferred_processing and
+Fail posture when Redis is unavailable: FAIL CLOSED (refuse the call) — and
+"unavailable" means ANY failure to complete the round trip, not just an
+unset REDIS_URL. ``get_redis_client()`` (core/storage/cloud/__init__.py)
+only raises ``CloudBackendUnavailable`` for the unset-URL case; once a
+client object exists, a stalled/refusing/erroring Redis raises the redis-py
+driver's OWN exceptions (``redis.exceptions.ConnectionError``,
+``TimeoutError``, ...) from the actual command. Every Redis-touching
+function below (``verify_request``'s nonce claim, ``store_job_payload``,
+``take_job_payload``) therefore catches broadly around its Redis calls, not
+just ``CloudBackendUnavailable`` — see each function's own docstring for
+exactly what it re-raises. This module's Redis-touching functions only run
+in cloud mode, on the two self-call paths — both of which already fall back
+to running the job in-process (see
+apps/channels/discord.py::_kick_off_deferred_processing and
 core/worker.py::_self_invoke_embed_job) whenever anything about the internal
--automation round trip can't be completed, INCLUDING Redis being down. So
-"fail closed" here doesn't strand cloud mode: the caller-side fallback
-degrades to in-process execution (less robust, but not silently broken), and
-local mode never reaches this module at all (it has no Redis and its callers
-check ``settings.is_cloud`` first). Fail-OPEN on a down replay store would be
-the unsafe choice here — it would silently disable replay protection at
-exactly the moment the check depending on it can't run.
+-automation round trip can't be completed, INCLUDING Redis being unreachable
+or erroring, not merely unconfigured. So "fail closed" here doesn't strand
+cloud mode: the caller-side fallback degrades to in-process execution (less
+robust, but not silently broken), and local mode never reaches this module
+at all (it has no Redis and its callers check ``settings.is_cloud`` first).
+Fail-OPEN on a down replay store would be the unsafe choice here — it would
+silently disable replay protection at exactly the moment the check depending
+on it can't run.
+
+Broad ``except Exception`` is used deliberately at each Redis call site
+below instead of importing ``redis`` just to catch its exception classes —
+this module must stay import-clean of the ``redis`` package itself (nothing
+in it should appear in ``sys.modules`` merely from importing
+``core.internal_auth``, matching ``core/storage/cloud/__init__.py``'s own
+"local import: optional dep" pattern). Each ``except Exception`` here wraps
+ONLY the one or two lines that make up that function's entire Redis round
+trip, so it can't mask an unrelated bug.
 """
 from __future__ import annotations
 
@@ -178,7 +198,10 @@ async def verify_request(
 
     Raises SignatureError on any failure: missing envelope fields, malformed
     timestamp, timestamp outside +/-CLOCK_SKEW_S, signature mismatch, replay
-    store unavailable, or nonce already claimed.
+    store unavailable/unreachable/erroring, or nonce already claimed. Never
+    lets a Redis failure propagate as anything other than SignatureError —
+    an unreachable replay store must produce the same 401 a caller sees for
+    an unset secret, not an unhandled 500.
     """
     if not timestamp or not nonce or not signature:
         raise SignatureError("missing signature envelope")
@@ -209,8 +232,13 @@ async def verify_request(
         claimed = await client.set(
             f"{_NONCE_KEY_PREFIX}{nonce}", "1", nx=True, ex=NONCE_TTL_S
         )
-    except CloudBackendUnavailable as exc:
-        # Fail CLOSED — see this module's docstring for the reasoning.
+    except Exception as exc:
+        # Fail CLOSED on ANY failure to complete this round trip — an unset
+        # REDIS_URL (CloudBackendUnavailable) AND a reachable-but-erroring
+        # or refusing/stalling Redis (redis-py's own ConnectionError /
+        # TimeoutError / etc., which this module never imports directly —
+        # see the module docstring). Both must produce a 401, never an
+        # unhandled 500.
         raise SignatureError(f"replay store unavailable: {exc}") from exc
     if not claimed:
         raise SignatureError("nonce already used")
@@ -223,13 +251,23 @@ async def store_job_payload(payload: dict) -> str:
     id — a forged wire body carrying a fabricated user_id has nothing to
     point at.
 
-    Raises CloudBackendUnavailable if Redis isn't configured; callers catch
-    that and fall back to running the job in-process (see this module's
-    docstring).
+    Raises CloudBackendUnavailable if Redis isn't configured, unreachable, or
+    erroring — callers catch that ONE type and fall back to running the job
+    in-process (see this module's docstring). A raw redis-py driver
+    exception (ConnectionError, TimeoutError, ...) never escapes this
+    function; it's wrapped into CloudBackendUnavailable so the existing
+    call-site ``except CloudBackendUnavailable`` already used by
+    apps/channels/discord.py and core/worker.py covers a real outage too,
+    not just an unset REDIS_URL.
     """
     job_id = uuid.uuid4().hex
-    client = await get_redis_client()
-    await client.set(f"{_JOB_KEY_PREFIX}{job_id}", json.dumps(payload), ex=JOB_PAYLOAD_TTL_S)
+    try:
+        client = await get_redis_client()
+        await client.set(f"{_JOB_KEY_PREFIX}{job_id}", json.dumps(payload), ex=JOB_PAYLOAD_TTL_S)
+    except CloudBackendUnavailable:
+        raise
+    except Exception as exc:
+        raise CloudBackendUnavailable(f"job store unreachable: {exc}") from exc
     return job_id
 
 
@@ -242,9 +280,19 @@ async def take_job_payload(job_id: str) -> dict | None:
     Uses Redis GETDEL (atomic single command — confirmed present on both the
     sync and async clients in the pinned redis-py 5.2.x; no pipeline/
     transaction fallback needed).
+
+    Raises CloudBackendUnavailable if Redis isn't configured, unreachable, or
+    erroring — same wrapping as store_job_payload, for the same reason (a
+    real outage must degrade the same way as an unset secret, never surface
+    as a raw driver exception / unhandled 500).
     """
-    client = await get_redis_client()
-    raw = await client.getdel(f"{_JOB_KEY_PREFIX}{job_id}")
+    try:
+        client = await get_redis_client()
+        raw = await client.getdel(f"{_JOB_KEY_PREFIX}{job_id}")
+    except CloudBackendUnavailable:
+        raise
+    except Exception as exc:
+        raise CloudBackendUnavailable(f"job store unreachable: {exc}") from exc
     if raw is None:
         return None
     return json.loads(raw)

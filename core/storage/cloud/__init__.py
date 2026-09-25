@@ -166,7 +166,22 @@ async def get_redis_client() -> Any:
             )
         import redis.asyncio as redis  # local import: optional dep
 
-        _redis_client = redis.from_url(url, decode_responses=True)
+        # WP 1.B / S-7.3 follow-up: this client is now awaited INSIDE a
+        # request handler (apps/channels/discord.py's Discord Interactions
+        # endpoint, via core/internal_auth.py's job-store/nonce calls) that
+        # must answer within Discord's 3-second ACK deadline. Unbounded
+        # socket timeouts mean a Redis that STALLS (rather than refusing)
+        # would hang that request past the deadline and never reach
+        # internal_auth's fail-closed handling at all — a refused connection
+        # raises promptly and IS caught, a hung one previously wasn't bounded
+        # here to raise at all. 1.0s connect + 1.0s socket read/write is a
+        # 2.0s worst case for one Redis round trip, leaving roughly a third
+        # of the 3s budget for building the payload, signing it, and the
+        # subsequent self-invoke — generous for a healthy Upstash connection
+        # (typically tens of ms) while still well short of the deadline.
+        _redis_client = redis.from_url(
+            url, decode_responses=True, socket_connect_timeout=1.0, socket_timeout=1.0
+        )
         return _redis_client
 
 
