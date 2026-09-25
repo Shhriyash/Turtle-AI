@@ -273,6 +273,33 @@ class ReadyzTimeoutBudgetTest(unittest.TestCase):
             cloud_mod = self._reload_cloud_module()
             self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
 
+    def test_zero_override_falls_back_to_default(self) -> None:
+        """0 would make asyncio.wait_for raise TimeoutError instantly, making
+        /readyz a permanent 503 in cloud mode — must fall back instead."""
+        with patch.dict("os.environ", {"TURTLE_READYZ_TIMEOUT_S": "0"}):
+            cloud_mod = self._reload_cloud_module()
+            self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
+
+    def test_negative_override_falls_back_to_default(self) -> None:
+        with patch.dict("os.environ", {"TURTLE_READYZ_TIMEOUT_S": "-5"}):
+            cloud_mod = self._reload_cloud_module()
+            self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
+
+    def test_nan_override_falls_back_to_default(self) -> None:
+        """nan must not slip through a naive `value <= 0` check — every
+        comparison against nan is False, so `nan <= 0` is also False. This
+        pins that math.isfinite() (not a bare `<= 0` comparison) is what
+        catches it: with nan, asyncio.wait_for never times out at all,
+        the exact opposite of this module's hang-safety promise."""
+        with patch.dict("os.environ", {"TURTLE_READYZ_TIMEOUT_S": "nan"}):
+            cloud_mod = self._reload_cloud_module()
+            self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
+
+    def test_infinite_override_falls_back_to_default(self) -> None:
+        with patch.dict("os.environ", {"TURTLE_READYZ_TIMEOUT_S": "1e400"}):
+            cloud_mod = self._reload_cloud_module()
+            self.assertEqual(cloud_mod.READYZ_TIMEOUT_S, 8.0)
+
     def test_probe_exceeding_raised_budget_still_returns_false(self) -> None:
         """Raising the default to 8.0 must not make the timeout path
         unreachable — pass an explicit small `timeout=` so this stays fast

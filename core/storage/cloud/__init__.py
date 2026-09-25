@@ -12,10 +12,14 @@ runs the full local/SQLite test suite untouched.
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import os
 from typing import Any, Optional
 
 from core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class CloudBackendUnavailable(RuntimeError):
@@ -229,14 +233,42 @@ def close_redis_sync_client() -> None:
 # a deploy. Read here (not core/config.py, which this WP does not own) and
 # guarded so a malformed value falls back to the default rather than raising
 # at import time — an exception here would break every cloud boot.
+_READYZ_TIMEOUT_DEFAULT = 8.0
+
+
 def _read_readyz_timeout_s() -> float:
     raw = os.environ.get("TURTLE_READYZ_TIMEOUT_S")
     if raw is None or not raw.strip():
-        return 8.0
+        # Unset/empty is normal, not an error — no warning.
+        return _READYZ_TIMEOUT_DEFAULT
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
-        return 8.0
+        logger.warning(
+            "TURTLE_READYZ_TIMEOUT_S=%r is not a valid number; falling back to "
+            "the %.1fs default.",
+            raw,
+            _READYZ_TIMEOUT_DEFAULT,
+        )
+        return _READYZ_TIMEOUT_DEFAULT
+    # asyncio.wait_for(timeout=0 or negative) raises TimeoutError instantly,
+    # which would make /readyz a permanent 503 in cloud mode; a non-finite
+    # value (inf/nan) either never times out (nan — the exact opposite of
+    # this module's "a hanging backend doesn't make /readyz hang" promise)
+    # or is simply nonsensical (inf). math.isfinite(nan) is False, so this
+    # one check catches both non-finite cases; `value > 0` catches zero and
+    # negatives WITHOUT relying on `value <= 0`, since every comparison
+    # against nan (including `nan <= 0`) is False and would silently let
+    # nan slip through a naive check.
+    if not math.isfinite(value) or not value > 0:
+        logger.warning(
+            "TURTLE_READYZ_TIMEOUT_S=%r must be a finite, strictly positive "
+            "number; falling back to the %.1fs default.",
+            raw,
+            _READYZ_TIMEOUT_DEFAULT,
+        )
+        return _READYZ_TIMEOUT_DEFAULT
+    return value
 
 
 READYZ_TIMEOUT_S = _read_readyz_timeout_s()
