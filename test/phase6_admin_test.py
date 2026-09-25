@@ -14,7 +14,10 @@ Proves:
       downgrade every user mid-conversation. Same explicit-opt-in rule as the
       channel webhook verifiers.
   (e) POST /api/config fails closed off-cloud WITHOUT DEV_ANON.
-  (d) GET /api/config stays open regardless (the dev panel reads it to render).
+  (d) GET /api/config stays open in LOCAL mode regardless (the dev panel
+      reads it to render; web/js/devmode.js is the only reader).
+  (f) GET /api/config is gated behind X-Admin-Token in CLOUD mode, mirroring
+      POST — 401 without the header, 200 with the correct one.
 
 Offline: no network, no live keys. Follows smoke_boot_test.py's guarded-import
 pattern so a genuinely missing optional dep skips rather than erroring collection.
@@ -115,11 +118,32 @@ class AdminDashboardAndConfigGate(unittest.TestCase):
             self.assertEqual(r.status_code, 503)
 
     # (d) -------------------------------------------------------------------
-    def test_get_config_open_regardless(self) -> None:
-        with patch.object(turtle_server.settings, "admin_token", SecretStr("s3cret")):
+    def test_get_config_open_in_local_regardless(self) -> None:
+        with patch.object(turtle_server.settings, "admin_token", SecretStr("s3cret")), \
+             patch.object(turtle_server.settings, "deploy_mode", "local"):
             r = self.client.get("/api/config")
             self.assertEqual(r.status_code, 200)
             self.assertIsInstance(r.json(), dict)
+
+    # (f) -------------------------------------------------------------------
+    def test_get_config_gated_in_cloud(self) -> None:
+        with patch.object(turtle_server.settings, "admin_token", SecretStr("s3cret")), \
+             patch.object(turtle_server.settings, "deploy_mode", "cloud"):
+            r_missing = self.client.get("/api/config")
+            self.assertEqual(r_missing.status_code, 401)
+
+            r_wrong = self.client.get("/api/config", headers={"X-Admin-Token": "nope"})
+            self.assertEqual(r_wrong.status_code, 401)
+
+            r_ok = self.client.get("/api/config", headers={"X-Admin-Token": "s3cret"})
+            self.assertEqual(r_ok.status_code, 200)
+            self.assertIsInstance(r_ok.json(), dict)
+
+    def test_get_config_fails_closed_in_cloud_without_token_configured(self) -> None:
+        with patch.object(turtle_server.settings, "admin_token", None), \
+             patch.object(turtle_server.settings, "deploy_mode", "cloud"):
+            r = self.client.get("/api/config")
+            self.assertEqual(r.status_code, 401)
 
 
 if __name__ == "__main__":

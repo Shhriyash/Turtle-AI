@@ -16,6 +16,7 @@ import atexit
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import os
 import signal
@@ -2237,21 +2238,40 @@ class AgentManager:
                     merged["recipients"], merged["subject"], merged["content"],
                     merged["cc_recipients"], merged["bcc_recipients"],
                 )
-                # B5: idempotency check — prevent double-sends within 60 s
-                from tools.idempotency import build_email_idempotency_key, is_duplicate_invocation, record_invocation
+                # B5: idempotency check — prevent double-sends within 60 s.
+                # Reservation-based (see tools/idempotency.py): the key is
+                # claimed BEFORE the send, keyed per-user so two tenants
+                # sending an identical email never collide, and the actual
+                # SMTP call is pushed off the event loop so one hung mail
+                # server can't freeze every connected user.
+                from tools.idempotency import (
+                    IdempotencyReservationError,
+                    build_email_idempotency_key,
+                    is_duplicate_invocation,
+                    record_invocation,
+                )
                 idem_key = build_email_idempotency_key(
+                    ctx.deps.user_id,
                     merged["recipients"],
                     merged["subject"],
                     merged["content"],
                     cc=merged["cc_recipients"],
                     bcc=merged["bcc_recipients"],
                 )
-                cached_result = is_duplicate_invocation(idem_key)
+                try:
+                    cached_result = is_duplicate_invocation(idem_key)
+                except IdempotencyReservationError:
+                    print(f"LOG: Email idempotency store unavailable — refusing send ({idem_key[:12]}...)")
+                    return clean_text_for_model(
+                        "I could not verify this wasn't a duplicate send (the safety "
+                        "check is temporarily unavailable), so I did NOT send this "
+                        "email. Please try again in a moment."
+                    )
                 if cached_result is not None:
                     print(f"LOG: Email idempotency hit — skipping duplicate send ({idem_key[:12]}...)")
                     return clean_text_for_model(cached_result)
 
-                send_result = send_email_now(merged)
+                send_result = await asyncio.to_thread(send_email_now, merged)
                 record_invocation(idem_key, send_result)
             except _ModelRetry:
                 # pydantic_ai's retry protocol — swallowing it hands the model
@@ -3267,9 +3287,32 @@ async def serve_favicon():
 # ---------------------------------------------------------------------------
 # REST: Dev-mode config endpoints
 # ---------------------------------------------------------------------------
+def _admin_token_matches(expected: str, provided: str | None) -> bool:
+    """Timing-safe compare, guarding hmac.compare_digest's requirement that
+    both operands be present and of the same type (it raises on None)."""
+    if provided is None:
+        return False
+    return hmac.compare_digest(expected, provided)
+
+
 @app.get("/api/config")
-async def get_config():
-    """Return current config for the dev-mode panel."""
+async def get_config(x_admin_token: str | None = Header(default=None)):
+    """Return current config for the dev-mode panel.
+
+    In cloud, this is gated behind the same X-Admin-Token as POST: local's
+    dev panel is the only reader (web/js/devmode.js, which already prompts
+    for the token on a 401), and D7 already refuses config edits in cloud —
+    so an open GET in cloud serves no one but leaks config shape to anyone
+    who hits the endpoint. Local stays open, unchanged from today.
+    """
+    if settings.is_cloud:
+        expected = (
+            settings.admin_token.get_secret_value()
+            if settings.admin_token is not None
+            else None
+        )
+        if not expected or not _admin_token_matches(expected, x_admin_token):
+            return JSONResponse({"error": "Unauthorized."}, status_code=401)
     return JSONResponse(_load_config())
 
 
@@ -3284,7 +3327,8 @@ async def update_config(
     visitor, so gate it behind the admin token WHEN one is configured: with
     TURTLE_ADMIN_TOKEN set, every POST must carry a matching X-Admin-Token header
     (401 otherwise). When the token is unset (local dev) the endpoint stays open,
-    preserving the current zero-config developer flow. GET /api/config is left
+    preserving the current zero-config developer flow. GET /api/config now
+    mirrors this gate in cloud (see get_config's docstring); local's GET stays
     open on purpose — the dev panel reads config to render, and it exposes no
     secrets.
     """
@@ -3306,7 +3350,7 @@ async def update_config(
                 {"error": "Config updates are disabled (TURTLE_ADMIN_TOKEN not set)."},
                 status_code=503,
             )
-    if expected and x_admin_token != expected:
+    if expected and not _admin_token_matches(expected, x_admin_token):
         return JSONResponse({"error": "Unauthorized."}, status_code=401)
     if not body:
         return JSONResponse({"error": "Empty body"}, status_code=400)
