@@ -163,6 +163,37 @@ class DispatchEmbedJobCloudModeTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
                 fake_job.assert_awaited_once_with(user_id="usr_a", topic_name="identity", lines=["- x"])
 
+    async def test_cloud_mode_redis_command_fails_falls_back_to_in_process_and_runs(
+        self,
+    ) -> None:
+        """Coordinator fail-fix: unset-URL is not the only failure mode. A
+        client object that EXISTS but whose command raises the redis-py
+        driver's own exception (here, a real redis.exceptions.ConnectionError
+        — not a mocked CloudBackendUnavailable) must still degrade to running
+        the job in-process, not silently drop it.
+        """
+        import redis.exceptions
+
+        fake_redis_client = AsyncMock()
+        fake_redis_client.set = AsyncMock(
+            side_effect=redis.exceptions.ConnectionError("connection refused")
+        )
+
+        with patch.object(worker, "settings") as fake_settings:
+            fake_settings.is_cloud = True
+            fake_settings.internal_job_secret.get_secret_value.return_value = "job-secret"
+            with patch(
+                "core.internal_auth.get_redis_client",
+                new=AsyncMock(return_value=fake_redis_client),
+            ), patch.dict(
+                worker._REGISTRY, {"embed_personal_memory": AsyncMock()}, clear=False
+            ):
+                fake_job = worker._REGISTRY["embed_personal_memory"]
+                worker.dispatch_embed_personal_memory_job("usr_a", "identity", ["- x"])
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                fake_job.assert_awaited_once_with(user_id="usr_a", topic_name="identity", lines=["- x"])
+
 
 class EmbedPersonalMemoryEndpointTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -235,6 +266,26 @@ class EmbedPersonalMemoryEndpointTest(unittest.TestCase):
                     "X-Turtle-Signature": "0" * 64,
                 },
             )
+        self.assertEqual(resp.status_code, 401)
+
+    def test_unreachable_redis_rejects_with_401_not_500(self) -> None:
+        """Coordinator fail-fix: verify_request's nonce claim hitting a real
+        redis-py driver exception (not a mocked CloudBackendUnavailable)
+        must produce a 401, never an unhandled 500.
+        """
+        import redis.exceptions
+
+        fake_redis_client = AsyncMock()
+        fake_redis_client.set = AsyncMock(
+            side_effect=redis.exceptions.ConnectionError("connection refused")
+        )
+        with patch("apps.cron_tick_routes.settings") as fake_settings:
+            fake_settings.internal_job_secret.get_secret_value.return_value = "real-secret"
+            with patch(
+                "core.internal_auth.get_redis_client",
+                new=AsyncMock(return_value=fake_redis_client),
+            ):
+                resp = self._signed_post("real-secret", {"job_id": "whatever"})
         self.assertEqual(resp.status_code, 401)
 
     def test_replayed_request_rejected(self) -> None:

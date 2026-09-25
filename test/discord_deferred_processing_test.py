@@ -163,6 +163,34 @@ class KickOffDeferredProcessingTest(unittest.IsolatedAsyncioTestCase):
 
         fake_process.assert_awaited_once_with(_PAYLOAD)
 
+    async def test_cloud_mode_redis_command_fails_falls_back_to_in_process(self) -> None:
+        """Coordinator fail-fix: unset-URL is not the only failure mode. A
+        client object that EXISTS but whose command raises the redis-py
+        driver's own exception (here, a real redis.exceptions.ConnectionError
+        — not a mocked CloudBackendUnavailable) must degrade the same way,
+        not surface as an unhandled 500 out of the Discord request handler.
+        """
+        import redis.exceptions
+
+        fake_redis_client = AsyncMock()
+        fake_redis_client.set = AsyncMock(
+            side_effect=redis.exceptions.ConnectionError("connection refused")
+        )
+
+        with patch.object(discord_module, "settings") as fake_settings:
+            fake_settings.is_cloud = True
+            fake_settings.internal_job_secret.get_secret_value.return_value = "job-secret"
+            with patch(
+                "core.internal_auth.get_redis_client",
+                new=AsyncMock(return_value=fake_redis_client),
+            ), patch.object(
+                discord_module, "_process_deferred_interaction", new_callable=AsyncMock
+            ) as fake_process:
+                await discord_module._kick_off_deferred_processing(_PAYLOAD)
+                await asyncio.sleep(0)
+
+        fake_process.assert_awaited_once_with(_PAYLOAD)
+
 
 class DiscordProcessEndpointTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -249,6 +277,26 @@ class DiscordProcessEndpointTest(unittest.TestCase):
                 )
         self.assertEqual(resp.status_code, 401)
         fake_process.assert_not_called()
+
+    def test_unreachable_redis_rejects_with_401_not_500(self) -> None:
+        """Coordinator fail-fix: verify_request's nonce claim hitting a real
+        redis-py driver exception (not a mocked CloudBackendUnavailable)
+        must produce a 401, never an unhandled 500.
+        """
+        import redis.exceptions
+
+        fake_redis_client = AsyncMock()
+        fake_redis_client.set = AsyncMock(
+            side_effect=redis.exceptions.ConnectionError("connection refused")
+        )
+        with patch.object(discord_module, "settings") as fake_settings:
+            fake_settings.internal_job_secret.get_secret_value.return_value = "real-secret"
+            with patch(
+                "core.internal_auth.get_redis_client",
+                new=AsyncMock(return_value=fake_redis_client),
+            ):
+                resp = self._signed_post("real-secret", {"job_id": "whatever"})
+        self.assertEqual(resp.status_code, 401)
 
     def test_replayed_request_rejected(self) -> None:
         with patch.object(discord_module, "settings") as fake_settings:
