@@ -9,7 +9,7 @@ Send an email on behalf of the user. This tool handles extraction of recipients,
 - ANY time the user's intent is to actually deliver an email message
 
 ## When NOT to USE
-- User is asking about an email they received — use search_web or history_tool instead
+- User is asking about an email they received — Turtle cannot read received email; tell the user this isn't something you can do rather than calling any tool
 - User just wants help writing text without sending — offer to compose the text directly without calling this tool
 - The request is about calendar invites — use a calendar tool instead
 

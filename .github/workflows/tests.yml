@@ -50,6 +50,80 @@ jobs:
         # via test/smoke_boot_test.py, so no separate CI boot job is needed.
         run: python -m pytest test -q
 
+  secrets-scan:
+    # ledger 1b.6 (item 3): there was no secret scanning, linting, or static
+    # analysis anywhere in this repo's CI before this job, and no
+    # pre-commit configuration of any kind. This runs gitleaks — downloaded
+    # directly from its GitHub release and checksum-verified below, NOT the
+    # `gitleaks/gitleaks-action` wrapper (that wrapper ships under a
+    # separate commercial EULA baked into its action.yml; the gitleaks CLI
+    # itself is MIT) — against just the commit(s) this push/PR introduces.
+    #
+    # BEHAVIOUR CHANGE, not a pure addition: this is a job inside the
+    # `tests` workflow (not a new workflow) specifically so
+    # deploy-vercel.yml's `workflow_run: workflows: ["tests"]` trigger keeps
+    # firing. But a workflow_run's `conclusion` is `success` only when every
+    # job in the run succeeds, so from this commit onward a secret landing
+    # in a push/PR will also fail the `tests` run and therefore newly block
+    # both preview and production deploys. That IS the point of a secret
+    # gate, but flagging it explicitly since nothing about the deploy
+    # workflow's trigger makes that consequence obvious by itself.
+    #
+    # Job, not a step inside `tests`: this needs no Python/pip install at
+    # all, so as its own job it starts immediately and runs fully in
+    # parallel with `tests` instead of serialising behind that job's
+    # dependency install. A step would be simpler (one less job block to
+    # read) but would sit idle behind pip for no reason — this scan doesn't
+    # touch anything `tests` installs.
+    #
+    # Diff-only, not full history: gitleaks is pointed at only the commits
+    # this push/PR adds (`--log-opts` below), not the whole repo history.
+    # Scanning full history on every push would cost the same seconds-long
+    # penalty on every single run forever, and — because this repo had zero
+    # secret scanning before today — would very likely surface old,
+    # already-shipped findings and block ALL work immediately until every
+    # historical hit was triaged or allow-listed, rather than gating what
+    # matters going forward. A one-time full-history audit run by hand is
+    # still worth doing separately; this job is the going-forward gate, not
+    # that audit.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need real history (not the default shallow clone) so the diff
+          # range below resolves against an ancestor commit that's actually
+          # present locally.
+          fetch-depth: 0
+
+      - name: Determine scan range (this push/PR's new commits only)
+        id: range
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "range=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              # First push of a new branch (or a push with no known parent)
+              # — nothing to diff against, so scan just the tip commit
+              # instead of the whole branch's history.
+              echo "range=-1" >> "$GITHUB_OUTPUT"
+            else
+              echo "range=${before}..${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Install gitleaks (pinned version, checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -sSL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+
+      - name: Run gitleaks on the incoming change
+        run: ./gitleaks git --log-opts="${{ steps.range.outputs.range }}" -v --exit-code 1
+
   cloud-tests:
     # WP0.C (ledger 0.4 / S-9.5): runs test/cloud_integration/ against a REAL
     # Postgres + Redis, TURTLE_DEPLOY=cloud. The `tests` job above only ever
