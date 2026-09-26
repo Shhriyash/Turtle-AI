@@ -48,6 +48,23 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 _STORES_SCHEMA = "wp3a_parity_stores"
 _ALEMBIC_SCHEMA = "wp3a_parity_alembic"
 
+# alembic_version (Alembic's own revision-bookkeeping table, created by
+# `alembic upgrade head` itself — NOT part of 0001_baseline.py's own
+# CREATE TABLE statements, and never declared by any core/storage/cloud/*.py
+# store) is expected to exist in the "alembic" schema and NOT in the "stores"
+# schema, and is expected to SURVIVE `alembic downgrade base` (that is how
+# Alembic itself knows a database is at "base" rather than unmanaged).
+# Excluded by name here, mirroring test/tenant_purge_enumeration_test.py's
+# `_INTENTIONALLY_UNPURGED_TABLES` shape — a named, commented exemption, not
+# a loosened assertion, so a future REAL table the baseline creates but no
+# store declares still turns this test red.
+_ALEMBIC_BOOKKEEPING_TABLES = {"alembic_version"}
+# alembic_version's own PRIMARY KEY index, created alongside it by the same
+# `alembic upgrade head` bookkeeping — the literal name Alembic gives it
+# (confirmed via `alembic upgrade head --sql`: "CONSTRAINT alembic_version_pkc
+# PRIMARY KEY (version_num)"), not a pattern match, for the same reason.
+_ALEMBIC_BOOKKEEPING_INDEXES = {"alembic_version_pkc"}
+
 
 def _schema_url(schema: str) -> str:
     sep = "&" if "?" in DATABASE_URL else "?"
@@ -227,7 +244,11 @@ def test_baseline_matches_store_ddl() -> None:
 
     with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
         stores_tables = _tables(conn, _STORES_SCHEMA)
-        alembic_tables = _tables(conn, _ALEMBIC_SCHEMA)
+        # Named exclusion only (see _ALEMBIC_BOOKKEEPING_TABLES above) — every
+        # other table alembic_tables reports still goes into the comparison
+        # below unfiltered, so a real drift (a store table the baseline
+        # doesn't create, or vice versa) still fails this assertion.
+        alembic_tables = _tables(conn, _ALEMBIC_SCHEMA) - _ALEMBIC_BOOKKEEPING_TABLES
         assert stores_tables == alembic_tables, (
             f"table sets differ: stores-only={stores_tables - alembic_tables}, "
             f"alembic-only={alembic_tables - stores_tables}"
@@ -237,27 +258,55 @@ def test_baseline_matches_store_ddl() -> None:
         assert len(stores_tables) == 18, f"expected 18 tables, found {len(stores_tables)}: {sorted(stores_tables)}"
 
         stores_columns = _columns(conn, _STORES_SCHEMA)
-        alembic_columns = _columns(conn, _ALEMBIC_SCHEMA)
+        alembic_columns = {
+            k: v
+            for k, v in _columns(conn, _ALEMBIC_SCHEMA).items()
+            if k[0] not in _ALEMBIC_BOOKKEEPING_TABLES
+        }
         assert stores_columns == alembic_columns
 
         stores_pks = _primary_keys(conn, _STORES_SCHEMA)
-        alembic_pks = _primary_keys(conn, _ALEMBIC_SCHEMA)
+        alembic_pks = {
+            k: v
+            for k, v in _primary_keys(conn, _ALEMBIC_SCHEMA).items()
+            if k not in _ALEMBIC_BOOKKEEPING_TABLES
+        }
         assert stores_pks == alembic_pks
 
         stores_indexes = _indexes(conn, _STORES_SCHEMA)
-        alembic_indexes = _indexes(conn, _ALEMBIC_SCHEMA)
+        alembic_indexes = {
+            name: ddl
+            for name, ddl in _indexes(conn, _ALEMBIC_SCHEMA).items()
+            if name not in _ALEMBIC_BOOKKEEPING_INDEXES
+        }
         assert stores_indexes == alembic_indexes
 
         # Explicitly pin down the two partial indexes the ledger calls out by
         # name, so a regression here fails with a readable assertion instead
-        # of only showing up in the broader dict-equality check above.
+        # of only showing up in the broader dict-equality check above. This
+        # is the first point in this test where these two assertions are
+        # actually reached when the table-set check above previously failed
+        # (the alembic_version mismatch) — every assertion in this function
+        # runs top-to-bottom and stops at the first failure, so until the
+        # table-set exclusion above was fixed, these two lines had never
+        # actually executed against a live database.
         for idx_name in ("idx_vector_docs_user", "idx_vector_chunks_user"):
             assert "WHERE (NOT deleted)" in stores_indexes[idx_name], stores_indexes[idx_name]
             assert "WHERE (NOT deleted)" in alembic_indexes[idx_name], alembic_indexes[idx_name]
 
 
 def test_downgrade_to_base_drops_every_table() -> None:
-    """`alembic downgrade base` removes all 18 tables this revision created.
+    """`alembic downgrade base` removes all 18 application tables this
+    revision created, and leaves exactly `alembic_version` behind — Alembic's
+    own revision-bookkeeping table, which downgrading to "base" is defined
+    to keep (that row, deleted back to empty rather than the table itself
+    being dropped, is how Alembic tells "at base" apart from "unmanaged").
+
+    Asserts the residual set equals _ALEMBIC_BOOKKEEPING_TABLES exactly,
+    not "every table except alembic_version is gone" filtered away before
+    comparing — so a real table this migration failed to drop still fails
+    this assertion instead of being silently swallowed alongside the
+    expected one.
 
     Runs against the "alembic" schema this module already builds up to head
     (rebuilt here to not depend on test execution order), so this is a real
@@ -280,4 +329,7 @@ def test_downgrade_to_base_drops_every_table() -> None:
     )
     with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
         remaining = _tables(conn, _ALEMBIC_SCHEMA)
-    assert remaining == set(), f"downgrade left tables behind: {remaining}"
+    assert remaining == _ALEMBIC_BOOKKEEPING_TABLES, (
+        f"expected only Alembic's own bookkeeping table {_ALEMBIC_BOOKKEEPING_TABLES} "
+        f"to remain after `alembic downgrade base`, found: {remaining}"
+    )
