@@ -59,6 +59,44 @@ jobs:
       - name: Install Vercel CLI
         run: npm install -g vercel@latest
 
+      # Ledger 3.1 (review/2026-09-25-decision-ledger.md, Phase 3): the ONLY
+      # Python toolchain this workflow needs is for the Alembic migration
+      # step immediately below — everything else here is Node/Vercel CLI.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Alembic
+        run: pip install alembic==1.16.5 sqlalchemy==2.0.44 "psycopg[binary,pool]>=3.2"
+
+      # Additive-first (ledger 3.1's "new columns and tables ship before the
+      # code that uses them"): migrations run BEFORE the deploy below, so the
+      # new schema exists before any new code that might read/write it goes
+      # live, and so a broken migration blocks the deploy outright rather
+      # than shipping code against a schema it doesn't match.
+      #
+      # DATABASE_URL_DIRECT is not set in the "production" GitHub environment
+      # yet (ledger 3.1's owner action: "add DATABASE_URL_DIRECT to the
+      # production GitHub environment"). This step deliberately does NOT skip
+      # quietly when it's absent — migrations/env.py already fails loudly and
+      # names the variable, and a silent skip here would let a schema-less
+      # deploy proceed, which is the exact hazard ledger 3.1 exists to avoid.
+      # Concretely: THIS STEP MAKES PRODUCTION DEPLOYS FAIL until the owner
+      # sets DATABASE_URL_DIRECT as a secret on the "production" environment.
+      # That is a deliberate, not an accidental, consequence of landing this
+      # migration framework before the secret exists — flagged here rather
+      # than engineered around.
+      - name: Run database migrations (alembic upgrade head)
+        env:
+          DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DATABASE_URL_DIRECT:-}" ]; then
+            echo "::error::DATABASE_URL_DIRECT is not set in the 'production' GitHub environment. Refusing to deploy without running migrations first — set this secret (Neon's direct, non-pooler connection string) to unblock deploys. See .env.example and migrations/env.py."
+            exit 1
+          fi
+          alembic upgrade head
+
       # --skip-domain deploys without assigning the production domain, so a
       # deployment that fails the /healthz or /readyz probes below is never
       # user-visible and there is nothing to roll back. `vercel promote`

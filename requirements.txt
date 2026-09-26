@@ -101,6 +101,19 @@ redis>=5.2.0        # async Redis client (Upstash rediss://) — rate limiter, g
 # replacement for that one call site) uses psycopg instead.
 psycopg[binary,pool]>=3.2
 
+# Alembic (ledger 3.1): migrates the cloud Postgres schema (migrations/,
+# alembic.ini). Neither the app nor any Vercel function imports this at
+# runtime — it only runs as a CLI step in .github/workflows/deploy-vercel.yml
+# and (indirectly, via `alembic upgrade head` in a subprocess) in
+# test/cloud_integration/migrations_schema_parity_test.py. It is listed here
+# rather than in a migrations-only manifest because the `cloud-tests` CI job
+# (.github/workflows/tests.yml, out of this work package's scope to edit)
+# installs only from this file, and that job is what runs the schema-parity
+# test. The cost is a small amount of unused weight (alembic + SQLAlchemy,
+# not their own native deps) added to the actual Vercel function bundle.
+alembic==1.16.5
+sqlalchemy==2.0.44   # alembic's own hard dependency; pinned for reproducibility
+
 # discord.py / python-telegram-bot moved to requirements-local.txt: both are
 # needed ONLY by the local long-polling/gateway adapters
 # (apps/channels/discord_gateway.py, apps/channels/telegram_gateway.py),
