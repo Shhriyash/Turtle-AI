@@ -93,6 +93,23 @@ async def get_pg_pool() -> Any:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             await register_vector(conn)
 
+        # asyncpg.create_pool() passes unrecognized **connect_kwargs straight
+        # through to asyncpg.connect() for every new physical connection,
+        # UNVALIDATED at pool-construction time — the pool object is handed
+        # back immediately either way. A typo'd/nonexistent kwarg here only
+        # raises the first time the pool actually opens a connection
+        # (asyncpg/pool.py's _get_new_connection -> connect()), which in this
+        # codebase means the first real request against a real Postgres.
+        # command_timeout, statement_cache_size, and timeout below are all
+        # confirmed present on asyncpg.connect()'s real signature (checked
+        # via inspect.signature(asyncpg.connect)); min_size/max_size/
+        # max_inactive_connection_lifetime are create_pool()'s own
+        # (non-passthrough) parameters. application_name is NOT one of
+        # connect()'s parameters — see its own comment below for what that
+        # one actually needs. No offline/mocked test can validate any of
+        # this list against the real library; only a real Postgres
+        # connection can (the cloud-tests CI job, exercising this pool on
+        # every cloud-marked test, is what caught application_name).
         _pg_pool = await asyncpg.create_pool(
             dsn,
             min_size=1,
@@ -118,9 +135,22 @@ async def get_pg_pool() -> Any:
             # invocation that used it, waiting on a request that will never
             # come.
             max_inactive_connection_lifetime=60,
-            # Distinguishes Turtle's connections in Neon's/PgBouncer's
-            # connection listings from any other client sharing the DSN.
-            application_name="turtle",
+            # `application_name` is a Postgres SERVER setting, not a
+            # parameter of asyncpg.connect() itself (confirmed via
+            # inspect.signature(asyncpg.connect) — it has no
+            # application_name kwarg, only server_settings). Passing it as
+            # a bare kwarg above raised "connect() got an unexpected
+            # keyword argument 'application_name'" the first time the pool
+            # opened a real connection — asyncpg.create_pool() does NOT
+            # validate connect kwargs at construction time, only when
+            # _get_new_connection() actually calls connect(), so this only
+            # surfaces against a real Postgres (which is what caught it:
+            # the cloud-tests CI job, not any offline/mocked test — no
+            # offline test can validate this; see
+            # GetPgPoolKwargsTest.test_create_pool_called_with_ledger_kwargs
+            # in test/storage_cloud_init_test.py for why, and don't add one
+            # that pretends to).
+            server_settings={"application_name": "turtle"},
         )
         return _pg_pool
 

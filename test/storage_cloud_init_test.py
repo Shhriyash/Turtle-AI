@@ -175,6 +175,22 @@ class GetPgPoolKwargsTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(setattr, cloud, "_pg_pool", None)
 
     async def test_create_pool_called_with_ledger_kwargs(self) -> None:
+        # IMPORTANT — what this test can and cannot prove: asyncpg.create_pool()
+        # does NOT validate connect kwargs at construction time; it forwards
+        # unrecognized **connect_kwargs straight to asyncpg.connect() only
+        # when the pool opens its first real connection
+        # (asyncpg/pool.py's _get_new_connection). A mocked create_pool()
+        # like the one below happily accepts ANY kwarg name/shape — it
+        # cannot catch a kwarg the real asyncpg.connect() would reject
+        # (this is exactly how `application_name="turtle"` shipped here
+        # once: it only surfaced as
+        # "connect() got an unexpected keyword argument 'application_name'"
+        # against a REAL Postgres, caught by the cloud-tests CI job, not by
+        # any offline test). This test only asserts get_pg_pool() PASSES
+        # THROUGH the values we intend it to — the real contract validation
+        # for asyncpg connect kwargs is the cloud_integration/ suite against
+        # a live database; do not add an offline test here that claims to
+        # cover that.
         captured = {}
 
         async def fake_create_pool(dsn, **kwargs):
@@ -194,7 +210,14 @@ class GetPgPoolKwargsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs.get("statement_cache_size"), 0)
         self.assertEqual(kwargs.get("timeout"), 10)
         self.assertEqual(kwargs.get("max_inactive_connection_lifetime"), 60)
-        self.assertEqual(kwargs.get("application_name"), "turtle")
+        # application_name is a Postgres SERVER setting, not a top-level
+        # asyncpg.connect() parameter — it must be nested inside
+        # server_settings, not passed bare (that was the actual bug).
+        self.assertEqual(kwargs.get("server_settings"), {"application_name": "turtle"})
+        self.assertNotIn(
+            "application_name", kwargs,
+            "application_name must be nested inside server_settings=, not top-level",
+        )
 
 
 class RedisTimeoutsUnchangedTest(unittest.IsolatedAsyncioTestCase):
