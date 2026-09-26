@@ -58,13 +58,16 @@ def test_load_token_json_prefers_per_user_file(tmp_path, monkeypatch):
     assert json.loads(resolved)["refresh_token"] == "per-user-token"
 
 
-def test_load_token_json_falls_back_to_global_when_no_per_user_file(tmp_path, monkeypatch):
+def test_load_token_json_no_fallback_when_user_id_given_but_no_per_user_file(tmp_path, monkeypatch):
+    """WP2.B (ledger 2.8): the legacy env fallback survives ONLY in local
+    mode with NO user_id — the conjunction matters. A user_id given but with
+    no per-user file on disk (a genuine miss, e.g. never connected their
+    calendar) must resolve to None, not silently reuse the operator's own
+    legacy token. Previously this fell back to the global env var."""
     import tools.calendar_tool as ct
+    from test.calendar_token_store_test import _EnvTripwireSettings
 
-    fake_settings = mock.MagicMock()
-    fake_settings.is_cloud = False
-    fake_settings.calendar_token_key = None
-    fake_settings.google_calendar_token_json = '{"refresh_token": "global-legacy"}'
+    fake_settings = _EnvTripwireSettings(is_cloud=False)
     monkeypatch.setattr(ct, "settings", fake_settings)
 
     def fake_personal_memory_dir(user_id: str):
@@ -75,8 +78,7 @@ def test_load_token_json_falls_back_to_global_when_no_per_user_file(tmp_path, mo
     monkeypatch.setattr("core.paths.personal_memory_dir", fake_personal_memory_dir)
 
     resolved = ct._load_token_json("no-such-user")
-    assert resolved is not None
-    assert json.loads(resolved)["refresh_token"] == "global-legacy"
+    assert resolved is None
 
 
 def test_load_token_json_falls_back_when_no_user_id(monkeypatch):

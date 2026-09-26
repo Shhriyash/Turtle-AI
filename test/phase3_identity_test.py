@@ -196,6 +196,30 @@ class IdentityResetStabilityTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    # -- WP 2.A: find_user_id_by_email / list_users ------------------------
+
+    def test_find_user_id_by_email_and_list_users(self) -> None:
+        """New async-surface methods added for WP 2.A (ledger 2.3) so
+        apps/admin_routes.py never has to reach for identity_manager.db_path
+        directly — the attribute PostgresIdentityManager doesn't have."""
+        async def scenario() -> None:
+            mgr = await self._fresh_manager()
+            uid = await mgr.resolve_user("web_email", "  Grace@Example.com ")
+
+            # find_user_id_by_email normalizes casing/whitespace like resolve_user.
+            self.assertEqual(await mgr.find_user_id_by_email("grace@example.com"), uid)
+            self.assertEqual(await mgr.find_user_id_by_email(" Grace@Example.com"), uid)
+            self.assertIsNone(await mgr.find_user_id_by_email("nobody@example.com"))
+            self.assertIsNone(await mgr.find_user_id_by_email(""))
+
+            users = await mgr.list_users()
+            self.assertEqual(len(users), 1)
+            self.assertEqual(users[0]["user_id"], uid)
+            self.assertEqual(users[0]["primary_email"], "grace@example.com")
+            self.assertIn("created_at", users[0])
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

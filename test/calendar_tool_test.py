@@ -13,6 +13,26 @@ the contracts-level arg models, and the config fields.
 from __future__ import annotations
 
 
+class _EnvTripwireSettings:
+    """Settings stand-in whose google_calendar_token_json raises if ever
+    read — proves the legacy env fallback is genuinely never consulted, not
+    merely coincidentally unused (WP2.B / ledger 2.8)."""
+
+    def __init__(self, *, is_cloud: bool, google_calendar_credentials_json=None,
+                 calendar_token_key=None):
+        self.is_cloud = is_cloud
+        self.google_calendar_credentials_json = google_calendar_credentials_json
+        self.calendar_token_key = calendar_token_key
+
+    @property
+    def google_calendar_token_json(self):
+        raise AssertionError(
+            "legacy env var google_calendar_token_json must not be read "
+            "when a user_id is given in cloud mode, nor when it is a "
+            "genuine miss with a user_id given in local mode"
+        )
+
+
 class TestF4CalendarTool:
     """Google Calendar tool — args validation + graceful no-creds paths."""
 
@@ -226,3 +246,217 @@ class TestRenderCalendarDraft:
         assert "alice@example.com" in rendered
         assert "bob@example.com" in rendered
         assert "confirm" in rendered.lower()
+
+
+class TestCredentialsUnavailableVsMissing:
+    """WP2.B (ledger 2.8): a transient DB error / undecryptable token must
+    never be conflated with "no token stored", and - critically - must
+    never fall back to the legacy single-tenant GOOGLE_CALENDAR_TOKEN_JSON
+    env var. Previously all four cases (falsy user_id, any exception on
+    lookup, empty/None stored value, any exception on decrypt) collapsed
+    into one except-Exception-stored-None and fell through to the env var,
+    so a Postgres hiccup for one user could create an event on the
+    operator's own personal calendar."""
+
+    _OAUTH_CREDS_JSON = '{"installed": {"client_id": "cid", "client_secret": "csecret"}}'
+
+    def test_cloud_user_id_no_row_is_credentials_missing_env_never_read(self):
+        """cloud + user_id + no row -> credentials_missing, env var not read."""
+        import asyncio, unittest.mock as mock
+        from tools.calendar_tool import create_calendar_event, CalendarCreateArgs
+
+        async def run():
+            import tools.calendar_tool as ct
+            from core.config import settings as real_settings
+            fake_settings = _EnvTripwireSettings(
+                is_cloud=True, google_calendar_credentials_json=self._OAUTH_CREDS_JSON
+            )
+            ct.settings = fake_settings
+            try:
+                with mock.patch(
+                    "core.storage.cloud.calendar_token_store.get_token_json",
+                    return_value=None,
+                ), mock.patch("googleapiclient.discovery.build") as build_mock:
+                    args = CalendarCreateArgs(
+                        title="T",
+                        start_iso="2026-06-01T10:00:00+00:00",
+                        end_iso="2026-06-01T10:30:00+00:00",
+                    )
+                    result = await create_calendar_event(args, user_id="usr_a")
+            finally:
+                ct.settings = real_settings
+            return result, build_mock
+
+        result, build_mock = asyncio.run(run())
+        assert result.status == "invalid"
+        assert result.error_code == "credentials_missing"
+        build_mock.assert_not_called()  # no client ever built -> no event created
+
+    def test_cloud_user_id_db_error_is_credentials_unavailable_no_event_env_never_read(self):
+        """cloud + user_id + get_token_json raising -> credentials_unavailable,
+        no event created, env var never read. This is the headline case: a
+        transient DB error must not create events on the operator's own
+        calendar."""
+        import asyncio, unittest.mock as mock
+        from tools.calendar_tool import create_calendar_event, CalendarCreateArgs
+
+        async def run():
+            import tools.calendar_tool as ct
+            from core.config import settings as real_settings
+            fake_settings = _EnvTripwireSettings(
+                is_cloud=True, google_calendar_credentials_json=self._OAUTH_CREDS_JSON
+            )
+            ct.settings = fake_settings
+            try:
+                with mock.patch(
+                    "core.storage.cloud.calendar_token_store.get_token_json",
+                    side_effect=RuntimeError("connection refused"),
+                ), mock.patch("googleapiclient.discovery.build") as build_mock:
+                    args = CalendarCreateArgs(
+                        title="T",
+                        start_iso="2026-06-01T10:00:00+00:00",
+                        end_iso="2026-06-01T10:30:00+00:00",
+                    )
+                    result = await create_calendar_event(args, user_id="usr_a")
+            finally:
+                ct.settings = real_settings
+            return result, build_mock
+
+        result, build_mock = asyncio.run(run())
+        assert result.status == "invalid"
+        assert result.error_code == "credentials_unavailable"
+        # The env var (a raising property here) was never accessed, and no
+        # Google API client was ever built, so no event could have been
+        # created.
+        build_mock.assert_not_called()
+
+    def test_cloud_user_id_list_also_creates_nothing_on_credentials_unavailable(self):
+        """Same DB-error scenario via list_upcoming_events: nothing is listed
+        (no API call made) and the env var is never read."""
+        import asyncio, unittest.mock as mock
+        from tools.calendar_tool import list_upcoming_events, CalendarListArgs
+
+        async def run():
+            import tools.calendar_tool as ct
+            from core.config import settings as real_settings
+            fake_settings = _EnvTripwireSettings(
+                is_cloud=True, google_calendar_credentials_json=self._OAUTH_CREDS_JSON
+            )
+            ct.settings = fake_settings
+            try:
+                with mock.patch(
+                    "core.storage.cloud.calendar_token_store.get_token_json",
+                    side_effect=RuntimeError("connection refused"),
+                ), mock.patch("googleapiclient.discovery.build") as build_mock:
+                    args = CalendarListArgs(max_results=3)
+                    result = await list_upcoming_events(args, user_id="usr_a")
+            finally:
+                ct.settings = real_settings
+            return result, build_mock
+
+        result, build_mock = asyncio.run(run())
+        assert result.status == "invalid"
+        assert result.error_code == "credentials_unavailable"
+        build_mock.assert_not_called()
+
+    def test_cloud_user_id_decrypt_failure_is_credentials_unavailable_env_never_read(self):
+        """cloud + user_id + decryption failure -> credentials_unavailable
+        (not credentials_missing): the ciphertext EXISTS but cannot be read
+        (wrong key / tampering), which is more alarming than "no token" and
+        must not be quietly filed as missing. Env var never read."""
+        import asyncio, unittest.mock as mock
+        from tools.calendar_tool import create_calendar_event, CalendarCreateArgs
+
+        async def run():
+            import tools.calendar_tool as ct
+            from core.config import settings as real_settings
+            fake_settings = _EnvTripwireSettings(
+                is_cloud=True, google_calendar_credentials_json=self._OAUTH_CREDS_JSON
+            )
+            ct.settings = fake_settings
+            try:
+                with mock.patch(
+                    "core.storage.cloud.calendar_token_store.get_token_json",
+                    return_value='{"key_version": 1, "blob": "not-really-valid"}',
+                ), mock.patch(
+                    "core.calendar_token_crypto.decrypt_stored",
+                    side_effect=ValueError("decryption failed: bad tag"),
+                ), mock.patch("googleapiclient.discovery.build") as build_mock:
+                    args = CalendarCreateArgs(
+                        title="T",
+                        start_iso="2026-06-01T10:00:00+00:00",
+                        end_iso="2026-06-01T10:30:00+00:00",
+                    )
+                    result = await create_calendar_event(args, user_id="usr_a")
+            finally:
+                ct.settings = real_settings
+            return result, build_mock
+
+        result, build_mock = asyncio.run(run())
+        assert result.status == "invalid"
+        assert result.error_code == "credentials_unavailable"
+        build_mock.assert_not_called()
+
+    def test_local_no_user_id_env_var_still_works_unchanged(self):
+        """local + no user_id + env var set -> still works, unchanged."""
+        import tools.calendar_tool as ct
+        from core.config import settings as real_settings
+
+        fake_settings = _EnvTripwireSettingsWithEnv(
+            is_cloud=False, token_json='{"refresh_token": "global-legacy"}'
+        )
+        ct.settings = fake_settings
+        try:
+            resolved = ct._load_token_json(None)
+        finally:
+            ct.settings = real_settings
+        assert resolved == '{"refresh_token": "global-legacy"}'
+
+    def test_local_user_id_no_stored_token_is_credentials_missing_env_never_read(self):
+        """local + user_id + no stored token -> credentials_missing (not a
+        fallback to the env var): the env fallback survives ONLY in local
+        mode with NO user_id - a user_id being present at all means the
+        per-user path is authoritative, even if nothing was found there."""
+        import asyncio, unittest.mock as mock
+        from tools.calendar_tool import create_calendar_event, CalendarCreateArgs
+
+        async def run():
+            import tools.calendar_tool as ct
+            from core.config import settings as real_settings
+            fake_settings = _EnvTripwireSettings(
+                is_cloud=False, google_calendar_credentials_json=self._OAUTH_CREDS_JSON
+            )
+            ct.settings = fake_settings
+
+            def fake_personal_memory_dir(user_id):
+                import pathlib, tempfile
+                d = pathlib.Path(tempfile.mkdtemp()) / user_id
+                d.mkdir(parents=True, exist_ok=True)
+                return d
+
+            try:
+                with mock.patch("core.paths.personal_memory_dir", fake_personal_memory_dir), \
+                     mock.patch("googleapiclient.discovery.build") as build_mock:
+                    args = CalendarCreateArgs(
+                        title="T",
+                        start_iso="2026-06-01T10:00:00+00:00",
+                        end_iso="2026-06-01T10:30:00+00:00",
+                    )
+                    result = await create_calendar_event(args, user_id="usr_no_file")
+            finally:
+                ct.settings = real_settings
+            return result, build_mock
+
+        result, build_mock = asyncio.run(run())
+        assert result.status == "invalid"
+        assert result.error_code == "credentials_missing"
+        build_mock.assert_not_called()
+
+
+class _EnvTripwireSettingsWithEnv:
+    """Opposite of _EnvTripwireSettings - used for the one case where the
+    env var SHOULD legitimately be read (local mode, no user_id)."""
+
+    def __init__(self, *, is_cloud: bool, token_json: str):
+        self.is_cloud = is_cloud
+        self.google_calendar_token_json = token_json
