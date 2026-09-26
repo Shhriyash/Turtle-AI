@@ -118,7 +118,12 @@ function handleServerMessage(msg) {
     }
 }
 
-function handleStatusMessage(msg) {
+// Exported (this is otherwise a private dispatch helper) solely so
+// test/web_js_wp3c_test.mjs can exercise the "degraded" status branch
+// directly without a full DOM/WebSocket harness — see that test file's
+// header for why (repo convention: a dependency-free node:assert script,
+// no new test framework).
+export function handleStatusMessage(msg) {
     const labelMap = {
         ready:        'Ready',
         thinking:     'Thinking',
@@ -126,6 +131,12 @@ function handleStatusMessage(msg) {
         listening:    'Listening',
         speaking:     'Speaking',
         restored:     'Session restored',
+        // Ledger 3.6(d): the server sends this when it couldn't reach its
+        // session store on connect and fell back to a fresh, unsaved
+        // in-memory session. Without an entry here this rendered as the
+        // literal word "degraded" with none of the special handling below —
+        // exactly the "wired at one end only" defect Phase 1 kept shipping.
+        degraded:     'Reconnecting memory…',
     };
 
     // The ready frame advertises whether the server has streaming STT enabled.
@@ -145,6 +156,12 @@ function handleStatusMessage(msg) {
         showThinking('Speaking');
     } else if (msg.status === 'ready' || msg.status === 'restored') {
         hideThinking();
+    } else if (msg.status === 'degraded') {
+        // The connection is still usable (a fresh session was started), it
+        // just won't have prior history/pending drafts this time — tell the
+        // user rather than silently losing continuity.
+        hideThinking();
+        showToast("Couldn't restore your previous session — starting fresh.", true);
     }
 }
 

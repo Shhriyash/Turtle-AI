@@ -22,11 +22,14 @@ import unittest
 from unittest.mock import patch
 
 import fakeredis
+import redis as redis_module
 
 from core.guardrails import WebSocketRateLimitExceeded
 from core.storage.cloud.redis_backends import (
     RedisChannelGateBuffer,
     RedisWebSocketRateLimiter,
+    get_channel_gate_degraded_count,
+    get_rate_limiter_degraded_count,
     redis_is_duplicate_invocation,
     redis_record_invocation,
 )
@@ -80,6 +83,80 @@ class RedisWebSocketRateLimiterTest(unittest.TestCase):
         limiter = RedisWebSocketRateLimiter(per_hour=1, per_day=1)
         limiter.check_and_record("")
         limiter.check_and_record("")  # would raise if it were tracked
+
+
+class RedisWebSocketRateLimiterFailOpenTest(unittest.TestCase):
+    """Ledger 3.6(a): check_and_record previously had NO error handling at
+    all, so a live Redis outage raised redis-py's own driver error uncaught.
+    Both call sites (apps/turtle_server.py) only catch
+    WebSocketRateLimitExceeded, so that exception reached the outer handler
+    and killed the whole WebSocket connection over an unenforced (but
+    recoverable) rate limit. These tests use the driver's REAL error type
+    (redis.exceptions.ConnectionError / TimeoutError), not a mocked
+    CloudBackendUnavailable -- a test that only proves the unset-URL case
+    passes while a live outage still takes the connection down is the exact
+    defect the brief calls out.
+    """
+
+    def test_live_connection_error_fails_open_not_raises(self) -> None:
+        limiter = RedisWebSocketRateLimiter(per_hour=5, per_day=100)
+        with patch(
+            "core.storage.cloud.redis_backends.get_redis_sync_client",
+            side_effect=redis_module.exceptions.ConnectionError("connection refused"),
+        ):
+            limiter.check_and_record("usr_a")  # must NOT raise -- this is the whole point
+
+    def test_live_timeout_error_fails_open_not_raises(self) -> None:
+        limiter = RedisWebSocketRateLimiter(per_hour=5, per_day=100)
+        with patch(
+            "core.storage.cloud.redis_backends.get_redis_sync_client",
+            side_effect=redis_module.exceptions.TimeoutError("timed out"),
+        ):
+            limiter.check_and_record("usr_a")  # must NOT raise
+
+    def test_outage_increments_rate_limiter_degraded_count(self) -> None:
+        limiter = RedisWebSocketRateLimiter(per_hour=5, per_day=100)
+        before = get_rate_limiter_degraded_count()
+        with patch(
+            "core.storage.cloud.redis_backends.get_redis_sync_client",
+            side_effect=redis_module.exceptions.ConnectionError("connection refused"),
+        ):
+            limiter.check_and_record("usr_a")
+        self.assertEqual(get_rate_limiter_degraded_count(), before + 1)
+
+    def test_enforced_limit_still_raises_even_though_outages_fail_open(self) -> None:
+        """The fail-open path must not swallow a REAL, successfully-enforced
+        limit -- only a Redis-unreachable error degrades."""
+        fake = fakeredis.FakeStrictRedis(decode_responses=True)
+        with patch("core.storage.cloud.redis_backends.get_redis_sync_client", return_value=fake):
+            limiter = RedisWebSocketRateLimiter(per_hour=1, per_day=100)
+            limiter.check_and_record("usr_a")
+            with self.assertRaises(WebSocketRateLimitExceeded):
+                limiter.check_and_record("usr_a")
+
+    def test_unset_url_case_also_fails_open(self) -> None:
+        """The unset-URL case (CloudBackendUnavailable) must also degrade
+        gracefully -- it's the OTHER half of the fail-open contract, not a
+        substitute for the live-outage half above.
+
+        Imported from core.storage.cloud.redis_backends (not
+        core.storage.cloud directly): test/readyz_test.py's
+        ReadyzTimeoutBudgetTest does `importlib.reload(core.storage.cloud)`
+        elsewhere in the suite, which mints a NEW CloudBackendUnavailable
+        class object -- redis_backends.py's `except` tuple still holds the
+        one it imported at its own module-load time, so importing "fresh"
+        from core.storage.cloud here would grab the reloaded (different)
+        class and make this isinstance check fail purely on suite ordering,
+        not on any real behavior difference.
+        """
+        from core.storage.cloud.redis_backends import CloudBackendUnavailable
+
+        limiter = RedisWebSocketRateLimiter(per_hour=5, per_day=100)
+        with patch(
+            "core.storage.cloud.redis_backends.get_redis_sync_client",
+            side_effect=CloudBackendUnavailable("REDIS_URL not set"),
+        ):
+            limiter.check_and_record("usr_a")  # must NOT raise
 
 
 class RedisChannelGateBufferTest(unittest.TestCase):
@@ -153,6 +230,53 @@ class RedisChannelGateBufferTest(unittest.TestCase):
         self.fake.pexpire(short_buffer._redis_key(key), 1)
         time.sleep(0.05)
         self.assertIsNone(short_buffer.try_consume_answer(key, "yes"))
+
+
+class RedisChannelGateBufferFailOpenTest(unittest.TestCase):
+    """Ledger 3.6(b): same defect as the rate limiter (no error handling at
+    all) for note_prompt/try_consume_answer/has_outstanding/clear. Fail open
+    to "no pending prompt" using the driver's real error type."""
+
+    def setUp(self) -> None:
+        self.buffer = RedisChannelGateBuffer(ttl_seconds=300)
+
+    def test_try_consume_answer_fails_open_to_none_on_live_outage(self) -> None:
+        with patch(
+            "core.storage.cloud.redis_backends.get_redis_sync_client",
+            side_effect=redis_module.exceptions.ConnectionError("connection refused"),
+        ):
+            result = self.buffer.try_consume_answer(("u1", "telegram"), "yes")
+        self.assertIsNone(result)
+
+    def test_note_prompt_does_not_raise_on_live_outage(self) -> None:
+        with patch(
+            "core.storage.cloud.redis_backends.get_redis_sync_client",
+            side_effect=redis_module.exceptions.ConnectionError("connection refused"),
+        ):
+            self.buffer.note_prompt(("u1", "telegram"), ("ev1",))  # must not raise
+
+    def test_has_outstanding_fails_open_to_false_on_live_outage(self) -> None:
+        with patch(
+            "core.storage.cloud.redis_backends.get_redis_sync_client",
+            side_effect=redis_module.exceptions.TimeoutError("timed out"),
+        ):
+            self.assertFalse(self.buffer.has_outstanding(("u1", "telegram")))
+
+    def test_clear_does_not_raise_on_live_outage(self) -> None:
+        with patch(
+            "core.storage.cloud.redis_backends.get_redis_sync_client",
+            side_effect=redis_module.exceptions.ConnectionError("connection refused"),
+        ):
+            self.buffer.clear(("u1", "telegram"))  # must not raise
+
+    def test_outage_increments_channel_gate_degraded_count(self) -> None:
+        before = get_channel_gate_degraded_count()
+        with patch(
+            "core.storage.cloud.redis_backends.get_redis_sync_client",
+            side_effect=redis_module.exceptions.ConnectionError("connection refused"),
+        ):
+            self.buffer.has_outstanding(("u1", "telegram"))
+        self.assertEqual(get_channel_gate_degraded_count(), before + 1)
 
 
 class RedisIdempotencyTest(unittest.TestCase):
