@@ -3132,9 +3132,19 @@ from apps.channels.slack import router as _slack_router
 from apps.channels.twilio_voice import router as _twilio_voice_router
 from apps.channels.discord import router as _discord_router
 
-app.include_router(_whatsapp_router)
-app.include_router(_imessage_router)
-app.include_router(_slack_router)
+# apps/channels/whatsapp.py, imessage.py, slack.py: NOT MOUNTED.
+# The owner has stated only three channels are open: Telegram, Discord and
+# the web UI. WhatsApp, iMessage and Slack are closed by policy, not because
+# anything is broken in them. apps/channels/whatsapp.py is a Twilio Cloud API
+# adapter (auth via TWILIO_AUTH_TOKEN, replies via TWILIO_WHATSAPP_NUMBER) —
+# the same vendor as Twilio Voice below, but this is signature-verified and
+# has no known auth hazard; it is simply a channel the owner does not run.
+# This is reversible: remounting any of the three requires only uncommenting
+# the corresponding include_router call below (imports are already in place)
+# plus provisioning that channel's provider credentials/webhook.
+# app.include_router(_whatsapp_router)
+# app.include_router(_imessage_router)
+# app.include_router(_slack_router)
 # apps/channels/twilio_voice.py: NOT MOUNTED.
 # The WS at /channels/twilio/voice/stream has no signature verification and
 # takes the tenant straight from client-supplied `start.customParameters.from`,
