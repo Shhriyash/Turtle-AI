@@ -4245,7 +4245,23 @@ async def websocket_endpoint(ws: WebSocket):
     async with httpx.AsyncClient() as client:
         # Tenant-scoped: resume/sweep must never see another user's sessions.
         session_store = SessionStore(user_id=user_id)
-        restore_result = await session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
+        # Ledger 3.6(d): start_or_restore() previously had no error handling
+        # and ran OUTSIDE the big try/except below (~4411) that guards the
+        # receive loop, so a DB error here (e.g. Postgres momentarily
+        # unreachable) propagated straight out of websocket_endpoint and
+        # Starlette tore the connection down with no application frame at
+        # all. Degrade instead: start a fresh in-memory-only session (no
+        # restore/persistence until the backend recovers) and tell the
+        # client via a "degraded" status frame so it can inform the user
+        # rather than silently landing on a dead socket.
+        session_store_degraded = False
+        try:
+            restore_result = await session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
+        except Exception as exc:
+            print(f"LOG: session store start_or_restore failed ({exc}); starting a fresh degraded session")
+            traceback.print_exc()
+            restore_result = session_store.start_fresh_degraded()
+            session_store_degraded = True
         # Personal memory lives under personal_memory_dir(user_id); there is no
         # single-tenant store to construct.
         personal_memory_store = PersonalMemoryStore(user_id=user_id)
@@ -4349,22 +4365,29 @@ async def websocket_endpoint(ws: WebSocket):
         # Process pending sessions from previous runs (personal memory finalization).
         # list_pending_finalization_archives now returns (session_id, message_history)
         # directly from SQLite — no file-based archive path needed.
-        for pending_sid, pending_messages in await session_store.list_pending_finalization_archives():
-            print(f"LOG: Finalizing pending session {pending_sid}")
-            if pending_messages:
-                _sync_personal_memory_from_messages(
-                    state, session_id=pending_sid, message_history=pending_messages,
-                )
-                try:
-                    await run_stage_b_session_extractor(
+        # Skipped entirely when the session store just failed above (3.6(d)):
+        # the backend is already known unreachable, so calling it again here
+        # would only reproduce the same failure this connection just degraded
+        # past, uncaught, one line later.
+        if session_store_degraded:
+            print("LOG: skipping pending-finalization sweep — session store is degraded this connection")
+        else:
+            for pending_sid, pending_messages in await session_store.list_pending_finalization_archives():
+                print(f"LOG: Finalizing pending session {pending_sid}")
+                if pending_messages:
+                    _sync_personal_memory_from_messages(
                         state, session_id=pending_sid, message_history=pending_messages,
                     )
+                    try:
+                        await run_stage_b_session_extractor(
+                            state, session_id=pending_sid, message_history=pending_messages,
+                        )
+                    except Exception as _e:
+                        print(f"LOG: Stage B error for pending session {pending_sid}: {_e}")
+                try:
+                    await session_store.mark_finalized(pending_sid)
                 except Exception as _e:
-                    print(f"LOG: Stage B error for pending session {pending_sid}: {_e}")
-            try:
-                await session_store.mark_finalized(pending_sid)
-            except Exception as _e:
-                print(f"LOG: mark_finalized failed for {pending_sid}: {_e}")
+                    print(f"LOG: mark_finalized failed for {pending_sid}: {_e}")
         if state.sqlite_index is not None:
             try:
                 state.sqlite_index.checkpoint()
@@ -4377,7 +4400,18 @@ async def websocket_endpoint(ws: WebSocket):
         # client opts in with a mic_open frame (only if the server enables it).
         mic_session: "_MicStreamSession | None" = None
 
-        if restore_result.restored:
+        if session_store_degraded:
+            # Wired end-to-end: web/js/websocket.js's status labelMap has a
+            # matching "degraded" entry (Phase 1's recurring defect was a
+            # control computed and shipped server-side but never read by the
+            # client -- don't repeat it here).
+            await _ws_send_json(ws, {
+                "type": "status",
+                "status": "degraded",
+                "reason": "session_store_unavailable",
+                "session_id": restore_result.session_id,
+            })
+        elif restore_result.restored:
             await _ws_send_json(ws, {
                 "type": "status",
                 "status": "restored",

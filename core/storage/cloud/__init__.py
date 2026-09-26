@@ -12,10 +12,12 @@ runs the full local/SQLite test suite untouched.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
-from typing import Any, Optional
+import threading
+from typing import Any, AsyncIterator, Optional
 
 from core.config import settings
 
@@ -34,6 +36,14 @@ _pg_pool: Optional[Any] = None
 _pg_pool_lock: Optional[asyncio.Lock] = None
 
 _pg_sync_pool: Optional[Any] = None
+# threading.Lock (NOT asyncio.Lock): get_pg_sync_pool() is called from real
+# concurrent OS threads via asyncio.to_thread (see its docstring below), and
+# an asyncio.Lock only serializes coroutines on ONE event loop thread — it
+# provides no mutual exclusion at all across separate OS threads. Module-level
+# (not lazily created like _pg_pool_lock above) because threading.Lock, unlike
+# asyncio.Lock, doesn't bind to a running event loop, so there's no
+# import-time hazard in constructing it eagerly.
+_pg_sync_pool_lock = threading.Lock()
 
 _redis_client: Optional[Any] = None
 _redis_client_lock: Optional[asyncio.Lock] = None
@@ -83,6 +93,23 @@ async def get_pg_pool() -> Any:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             await register_vector(conn)
 
+        # asyncpg.create_pool() passes unrecognized **connect_kwargs straight
+        # through to asyncpg.connect() for every new physical connection,
+        # UNVALIDATED at pool-construction time — the pool object is handed
+        # back immediately either way. A typo'd/nonexistent kwarg here only
+        # raises the first time the pool actually opens a connection
+        # (asyncpg/pool.py's _get_new_connection -> connect()), which in this
+        # codebase means the first real request against a real Postgres.
+        # command_timeout, statement_cache_size, and timeout below are all
+        # confirmed present on asyncpg.connect()'s real signature (checked
+        # via inspect.signature(asyncpg.connect)); min_size/max_size/
+        # max_inactive_connection_lifetime are create_pool()'s own
+        # (non-passthrough) parameters. application_name is NOT one of
+        # connect()'s parameters — see its own comment below for what that
+        # one actually needs. No offline/mocked test can validate any of
+        # this list against the real library; only a real Postgres
+        # connection can (the cloud-tests CI job, exercising this pool on
+        # every cloud-marked test, is what caught application_name).
         _pg_pool = await asyncpg.create_pool(
             dsn,
             min_size=1,
@@ -91,6 +118,39 @@ async def get_pg_pool() -> Any:
             # Serverless invocations are short-lived; don't hold connections
             # open indefinitely waiting on a command that will never finish.
             command_timeout=30,
+            # database_url is documented (core/config.py) as Neon's POOLED
+            # (PgBouncer, transaction-mode) endpoint. asyncpg's own FAQ says
+            # transaction-mode PgBouncer does not preserve a session across
+            # statements, so its prepared-statement cache can be handed a
+            # statement name it never actually prepared on the physical
+            # connection the next call lands on ("prepared statement ...
+            # does not exist"). statement_cache_size=0 disables that cache,
+            # which is the FAQ's prescribed fix for exactly this setup.
+            statement_cache_size=0,
+            # Bound the one-off connect handshake itself, not just query
+            # execution (command_timeout above) — a stalled TCP/TLS/auth
+            # step during pool creation would otherwise hang unbounded.
+            timeout=10,
+            # Serverless: don't let an idle connection sit open past the
+            # invocation that used it, waiting on a request that will never
+            # come.
+            max_inactive_connection_lifetime=60,
+            # `application_name` is a Postgres SERVER setting, not a
+            # parameter of asyncpg.connect() itself (confirmed via
+            # inspect.signature(asyncpg.connect) — it has no
+            # application_name kwarg, only server_settings). Passing it as
+            # a bare kwarg above raised "connect() got an unexpected
+            # keyword argument 'application_name'" the first time the pool
+            # opened a real connection — asyncpg.create_pool() does NOT
+            # validate connect kwargs at construction time, only when
+            # _get_new_connection() actually calls connect(), so this only
+            # surfaces against a real Postgres (which is what caught it:
+            # the cloud-tests CI job, not any offline/mocked test — no
+            # offline test can validate this; see
+            # GetPgPoolKwargsTest.test_create_pool_called_with_ledger_kwargs
+            # in test/storage_cloud_init_test.py for why, and don't add one
+            # that pretends to).
+            server_settings={"application_name": "turtle"},
         )
         return _pg_pool
 
@@ -98,33 +158,81 @@ async def get_pg_pool() -> Any:
 def get_pg_sync_pool() -> Any:
     """Process-wide SYNCHRONOUS psycopg connection pool.
 
-    Only for callers that are themselves synchronous and run directly on the
-    event loop thread (rag/system/complete_rag.py's TurtleRAGSystem, an
-    existing blocking-call pattern this preserves — see requirements.txt's
-    comment on why asyncpg doesn't fit there). Everything else in
-    core/storage/cloud uses the async pool above.
+    Used by callers that are themselves synchronous (rag/system/
+    complete_rag.py's TurtleRAGSystem, an existing blocking-call pattern this
+    preserves — see requirements.txt's comment on why asyncpg doesn't fit
+    there — plus core/storage/cloud/journal_store.py, identity_store.py,
+    calendar_token_store.py, account_linking_store.py,
+    confirmation_state_store.py, personal_memory_store.py, pgvector_store.py,
+    rag_session_staging_store.py, routine_outbox_store.py,
+    telemetry_claim_store.py, and routine_last_fired_store.py).
 
-    No asyncio.Lock guard needed: this runs on the single event-loop thread in
-    the app process (matching its caller's own execution model), so there is
-    no concurrent-thread race to guard against here the way get_pg_pool()
-    guards its own creation.
+    IMPORTANT: despite this function's own execution being synchronous, it is
+    NOT single-threaded in practice. Several of the routes that reach these
+    sync stores do so via asyncio.to_thread (apps/cron_tick_routes.py,
+    apps/calendar_oauth_routes.py, apps/turtle_server.py,
+    rag/system/complete_rag.py) — asyncio.to_thread dispatches to the
+    default ThreadPoolExecutor, which runs REAL concurrent OS threads, not
+    cooperative coroutines. Two such routes firing on a cold instance (e.g.
+    a calendar OAuth callback and a cron tick, or two concurrent callbacks)
+    can both observe `_pg_sync_pool is None` before either finishes
+    constructing one, both build a ConnectionPool, and one overwrites the
+    other's global reference while its connections leak unclosed. A prior
+    version of this docstring claimed this only ran on one event-loop thread
+    with one caller — that was stale and wrong; hence the threading.Lock
+    below (an asyncio.Lock would NOT protect across OS threads the way it
+    needs to here — see get_pg_pool()'s asyncio.Lock, which is fine because
+    that one only ever races coroutines on a single loop thread).
     """
     global _pg_sync_pool
     if _pg_sync_pool is not None:
         return _pg_sync_pool
-    dsn = settings.database_url.get_secret_value() if settings.database_url else ""
-    if not dsn:
-        raise CloudBackendUnavailable(
-            "DATABASE_URL is not set — cannot create the sync Postgres pool."
+    with _pg_sync_pool_lock:
+        if _pg_sync_pool is not None:  # re-check: lost the race while blocked on the lock
+            return _pg_sync_pool
+        dsn = settings.database_url.get_secret_value() if settings.database_url else ""
+        if not dsn:
+            raise CloudBackendUnavailable(
+                "DATABASE_URL is not set — cannot create the sync Postgres pool."
+            )
+        from psycopg_pool import ConnectionPool
+        from pgvector.psycopg import register_vector
+
+        def _configure(conn: Any) -> None:
+            register_vector(conn)
+
+        pool = ConnectionPool(
+            dsn,
+            min_size=1,
+            max_size=5,
+            configure=_configure,
+            # Constructed closed, then opened explicitly below: psycopg_pool
+            # warns that open=True (the implicit-open-in-constructor form)
+            # can race the pool's own background connection-opening thread
+            # against code that starts using the pool immediately, and is
+            # deprecated in favor of this explicit two-step form.
+            open=False,
+            # ConnectionPool's own `timeout` bounds how long a CALLER waits
+            # to be handed a connection out of the pool (e.g. all 5 are
+            # checked out and busy) — it has nothing to do with the network
+            # connect handshake. Kept short for the same serverless reason
+            # as get_pg_pool()'s asyncpg timeout=10 above: don't let a
+            # caller block indefinitely on pool exhaustion.
+            timeout=10,
+            # The actual connect-handshake bound (TCP/TLS/auth) is a libpq
+            # connection parameter, not a ConnectionPool.__init__ argument —
+            # psycopg_pool has no `connect_timeout` kwarg of its own; it
+            # passes `kwargs` through to every new connection it opens.
+            kwargs={"connect_timeout": 10},
+            # psycopg_pool's own recommended liveness check: reject/replace
+            # a connection from the pool that's gone stale (e.g. Neon
+            # suspended the compute between invocations) instead of handing
+            # a caller a dead connection that fails on first use.
+            check=ConnectionPool.check_connection,
         )
-    from psycopg_pool import ConnectionPool
-    from pgvector.psycopg import register_vector
-
-    def _configure(conn: Any) -> None:
-        register_vector(conn)
-
-    _pg_sync_pool = ConnectionPool(dsn, min_size=1, max_size=5, configure=_configure, open=True)
-    return _pg_sync_pool
+        pool.open()
+        _pg_sync_pool = pool
+        return _pg_sync_pool
 
 
 def close_pg_sync_pool() -> None:
@@ -141,6 +249,34 @@ async def close_pg_pool() -> None:
     if _pg_pool is not None:
         await _pg_pool.close()
         _pg_pool = None
+
+
+@contextlib.asynccontextmanager
+async def pg_transaction(conn: Any) -> AsyncIterator[Any]:
+    """Shared asyncpg transaction helper: wraps ``conn.transaction()`` and
+    additionally sets a per-transaction statement timeout via
+    ``SET LOCAL statement_timeout``.
+
+    ``SET LOCAL`` scopes the setting to the current transaction only (it
+    resets at COMMIT/ROLLBACK), which matters because every connection here
+    comes out of a shared pool (get_pg_pool()) and is reused by unrelated
+    callers afterwards — a bare (non-LOCAL) SET would leak the timeout onto
+    whichever caller acquires that connection next.
+
+    NOT yet adopted at any call site (ledger 3.5 asks this WP to define it,
+    not to migrate every store's ad hoc ``async with conn.transaction():``
+    onto it — see this WP's report for the exact list of call sites that
+    should adopt it as a follow-up package, so as to avoid touching files
+    other work packages currently own).
+
+    Usage::
+
+        async with pg_transaction(conn) as txn_conn:
+            await txn_conn.execute(...)
+    """
+    async with conn.transaction():
+        await conn.execute("SET LOCAL statement_timeout = '30s'")
+        yield conn
 
 
 def _get_redis_lock() -> asyncio.Lock:

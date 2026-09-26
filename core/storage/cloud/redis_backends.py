@@ -26,7 +26,46 @@ from typing import Optional
 
 from core.channel_gate import DEFAULT_TTL_SECONDS, parse_gate_answer
 from core.guardrails import WebSocketRateLimitExceeded
-from core.storage.cloud import get_redis_sync_client
+from core.storage.cloud import CloudBackendUnavailable, get_redis_sync_client
+
+# Ledger 3.6(a)/(b): the errors that must fail OPEN here (unlike idempotency's
+# deliberate fail-CLOSED above -- see this module's docstring intro / the
+# governing-principle note in the WP brief). A live Redis outage raises
+# redis-py's own driver errors (redis.exceptions.RedisError and everything
+# under it, e.g. ConnectionError/TimeoutError) -- NOT CloudBackendUnavailable,
+# which get_redis_sync_client only raises for an unset REDIS_URL. Both are
+# caught here: an unset URL is a config problem, a live outage is a runtime
+# blip, but in neither case should refusing to enforce a soft limit cost a
+# user their entire WebSocket connection.
+try:
+    import redis as _redis_module  # local import: optional dep, mirrors get_redis_sync_client
+
+    _REDIS_FAIL_OPEN_ERRORS: tuple[type[BaseException], ...] = (
+        _redis_module.RedisError,
+        CloudBackendUnavailable,
+    )
+except Exception:  # pragma: no cover - redis package itself unavailable
+    _REDIS_FAIL_OPEN_ERRORS = (CloudBackendUnavailable,)
+
+# Ledger 3.6(a): in-process counter, incremented every time the rate limiter
+# degrades (fails open) because Redis could not be reached. Same "no metrics
+# module yet" caveat as routine_outbox_store.get_outbox_failure_counts --
+# this does not reach a dashboard until Phase 4.
+_RATE_LIMITER_METRICS = {"rate_limiter_degraded": 0}
+
+
+def get_rate_limiter_degraded_count() -> int:
+    """Snapshot of this process's rate_limiter_degraded counter."""
+    return _RATE_LIMITER_METRICS["rate_limiter_degraded"]
+
+
+# Ledger 3.6(b): same counter shape for the channel gate's fail-open path.
+_CHANNEL_GATE_METRICS = {"channel_gate_degraded": 0}
+
+
+def get_channel_gate_degraded_count() -> int:
+    """Snapshot of this process's channel_gate_degraded counter."""
+    return _CHANNEL_GATE_METRICS["channel_gate_degraded"]
 
 
 # --- Rate limiter -----------------------------------------------------------
@@ -49,30 +88,46 @@ class RedisWebSocketRateLimiter:
     def check_and_record(self, user_id: str) -> None:
         if not user_id:
             return
-        client = get_redis_sync_client()
-        key = f"turtle:ws_rate:{user_id}"
-        now = time.time()
-        day_cutoff = now - 86400
-        hour_cutoff = now - 3600
+        try:
+            client = get_redis_sync_client()
+            key = f"turtle:ws_rate:{user_id}"
+            now = time.time()
+            day_cutoff = now - 86400
+            hour_cutoff = now - 3600
 
-        client.zremrangebyscore(key, "-inf", day_cutoff)
+            client.zremrangebyscore(key, "-inf", day_cutoff)
 
-        if self.per_day > 0:
-            day_count = client.zcard(key)
-            if day_count >= self.per_day:
-                raise WebSocketRateLimitExceeded(user_id, "day", self.per_day)
-        if self.per_hour > 0:
-            hour_count = client.zcount(key, hour_cutoff, "+inf")
-            if hour_count >= self.per_hour:
-                raise WebSocketRateLimitExceeded(user_id, "hour", self.per_hour)
+            if self.per_day > 0:
+                day_count = client.zcard(key)
+                if day_count >= self.per_day:
+                    raise WebSocketRateLimitExceeded(user_id, "day", self.per_day)
+            if self.per_hour > 0:
+                hour_count = client.zcount(key, hour_cutoff, "+inf")
+                if hour_count >= self.per_hour:
+                    raise WebSocketRateLimitExceeded(user_id, "hour", self.per_hour)
 
-        # Unique member per event: two messages in the same wall-clock instant
-        # must both count, not collide into one sorted-set entry.
-        member = f"{now}:{id(object())}"
-        client.zadd(key, {member: now})
-        # Bound the key's own lifetime so an abandoned user's entry doesn't
-        # linger in Redis forever once past the day window.
-        client.expire(key, 90000)  # a little over 24h
+            # Unique member per event: two messages in the same wall-clock instant
+            # must both count, not collide into one sorted-set entry.
+            member = f"{now}:{id(object())}"
+            client.zadd(key, {member: now})
+            # Bound the key's own lifetime so an abandoned user's entry doesn't
+            # linger in Redis forever once past the day window.
+            client.expire(key, 90000)  # a little over 24h
+        except WebSocketRateLimitExceeded:
+            # A real, enforced limit -- never swallow this one.
+            raise
+        except _REDIS_FAIL_OPEN_ERRORS as exc:
+            # Ledger 3.6(a): previously had NO error handling at all, so a
+            # live Redis outage raised redis-py's own ConnectionError/
+            # TimeoutError uncaught -- both call sites only catch
+            # WebSocketRateLimitExceeded, so the exception reached the outer
+            # handler and killed the entire WebSocket connection over an
+            # unenforced (but recoverable) rate limit. Fail OPEN instead:
+            # a rate limit is a bounded-abuse guard, not an irreversible
+            # side effect (contrast tools/idempotency.py's deliberate
+            # fail-CLOSED above, which guards a real duplicate-send).
+            _RATE_LIMITER_METRICS["rate_limiter_degraded"] += 1
+            print(f"LOG: rate limiter degraded (Redis unreachable): {exc}")
 
 
 # --- Channel gate buffer -----------------------------------------------------
@@ -93,18 +148,40 @@ class RedisChannelGateBuffer:
         user_id, channel = key
         return f"turtle:gate:{user_id}:{channel}"
 
+    @staticmethod
+    def _degrade(exc: BaseException, action: str) -> None:
+        # Ledger 3.6(b): same fail-open posture as the rate limiter -- a
+        # channel-gate prompt going unanswered because Redis is unreachable
+        # is recoverable (the user just doesn't get the yes/no shortcut this
+        # turn); refusing the whole channel turn over it is strictly worse.
+        _CHANNEL_GATE_METRICS["channel_gate_degraded"] += 1
+        print(f"LOG: channel gate degraded (Redis unreachable) during {action}: {exc}")
+
     def note_prompt(self, key: tuple[str, str], event_ids: tuple[str, ...], **_kwargs) -> None:
         if not event_ids:
             return
-        client = get_redis_sync_client()
-        client.set(self._redis_key(key), json.dumps(list(event_ids)), ex=self._ttl_seconds)
+        try:
+            client = get_redis_sync_client()
+            client.set(self._redis_key(key), json.dumps(list(event_ids)), ex=self._ttl_seconds)
+        except _REDIS_FAIL_OPEN_ERRORS as exc:
+            # Best-effort: the prompt still reaches the user in chat text even
+            # if we fail to remember it was asked, it just can't be answered
+            # via the yes/no shortcut this turn.
+            self._degrade(exc, "note_prompt")
 
     def try_consume_answer(
         self, key: tuple[str, str], text: str, **_kwargs
     ) -> tuple[bool, tuple[str, ...]] | None:
-        client = get_redis_sync_client()
-        redis_key = self._redis_key(key)
-        raw = client.get(redis_key)
+        try:
+            client = get_redis_sync_client()
+            redis_key = self._redis_key(key)
+            raw = client.get(redis_key)
+        except _REDIS_FAIL_OPEN_ERRORS as exc:
+            # Fail open to "no pending prompt" -- the caller falls through to
+            # treating this message as ordinary chat text instead of an
+            # unanswerable gate reply.
+            self._degrade(exc, "try_consume_answer")
+            return None
         if raw is None:
             return None
         verdict = parse_gate_answer(text)
@@ -112,7 +189,10 @@ class RedisChannelGateBuffer:
             # Not a yes/no reply — leave the prompt outstanding (its Redis TTL
             # still governs expiry), matching the local class's behavior.
             return None
-        client.delete(redis_key)
+        try:
+            client.delete(redis_key)
+        except _REDIS_FAIL_OPEN_ERRORS as exc:
+            self._degrade(exc, "try_consume_answer.delete")
         try:
             event_ids = tuple(json.loads(raw))
         except Exception:
@@ -120,12 +200,19 @@ class RedisChannelGateBuffer:
         return verdict, event_ids
 
     def has_outstanding(self, key: tuple[str, str], **_kwargs) -> bool:
-        client = get_redis_sync_client()
-        return bool(client.exists(self._redis_key(key)))
+        try:
+            client = get_redis_sync_client()
+            return bool(client.exists(self._redis_key(key)))
+        except _REDIS_FAIL_OPEN_ERRORS as exc:
+            self._degrade(exc, "has_outstanding")
+            return False
 
     def clear(self, key: tuple[str, str]) -> None:
-        client = get_redis_sync_client()
-        client.delete(self._redis_key(key))
+        try:
+            client = get_redis_sync_client()
+            client.delete(self._redis_key(key))
+        except _REDIS_FAIL_OPEN_ERRORS as exc:
+            self._degrade(exc, "clear")
 
 
 # --- Tool idempotency ---------------------------------------------------------

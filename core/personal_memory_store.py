@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ContextManager
 
 from core.config import settings
 from core.io_atomic import atomic_write_text
@@ -116,6 +117,23 @@ class _LocalPersonalMemoryBackend:
     def enforce_cap(self, user_id: str, *, incoming_bytes: int) -> None:
         enforce_storage_cap(user_id, self.base_dir, incoming_bytes=incoming_bytes)
 
+    def begin_transaction(self) -> ContextManager[None]:
+        """Ledger 3.8 (WP3.D): local backend has no transaction concept, and
+        deliberately isn't given one here. Each local topic write is already
+        a single atomic file replace (core.io_atomic.atomic_write_text), so
+        there is no per-topic "implicit commit" for a crash to catch
+        mid-loop the way the cloud backend's per-call Postgres connection
+        creates — a partial local replay leaves N correct files and the rest
+        simply not-yet-written-this-run, a different (and already benign)
+        failure mode from Postgres's, not the same one under a different
+        name. Returns an explicit `contextlib.nullcontext()`, not a bare
+        `None`/missing method: PersonalMemoryStore.begin_transaction()
+        delegates straight to this method with no getattr fallback, so if
+        this method is ever renamed or removed the caller gets a loud
+        AttributeError instead of the guarantee silently degrading to a
+        no-op (see PersonalMemoryStore.begin_transaction's docstring)."""
+        return contextlib.nullcontext()
+
 
 class _CloudPersonalMemoryBackend:
     """Adapts core.storage.cloud.personal_memory_store.PostgresPersonalMemoryBackend
@@ -179,6 +197,20 @@ class _CloudPersonalMemoryBackend:
         if used > cap_bytes:
             raise StorageCapExceededError(user_id, used, cap_bytes)
 
+    def begin_transaction(self) -> ContextManager[None]:
+        """Ledger 3.8 (WP3.D): delegates directly to the real Postgres
+        transaction (core/storage/cloud/personal_memory_store.py::
+        PostgresPersonalMemoryBackend.transaction()) — no getattr/duck-typing
+        here. If this delegation is ever broken (self._pg renamed, the
+        `transaction` method renamed/removed on PostgresPersonalMemoryBackend),
+        this line raises AttributeError immediately instead of silently
+        degrading replay()'s atomicity guarantee to a no-op. Covered by
+        test/wp3d_projection_transaction_test.py::BeginTransactionWiringTest,
+        which deletes this exact method (and its neighbor,
+        PostgresPersonalMemoryBackend.transaction) at runtime and asserts the
+        caller sees the AttributeError rather than a quiet no-op."""
+        return self._pg.transaction()
+
 
 class PersonalMemoryStore:
     def __init__(
@@ -221,6 +253,34 @@ class PersonalMemoryStore:
             self._backend = _CloudPersonalMemoryBackend(user_id)
         else:
             self._backend = _LocalPersonalMemoryBackend(self.base_dir, self.index_path, self.logs_dir)
+
+    def begin_transaction(self) -> ContextManager[None]:
+        """Backend-agnostic transaction scope for a burst of writes — today
+        used only by core/memory_replayer.py::replay()'s per-topic loop
+        (ledger 3.8, transaction half): a crash between topic 3 and topic 4
+        of ~11 must not leave some topics reflecting the new journal state
+        and others stale.
+
+        Delegates straight to self._backend.begin_transaction() with no
+        getattr fallback and no try/except: the local backend's no-op and
+        the cloud backend's real Postgres transaction are two DISTINCT,
+        deliberately-implemented methods (see
+        _LocalPersonalMemoryBackend.begin_transaction and
+        _CloudPersonalMemoryBackend.begin_transaction), not one getattr miss
+        collapsing "no transaction needed" and "transaction hook is broken"
+        into the same silent no-op. If either backend's method is ever
+        renamed or removed, this raises AttributeError immediately instead
+        of the caller quietly losing its atomicity guarantee — this was a
+        real design fork earlier in this ledger item (a getattr-based
+        duck-typed lookup from core/memory_replayer.py directly into private
+        `_backend`/`_pg` attributes) that a reviewer correctly flagged: this
+        project has shipped the "guarantee silently degrades to inert"
+        failure mode more than once already (an untrusted-content allow-list
+        computed and ignored by the client, a gitleaks job that scanned zero
+        commits, a Twilio gate test injecting a field production never
+        sends) — a getattr(..., None) here would be the same shape of bug.
+        """
+        return self._backend.begin_transaction()
 
     def load_index(self) -> list[PersonalMemoryIndexEntry]:
         raw = self._backend.read_index()
