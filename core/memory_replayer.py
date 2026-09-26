@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Iterable, Iterator
+from typing import Iterable
 
 from core.memory_journal import MemoryEvent
 from core.memory_schema import DECAY_DAYS, TOPICS, is_decayed, render_statement
@@ -106,14 +105,20 @@ def replay(
     cleared: list[str] = []
 
     # WP3.D (ledger 3.8, transaction half): every topic write/delete below
-    # must commit together or not at all. `store` is the backend-agnostic
-    # PersonalMemoryStore (core/personal_memory_store.py) — local/SQLite has
-    # no notion of a cross-file transaction (see _topic_write_transaction's
-    # docstring for why that's left as-is), but the cloud backend opened its
-    # own Postgres connection PER topic call, so a crash between topic 3 and
-    # topic 4 of ~11 left some topics reflecting the new journal state and
-    # others stale, with nothing recording that it happened.
-    with _topic_write_transaction(store):
+    # must commit together or not at all. store.begin_transaction()
+    # (core/personal_memory_store.py) is a no-op on the local/SQLite backend
+    # — each local topic write is already a single atomic file replace
+    # (core.io_atomic.atomic_write_text), so a partial local replay leaves N
+    # correct files and the rest simply not-yet-written-this-run, a
+    # different (and already benign) failure mode from the cloud backend's,
+    # which opened its own Postgres connection PER topic call: a crash
+    # between topic 3 and topic 4 of ~11 left some topics reflecting the new
+    # journal state and others stale, with nothing recording that it
+    # happened. See PersonalMemoryStore.begin_transaction's docstring for why
+    # this is a direct method call (no getattr/duck-typing into private
+    # backend attributes): a renamed or missing hook must raise loudly here,
+    # not silently degrade this guarantee to a no-op.
+    with store.begin_transaction():
         for topic in ALL_TOPICS:
             lines = _sort_lines(topic_lines[topic])
             if not lines:
@@ -139,42 +144,6 @@ def replay(
         cleared_topics=cleared,
         resolved_event_count=len(resolved),
     )
-
-
-@contextlib.contextmanager
-def _topic_write_transaction(store: PersonalMemoryStore) -> Iterator[None]:
-    """Wrap replay()'s per-topic write loop in the store's own transaction,
-    if it has one, so a crash partway through leaves no topics changed
-    (ledger 3.8, transaction half).
-
-    PersonalMemoryStore is deliberately backend-agnostic (local/SQLite files
-    vs. Postgres rows) and exposes no transaction primitive of its own on its
-    public surface, so this only reaches as far as `store._backend._pg`
-    (present only on the cloud path — see core.personal_memory_store's
-    _CloudPersonalMemoryBackend) to find the one Postgres-specific hook that
-    matters: `PostgresPersonalMemoryBackend.transaction()`
-    (core/storage/cloud/personal_memory_store.py). This is duck-typed via
-    getattr rather than an isinstance/import of the cloud module, so replay()
-    never touches psycopg/asyncpg directly and importing this module stays
-    dependency-free on a machine with no cloud extras installed.
-
-    Local/SQLite path: deliberately NOT given the same atomicity here. Each
-    local topic write is already a single atomic file replace
-    (core.io_atomic.atomic_write_text) and there was never a per-topic
-    "implicit commit" for a crash to catch mid-loop the way Postgres's
-    per-call `pool.connection()` created — a partial local replay leaves N
-    correct files and the rest simply not-yet-written-this-run, not a torn
-    write. Retrofitting cross-file atomicity to local storage (e.g. staging
-    all N files and renaming as a batch) is a bigger change than this
-    ledger item's scope and isn't the crash mode being fixed here.
-    """
-    pg_backend = getattr(getattr(store, "_backend", None), "_pg", None)
-    transaction_fn = getattr(pg_backend, "transaction", None)
-    if transaction_fn is None:
-        yield
-        return
-    with transaction_fn():
-        yield
 
 
 def _resolve_latest_by_key(events: list[MemoryEvent]) -> list[MemoryEvent]:

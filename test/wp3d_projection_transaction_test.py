@@ -34,20 +34,37 @@ per-call behaviour — the FIX is not "every write is transactional", it is
 class.
 
 The second class (`ReplayAtomicityFixTest`) drives `core.memory_replayer.replay()`
-itself (its real per-topic loop) against the fake Postgres-shaped backend and
-proves an injected failure on the 5th topic write leaves NO topic committed —
-the ledger's own acceptance wording ("an injected failure on the fifth topic
-write changes no topics").
+itself (its real per-topic loop, which now just calls `store.begin_transaction()`)
+against the fake Postgres-shaped backend and proves an injected failure on the
+5th topic write leaves NO topic committed — the ledger's own acceptance
+wording ("an injected failure on the fifth topic write changes no topics").
+
+A third class (`BeginTransactionWiringTest`) guards the delegation chain
+itself: `PersonalMemoryStore.begin_transaction()` ->
+`_CloudPersonalMemoryBackend.begin_transaction()` ->
+`PostgresPersonalMemoryBackend.transaction()` is a direct method chain with
+no getattr/duck-typing, specifically so a rename of any link fails loudly
+(AttributeError) instead of silently collapsing the atomicity guarantee into
+a no-op. Every test in this file already drives that REAL chain (only
+`get_pg_sync_pool` is mocked at the very bottom) rather than a test double
+carrying the right attribute names, so a rename in production code fails
+every test here, not just the dedicated one — the dedicated test additionally
+proves that removing the hook raises rather than silently degrading.
 """
 from __future__ import annotations
 
+import contextlib
 import unittest
 from datetime import UTC, datetime
 from unittest.mock import patch
 
 from core.memory_journal import MemoryEvent
 from core.memory_replayer import ALL_TOPICS, replay
-from core.personal_memory_store import PersonalMemoryStore
+from core.personal_memory_store import (
+    PersonalMemoryStore,
+    _CloudPersonalMemoryBackend,
+    _LocalPersonalMemoryBackend,
+)
 from core.storage.cloud.personal_memory_store import PostgresPersonalMemoryBackend
 
 REFERENCE_TIME = datetime(2026, 9, 26, tzinfo=UTC)
@@ -191,7 +208,8 @@ class ReplayPartialWriteBugTest(unittest.TestCase):
     """Reproduces the ORIGINAL defect: before this ledger item, every
     PostgresPersonalMemoryBackend.write_topic/delete_topic call opened and
     committed its OWN connection. This test drives the backend directly
-    (bypassing `transaction()`) to document that shape stays true for any
+    (bypassing `PostgresPersonalMemoryBackend.transaction()`) to document
+    that shape stays true for any
     caller that doesn't opt into a transaction — replay() is the one caller
     ledger 3.8 fixes, not this backend method's own per-call contract."""
 
@@ -233,7 +251,7 @@ class ReplayPartialWriteBugTest(unittest.TestCase):
 
 class ReplayAtomicityFixTest(unittest.TestCase):
     """Drives the FIXED replay() (its real per-topic loop, wrapped in
-    `_topic_write_transaction`) against the fake Postgres-shaped backend and
+    `store.begin_transaction()`) against the fake Postgres-shaped backend and
     proves an injected failure on the 5th topic write leaves NO topic
     committed — the ledger's own acceptance criterion."""
 
@@ -334,6 +352,130 @@ class ReplayAtomicityFixTest(unittest.TestCase):
             set(result.written_topics),
             {"identity", "preferences", "workflow", "contacts", "projects", "corrections"},
         )
+
+
+class BeginTransactionWiringTest(unittest.TestCase):
+    """Guards the delegation chain replay()'s atomicity guarantee depends on:
+    PersonalMemoryStore.begin_transaction() -> backend.begin_transaction() ->
+    (cloud only) PostgresPersonalMemoryBackend.transaction(). Every method
+    call below is the REAL production method on the REAL class — nothing
+    here is a test double carrying the right attribute/method names — so a
+    rename anywhere in that chain fails these tests loudly instead of the
+    guarantee silently degrading to a no-op with nothing raising and
+    nothing failing (the exact failure shape this project has shipped
+    before: an ignored client-side allow-list, a gitleaks job scanning zero
+    commits, a Twilio gate test injecting a field production never sends)."""
+
+    def setUp(self) -> None:
+        self.pool = _FakePool()
+        patcher = _patch_pool()
+        self.addCleanup(patcher.stop)
+        mock_get = patcher.start()
+        mock_get.return_value = self.pool
+
+    def _cloud_store(self) -> PersonalMemoryStore:
+        with patch("core.personal_memory_store.settings") as fake_settings:
+            fake_settings.is_cloud = True
+            fake_settings.user_storage_cap_mb = 0
+            return PersonalMemoryStore(user_id="usr_wiring")
+
+    def test_cloud_store_begin_transaction_resolves_to_a_real_postgres_transaction(self) -> None:
+        store = self._cloud_store()
+        # Confirms we are actually exercising the real cloud backend chain,
+        # not a fixture standing in for it.
+        self.assertIsInstance(store._backend, _CloudPersonalMemoryBackend)
+        self.assertIsInstance(store._backend._pg, PostgresPersonalMemoryBackend)
+
+        ctx = store.begin_transaction()
+
+        # Must be a real context-manager-shaped object, and specifically NOT
+        # a nullcontext — a nullcontext here would mean cloud mode silently
+        # fell back to the local no-op, which is exactly the "guarantee
+        # quietly becomes inert" failure this test exists to catch.
+        self.assertTrue(hasattr(ctx, "__enter__") and hasattr(ctx, "__exit__"))
+        self.assertNotIsInstance(ctx, contextlib.nullcontext)
+        with ctx:
+            pass  # must not raise: it is a real, usable context manager
+
+    def test_local_store_begin_transaction_is_explicitly_a_no_op(self) -> None:
+        """The local path's no-op is a distinct, deliberate implementation
+        (not the same getattr-miss the cloud path would hit if broken) —
+        this asserts it really is the documented nullcontext, so the two
+        cases stay distinguishable rather than collapsing into one another."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PersonalMemoryStore(user_id="usr_local", base_dir=Path(tmp))
+            self.assertIsInstance(store._backend, _LocalPersonalMemoryBackend)
+
+            ctx = store.begin_transaction()
+            self.assertIsInstance(ctx, contextlib.nullcontext)
+            with ctx:
+                pass
+
+    def test_removing_the_cloud_hook_raises_instead_of_silently_no_opping(self) -> None:
+        """The crux of the coordinator's ask: if
+        `_CloudPersonalMemoryBackend.begin_transaction` is ever renamed or
+        deleted, `store.begin_transaction()` must raise AttributeError, not
+        quietly return something that behaves like a no-op transaction."""
+        store = self._cloud_store()
+        original = _CloudPersonalMemoryBackend.begin_transaction
+        del _CloudPersonalMemoryBackend.begin_transaction
+        try:
+            with self.assertRaises(AttributeError):
+                store.begin_transaction()
+        finally:
+            _CloudPersonalMemoryBackend.begin_transaction = original
+
+    def test_removing_the_postgres_hook_raises_instead_of_silently_no_opping(self) -> None:
+        """Same guard one link further down the chain: if
+        `PostgresPersonalMemoryBackend.transaction` is ever renamed or
+        deleted, `_CloudPersonalMemoryBackend.begin_transaction()` (and thus
+        `store.begin_transaction()`) must raise, not silently no-op."""
+        store = self._cloud_store()
+        original = PostgresPersonalMemoryBackend.transaction
+        del PostgresPersonalMemoryBackend.transaction
+        try:
+            with self.assertRaises(AttributeError):
+                store.begin_transaction()
+        finally:
+            PostgresPersonalMemoryBackend.transaction = original
+
+    def test_replay_actually_uses_begin_transaction_not_a_bypassed_path(self) -> None:
+        """Confirms replay() really calls store.begin_transaction() (and
+        therefore inherits every guard above) rather than some other,
+        untested route to the same connection."""
+        store = self._cloud_store()
+        events = [
+            MemoryEvent(
+                event_id="ev1",
+                session_id="s1",
+                turn_id="t1",
+                observed_at="2026-09-20T10:00:00Z",
+                kind="fact",
+                topic="identity",
+                key="identity.name",
+                value={},
+                confidence=0.9,
+                source="explicit",
+                extractor="llm_turn",
+                applied=True,
+                statement="Name: Alice",
+            )
+        ]
+
+        calls: list[str] = []
+        real_begin_transaction = PersonalMemoryStore.begin_transaction
+
+        def spying_begin_transaction(self):
+            calls.append("called")
+            return real_begin_transaction(self)
+
+        with patch.object(PersonalMemoryStore, "begin_transaction", spying_begin_transaction):
+            replay(events, store=store, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(calls, ["called"])
 
 
 if __name__ == "__main__":
