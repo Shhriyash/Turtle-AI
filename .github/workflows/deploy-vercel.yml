@@ -67,7 +67,15 @@ jobs:
           python-version: "3.13"
 
       - name: Install Alembic
-        run: pip install alembic==1.16.5 sqlalchemy==2.0.44 "psycopg[binary,pool]>=3.2"
+        # requirements-migrations.txt (not requirements.txt): Alembic is
+        # install-time-only tooling, never imported by the deployed app
+        # itself — see that file's header for why it's kept out of the
+        # manifest vercel.json bundles into production. This step does not
+        # install the rest of requirements.txt (this job runs `alembic
+        # upgrade head` only, not the app), so psycopg is installed
+        # alongside it explicitly here; pip resolves a compatible SQLAlchemy
+        # for Alembic automatically as its own declared dependency.
+        run: pip install -r requirements-migrations.txt "psycopg[binary,pool]>=3.2"
 
       # Additive-first (ledger 3.1's "new columns and tables ship before the
       # code that uses them"): migrations run BEFORE the deploy below, so the
