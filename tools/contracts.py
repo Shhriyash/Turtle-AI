@@ -143,17 +143,48 @@ class HistoryArgs(BaseModel):
 
 
 class RecallArgs(BaseModel):
+    """Local-mode recall args — task history has a real backend here, so
+    scope="tasks" is offered. See RecallArgsCloud for the cloud variant."""
+
     query: str = Field(
         min_length=2,
         description=(
             "Natural-language question about past context, preferences, or tasks. "
-            "Use the user's words; do not paraphrase." 
+            "Use the user's words; do not paraphrase."
         ),
     )
     scope: Literal["personal", "episodic", "tasks", "working"] = Field(
         description=(
             "Recall scope: personal (profile/journal), episodic (RAG), "
             "tasks (tool history), working (earlier in current chat)."
+        )
+    )
+
+
+class RecallArgsCloud(BaseModel):
+    """Cloud-mode recall args (WP2.C / ledger 2.5): TaskHistoryStore has no
+    cloud backend, so offering scope="tasks" there let the model believe a
+    capability existed when every call silently returned nothing —
+    indistinguishable from "nothing matched". The scope is removed from the
+    schema entirely instead of documented as broken, so the model never asks
+    for it. Kept as a separate class (not a runtime-conditional Literal on
+    RecallArgs) because pydantic-ai builds the tool's JSON schema from this
+    class's static annotations; apps/turtle_server.py picks between the two
+    classes once per agent (re)build, keyed on settings.is_cloud.
+    """
+
+    query: str = Field(
+        min_length=2,
+        description=(
+            "Natural-language question about past context, preferences, or tasks. "
+            "Use the user's words; do not paraphrase."
+        ),
+    )
+    scope: Literal["personal", "episodic", "working"] = Field(
+        description=(
+            "Recall scope: personal (profile/journal), episodic (RAG), "
+            "working (earlier in current chat). Task history recall is not "
+            "available on this deployment."
         )
     )
 

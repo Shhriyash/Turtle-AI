@@ -147,6 +147,7 @@ from tools.contracts import (
     UrlFetchArgs,
     EmailArgs,
     RecallArgs,
+    RecallArgsCloud,
     CalendarCreateArgs,
     CalendarListArgs,
     FindPlaceArgs,
@@ -431,7 +432,9 @@ class SharedState:
     personal_memory_prompt: PersonalMemoryPromptBuilder
     journal_store: JournalStore
     confirmation_gate: ConfirmationGate
-    task_history_store: TaskHistoryStore
+    # WP2.C (ledger 2.5): None in cloud -- TaskHistoryStore can no longer be
+    # constructed there (task history has no cloud backend).
+    task_history_store: TaskHistoryStore | None
     rag_system: TurtleRAGSystem
     sqlite_index: Any | None = None   # MemorySQLiteIndex; closed on shutdown
     retrieval_broker: Any | None = None   # D4: wired in setup_shared_state
@@ -1877,6 +1880,21 @@ def _build_model_from_str(model_str: str, settings: Any) -> Any | None:
     return None
 
 
+# WP2.C (ledger 2.5): the `recall` tool's args model varies by deployment —
+# cloud drops scope="tasks" (RecallArgsCloud) since TaskHistoryStore has no
+# cloud backend. AgentManager._register_tools() reassigns this module-level
+# name on every (re)build, keyed on settings.is_cloud, right before defining
+# the `recall` closure below. It has to be a MODULE global rather than a
+# local inside _register_tools: this file uses `from __future__ import
+# annotations`, so the `args: _RecallArgsForMode` annotation on the nested
+# `recall` function is stored as the string "_RecallArgsForMode" and resolved
+# lazily (by pydantic-ai's schema builder, via typing.get_type_hints) against
+# the function's __globals__ -- which for a nested function is this module's
+# globals, not _register_tools' locals. A local variable would simply be
+# unresolvable.
+_RecallArgsForMode: type = RecallArgs
+
+
 # ---------------------------------------------------------------------------
 # Agent builder — creates agent chain from current config, supports hot-reload
 # ---------------------------------------------------------------------------
@@ -2072,6 +2090,13 @@ class AgentManager:
         """Register all tools on the main assistant and every fallback rung."""
         from pathlib import Path as _Path
 
+        # WP2.C (ledger 2.5): pick the recall args schema for THIS deployment
+        # before the `recall` closure below is defined -- see the module-level
+        # _RecallArgsForMode docstring for why this must be a global, not a
+        # local, assignment.
+        global _RecallArgsForMode
+        _RecallArgsForMode = RecallArgsCloud if settings.is_cloud else RecallArgs
+
         def _load_tool_contract(name: str) -> str:
             """Load tool contract markdown as the tool description."""
             md_path = (
@@ -2079,9 +2104,31 @@ class AgentManager:
                 / "core" / "system_prompts" / "tools" / f"{name}.md"
             )
             try:
-                return md_path.read_text(encoding="utf-8")
+                text = md_path.read_text(encoding="utf-8")
             except Exception:
                 return f"Tool: {name}"  # graceful fallback
+            # WP2.C (ledger 2.5): cloud's recall schema drops scope="tasks"
+            # (see RecallArgsCloud below) -- the contract text handed to the
+            # model must not still instruct it to use a scope its own tool
+            # schema will reject. Edited in place rather than a second
+            # contract file so test/tool_contract_lint_test.py's
+            # one-file-per-tool invariant holds and the two variants can
+            # never drift out of sync on everything but the tasks scope.
+            if name == "recall" and settings.is_cloud:
+                text = text.replace(
+                    "- scope: one of personal, episodic, tasks, working.",
+                    "- scope: one of personal, episodic, working.",
+                )
+                lines = [
+                    line for line in text.splitlines()
+                    if not line.startswith("- tasks:")
+                ]
+                lines.append(
+                    "Task/tool-action history recall is not available on "
+                    "this deployment."
+                )
+                text = "\n".join(lines) + "\n"
+            return text
 
         agent = self.main_assistant
 
@@ -2382,30 +2429,43 @@ class AgentManager:
                     bcc_recipients=merged["bcc_recipients"], subject=merged["subject"], content=merged["content"],
                     suggested_recipient="",
                 )
-            try:
-                # recall(scope="tasks") finally has data: record the action.
-                ctx.deps.task_history_store.record(
-                    session_id=ctx.deps.session_store.session_id or "unknown_session",
-                    turn_id=f"email_{int(time.time())}",
-                    task_type="email",
-                    status="completed" if send_result.startswith("Email sent successfully") else "failed",
-                    query=query[:200],
-                    tool_used="send_email_assistant",
-                    outcome=send_result[:200],
-                )
-            except Exception as _e:
-                print(f"LOG: task history record failed: {_e}")
+            # WP2.C (ledger 2.5): TaskHistoryStore has no cloud backend and can
+            # no longer be constructed there (task_history_store is None) --
+            # skip the record entirely instead of calling a no-op that used to
+            # hand back a fully-formed TaskHistoryRecord for a write that never
+            # happened.
+            if ctx.deps.task_history_store is not None:
+                try:
+                    # recall(scope="tasks") finally has data: record the action.
+                    ctx.deps.task_history_store.record(
+                        session_id=ctx.deps.session_store.session_id or "unknown_session",
+                        turn_id=f"email_{int(time.time())}",
+                        task_type="email",
+                        status="completed" if send_result.startswith("Email sent successfully") else "failed",
+                        query=query[:200],
+                        tool_used="send_email_assistant",
+                        outcome=send_result[:200],
+                    )
+                except Exception as _e:
+                    print(f"LOG: task history record failed: {_e}")
             return clean_text_for_model(send_result)
 
 
-        async def recall(ctx: RunContext[SharedState], args: RecallArgs) -> str:
+        _recall_valid_scopes = (
+            {"personal", "episodic", "working"} if settings.is_cloud
+            else {"personal", "episodic", "tasks", "working"}
+        )
+
+        async def recall(ctx: RunContext[SharedState], args: _RecallArgsForMode) -> str:
             """Recall personal, episodic, task, or working context. See tool contract for full spec."""
             query = args.query.strip()
             scope = str(args.scope or "").strip().lower()
             if not query:
                 return ToolResult.invalid("query must not be empty").to_agent_string()
-            if scope not in {"personal", "episodic", "tasks", "working"}:
-                return ToolResult.invalid("scope must be personal, episodic, tasks, or working").to_agent_string()
+            if scope not in _recall_valid_scopes:
+                return ToolResult.invalid(
+                    f"scope must be one of: {', '.join(sorted(_recall_valid_scopes))}"
+                ).to_agent_string()
             broker = ctx.deps.retrieval_broker
             if broker is None:
                 return ToolResult.empty("Recall is not available.").to_agent_string()
@@ -3228,7 +3288,15 @@ async def _build_channel_state(user_id: str, channel: str) -> SharedState:
             max_topic_files=PERSONAL_MEMORY_MAX_TOPIC_FILES,
         ),
     )
-    task_history_store = TaskHistoryStore(TASK_HISTORY_FILE, user_id=user_id)
+    # WP2.C (ledger 2.5): task history has no cloud backend -- the store is
+    # not constructed at all in cloud (it used to degrade to a silent no-op
+    # that still handed back a fully-formed record for a write that never
+    # happened). recall(scope="tasks") and the email task-record both branch
+    # on this being None.
+    task_history_store = (
+        None if settings.is_cloud
+        else TaskHistoryStore(TASK_HISTORY_FILE, user_id=user_id)
+    )
     rag_system = TurtleRAGSystem(user_id=user_id)
 
     from core.storage.factory import get_vector_store
@@ -3596,7 +3664,28 @@ async def update_config(
     mirrors this gate in cloud (see get_config's docstring); local's GET stays
     open on purpose — the dev panel reads config to render, and it exposes no
     secrets.
+
+    WP2.C (ledger 2.7 / owner decision D7): config is unconditionally
+    immutable in cloud, regardless of the admin token. _save_config() is a
+    plain open(CONFIG_PATH, "w") against local disk -- on a serverless
+    deploy that either crashes on a read-only filesystem or writes into
+    /tmp, which vanishes at the next cold start, while agents_mgr.rebuild()
+    still mutates the live process for the rest of its lifetime. A correct
+    admin token proves who you are, not that a filesystem write will stick;
+    it is not permission to write to a filesystem that will not keep the
+    write. This check runs before the token check on purpose -- the token
+    is irrelevant here, not merely insufficient.
     """
+    if settings.is_cloud:
+        return JSONResponse(
+            {
+                "error": (
+                    "Config is immutable on this deployment; change "
+                    "environment variables and redeploy."
+                )
+            },
+            status_code=405,
+        )
     global config
     expected = (
         settings.admin_token.get_secret_value()
@@ -4202,7 +4291,12 @@ async def websocket_endpoint(ws: WebSocket):
                 max_topic_files=PERSONAL_MEMORY_MAX_TOPIC_FILES,
             ),
         )
-        task_history_store = TaskHistoryStore(TASK_HISTORY_FILE, user_id=user_id)
+        # WP2.C (ledger 2.5): see the matching comment in the channel-state
+        # twin above -- no cloud backend, so not constructed in cloud at all.
+        task_history_store = (
+            None if settings.is_cloud
+            else TaskHistoryStore(TASK_HISTORY_FILE, user_id=user_id)
+        )
         rag_system = TurtleRAGSystem(user_id=user_id)
 
         # D4: construct RetrievalBroker for 4-tier memory context retrieval
