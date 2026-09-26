@@ -43,6 +43,12 @@ def _docs_for_user(user_id: str) -> list[tuple[str, str, dict]]:
 async def _resolve_user_ids(user_arg: str) -> list[str]:
     if user_arg != "all":
         return [user_arg]
+    # Every route that touches the local users table calls this first (see
+    # apps/admin_routes.py) because the table is created by init_db(), not
+    # lazily on read. A standalone script has no startup to rely on, so
+    # without this `--user all` dies with "no such table: users" on any
+    # install where no user has ever resolved yet.
+    await identity_manager.init_db()
     users = await identity_manager.list_users()
     return [u["user_id"] for u in users if u.get("user_id")]
 
