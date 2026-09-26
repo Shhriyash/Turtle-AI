@@ -157,59 +157,115 @@ def render_calendar_draft(args: CalendarCreateArgs) -> str:
 # Credential loading
 # ---------------------------------------------------------------------------
 
+class CalendarCredentialsUnavailable(Exception):
+    """Raised when we could not determine whether a signed-in user has a
+    calendar token — as opposed to determining that they definitely do not.
+
+    WP2.B (ledger 2.8): a transient DB error, or a stored-but-undecryptable
+    token, must never be treated the same as "no token on file". Both used
+    to collapse into the same `except Exception: stored = None` and fall
+    through to the legacy single-tenant GOOGLE_CALENDAR_TOKEN_JSON env var —
+    which meant a Postgres hiccup for user A could silently create an event
+    on the operator's own personal calendar instead. Callers of
+    _load_token_json must catch this SEPARATELY from a genuine miss (None)
+    and must NOT read settings.google_calendar_token_json when it is raised.
+
+    Deliberately NOT a RuntimeError: _build_service raises plain RuntimeError
+    for "no credentials configured at all", and create_calendar_event /
+    list_upcoming_events catch that to produce error_code="credentials_missing".
+    Keeping this as a distinct Exception type means it can't be accidentally
+    swallowed by a `except RuntimeError` written before this type existed.
+    """
+
+
+def _load_user_token_json(user_id: str) -> Optional[str]:
+    """Resolve the stored per-user token, distinguishing "no token on file"
+    (returns None — a normal, expected state) from "could not find out"
+    (raises CalendarCredentialsUnavailable). See that class's docstring.
+
+    Looked up in Postgres in cloud mode (TURTLE_DEPLOY=cloud — the local
+    disk path below does not survive a serverless cold start), or
+    personal_memory_dir(user_id)/google_calendar_token.json locally.
+
+    Safe to call synchronously here: every caller in this module reaches
+    this via asyncio.to_thread (see create_calendar_event/
+    list_calendar_events's _sync_* helpers), so the Postgres read below
+    (psycopg, sync) never blocks the event loop.
+    """
+    stored: Optional[str] = None
+    if settings.is_cloud:
+        from core.storage.cloud.calendar_token_store import get_token_json
+
+        try:
+            stored = get_token_json(user_id)
+        except Exception as exc:
+            raise CalendarCredentialsUnavailable(
+                f"calendar token lookup failed for user_id={user_id!r}: {exc}"
+            ) from exc
+    else:
+        from core.paths import personal_memory_dir
+
+        token_path = personal_memory_dir(user_id) / "google_calendar_token.json"
+        try:
+            if token_path.exists():
+                stored = token_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            raise CalendarCredentialsUnavailable(
+                f"calendar token read failed for user_id={user_id!r}: {exc}"
+            ) from exc
+
+    if not stored:
+        return None  # genuine miss: no token stored for this user
+
+    # Transparently decrypts a key_version>=1 envelope, or returns a
+    # pre-encryption plaintext blob unchanged — see
+    # core/calendar_token_crypto.py and apps/calendar_oauth_routes.py's
+    # _read_token, which this mirrors (the connect-flow route module owns
+    # writing; this tool only ever reads).
+    #
+    # A decryption failure means the stored ciphertext EXISTS but cannot be
+    # read (wrong key, wrong AAD, tampering) — that is neither "no token"
+    # nor transient DB unavailability, and is arguably the most alarming of
+    # the three, so it is also reported as CalendarCredentialsUnavailable
+    # rather than silently treated as a missing token.
+    try:
+        from core.calendar_token_crypto import decrypt_stored, parse_key
+
+        key_secret = settings.calendar_token_key
+        key = parse_key(key_secret.get_secret_value()) if key_secret is not None else None
+        token_json, _key_version = decrypt_stored(stored, key, user_id=user_id)
+        return token_json
+    except Exception as exc:
+        raise CalendarCredentialsUnavailable(
+            f"stored calendar token for user_id={user_id!r} could not be decrypted: {exc}"
+        ) from exc
+
+
 def _load_token_json(user_id: Optional[str]) -> Optional[str]:
     """Resolve the OAuth2 user token JSON to use.
 
     Prefers the per-user token written by the in-app connect flow
-    (apps/calendar_oauth_routes.py, GET /integrations/google_calendar/connect):
-    Postgres in cloud mode (TURTLE_DEPLOY=cloud — the local disk path below
-    does not survive a serverless cold start), personal_memory_dir(user_id)/
-    google_calendar_token.json locally. Either way, each signed-in user's
-    calendar_create/calendar_list calls act on THEIR OWN calendar.
+    (apps/calendar_oauth_routes.py, GET /integrations/google_calendar/connect).
+    Each signed-in user's calendar_create/calendar_list calls act on THEIR
+    OWN calendar.
 
-    Falls back to the legacy global GOOGLE_CALENDAR_TOKEN_JSON env var for
-    single-tenant / dev deployments that predate the per-user connect flow, or
-    when no user_id is available (e.g. a non-web channel not yet resolved to
-    a per-user token).
+    Falls back to the legacy global GOOGLE_CALENDAR_TOKEN_JSON env var ONLY
+    for single-tenant / dev deployments that predate the per-user connect
+    flow — local mode AND no user_id given. WP2.B (ledger 2.8): once a
+    user_id is present, the per-user path is authoritative and the env
+    fallback must never be read — not on a miss, not on a lookup error, not
+    on a decryption failure. A transient DB error must not create events on
+    the operator's own calendar. Likewise, in cloud mode with no user_id
+    resolved at all, there is no per-user token to look up and no legacy
+    single-tenant deployment to fall back to, so this also returns None.
 
-    Safe to call synchronously here: every caller in this module reaches
-    _load_token_json via asyncio.to_thread (see create_calendar_event/
-    list_calendar_events's _sync_* helpers), so the Postgres read below
-    (psycopg, sync) never blocks the event loop.
+    May raise CalendarCredentialsUnavailable (see that class) when user_id
+    is given but we could not determine whether a token exists.
     """
     if user_id:
-        stored: Optional[str] = None
-        if settings.is_cloud:
-            try:
-                from core.storage.cloud.calendar_token_store import get_token_json
-
-                stored = get_token_json(user_id)
-            except Exception:
-                stored = None  # fall through to the legacy env var
-        else:
-            try:
-                from core.paths import personal_memory_dir
-                token_path = personal_memory_dir(user_id) / "google_calendar_token.json"
-                if token_path.exists():
-                    stored = token_path.read_text(encoding="utf-8")
-            except Exception:
-                stored = None  # fall through to the legacy env var
-        if stored:
-            # Transparently decrypts a key_version>=1 envelope, or returns a
-            # pre-encryption plaintext blob unchanged — see
-            # core/calendar_token_crypto.py and
-            # apps/calendar_oauth_routes.py's _read_token, which this mirrors
-            # (the connect-flow route module owns writing; this tool only
-            # ever reads).
-            try:
-                from core.calendar_token_crypto import decrypt_stored, parse_key
-
-                key_secret = settings.calendar_token_key
-                key = parse_key(key_secret.get_secret_value()) if key_secret is not None else None
-                token_json, _key_version = decrypt_stored(stored, key, user_id=user_id)
-                return token_json
-            except Exception:
-                pass  # fall through to the legacy env var
+        return _load_user_token_json(user_id)
+    if settings.is_cloud:
+        return None
     return settings.google_calendar_token_json
 
 
@@ -355,6 +411,10 @@ async def create_calendar_event(
     try:
         result = await asyncio.to_thread(_sync_create)
         return ToolResult.ok(result)
+    except CalendarCredentialsUnavailable as exc:
+        # WP2.B: distinct from "no token" — do not create the event, do not
+        # fall back to the legacy env var (see _load_token_json).
+        return ToolResult.invalid(str(exc), code="credentials_unavailable")
     except RuntimeError as exc:
         return ToolResult.invalid(str(exc), code="credentials_missing")
     except Exception as exc:
@@ -415,6 +475,10 @@ async def list_upcoming_events(
     try:
         result = await asyncio.to_thread(_sync_list)
         return ToolResult.ok(result)
+    except CalendarCredentialsUnavailable as exc:
+        # WP2.B: distinct from "no token" — do not list, do not fall back
+        # to the legacy env var (see _load_token_json).
+        return ToolResult.invalid(str(exc), code="credentials_unavailable")
     except RuntimeError as exc:
         return ToolResult.invalid(str(exc), code="credentials_missing")
     except Exception as exc:
