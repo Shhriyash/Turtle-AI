@@ -182,10 +182,18 @@ def get_pg_sync_pool() -> Any:
             # against code that starts using the pool immediately, and is
             # deprecated in favor of this explicit two-step form.
             open=False,
-            # Bound the connect handshake itself (mirrors get_pg_pool()'s
-            # timeout=10 above), not just query execution.
+            # ConnectionPool's own `timeout` bounds how long a CALLER waits
+            # to be handed a connection out of the pool (e.g. all 5 are
+            # checked out and busy) — it has nothing to do with the network
+            # connect handshake. Kept short for the same serverless reason
+            # as get_pg_pool()'s asyncpg timeout=10 above: don't let a
+            # caller block indefinitely on pool exhaustion.
             timeout=10,
-            connect_timeout=10,
+            # The actual connect-handshake bound (TCP/TLS/auth) is a libpq
+            # connection parameter, not a ConnectionPool.__init__ argument —
+            # psycopg_pool has no `connect_timeout` kwarg of its own; it
+            # passes `kwargs` through to every new connection it opens.
+            kwargs={"connect_timeout": 10},
             # psycopg_pool's own recommended liveness check: reject/replace
             # a connection from the pool that's gone stale (e.g. Neon
             # suspended the compute between invocations) instead of handing

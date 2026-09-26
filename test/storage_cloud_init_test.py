@@ -124,10 +124,49 @@ class GetPgSyncPoolKwargsTest(unittest.TestCase):
         self.assertEqual(kwargs.get("min_size"), 1)
         self.assertEqual(kwargs.get("max_size"), 5)
         self.assertEqual(kwargs.get("open"), False)
+        # `timeout` on ConnectionPool bounds waiting for a free connection
+        # FROM the pool; `connect_timeout` is a libpq per-connection param
+        # and must travel inside `kwargs=`, not as a direct constructor
+        # argument (ConnectionPool has no `connect_timeout` kwarg of its
+        # own — see GetPgSyncPoolRealConstructionTest below, which caught
+        # this exact shape being wrong against the real class).
         self.assertEqual(kwargs.get("timeout"), 10)
-        self.assertEqual(kwargs.get("connect_timeout"), 10)
+        self.assertEqual(kwargs.get("kwargs"), {"connect_timeout": 10})
+        self.assertNotIn(
+            "connect_timeout", kwargs,
+            "connect_timeout must be nested inside kwargs=, not passed directly",
+        )
         self.assertEqual(kwargs.get("check"), "check-connection-sentinel")
         self.assertTrue(captured.get("opened"), "pool.open() must be called explicitly after open=False")
+
+
+class GetPgSyncPoolRealConstructionTest(unittest.TestCase):
+    """A mocked constructor cannot validate a contract with a third-party
+    library — it only re-asserts what the code already believes the
+    signature is (this is exactly how a prior version of this WP shipped
+    `connect_timeout` as a direct ConnectionPool kwarg, which is not a
+    real parameter, and the mocked test above did not catch it). This test
+    builds a REAL psycopg_pool.ConnectionPool with open=False and an
+    unroutable DSN, so nothing actually connects, but construction alone
+    proves every kwarg name/shape here is accepted by the installed
+    psycopg_pool version."""
+
+    def setUp(self) -> None:
+        cloud._pg_sync_pool = None
+        self.addCleanup(setattr, cloud, "_pg_sync_pool", None)
+
+    def test_real_connection_pool_accepts_our_kwargs_unopened(self) -> None:
+        # TEST-NET-1 (RFC 5737): guaranteed non-routable, so even if `open`
+        # were mishandled this cannot reach a real network connection.
+        settings_stub = type(
+            "S", (), {"database_url": _FakeSecretStr("postgresql://u:p@192.0.2.1:5432/db")}
+        )()
+        with patch("core.storage.cloud.settings", settings_stub):
+            pool = cloud.get_pg_sync_pool()
+        try:
+            self.assertEqual(type(pool).__module__.split(".")[0], "psycopg_pool")
+        finally:
+            pool.close()
 
 
 class GetPgPoolKwargsTest(unittest.IsolatedAsyncioTestCase):
