@@ -429,17 +429,24 @@ class RetrievalBroker:
         which closes the synonym/semantic gap ("closest pal" → "Best Friend").
         """
         started = time.perf_counter()
-        if not str(query or "").strip() or self.sqlite_index is None:
+        if not str(query or "").strip():
             return ""
         normalized = _normalize_recall_query(query)
         if not normalized:
             return ""
 
-        try:
-            fts_hits = self.sqlite_index.search(normalized, limit=8)
-        except Exception as exc:
-            print(f"LOG: RetrievalBroker FTS5 search failed: {exc}")
+        # In cloud there is no lexical index at all (no SQLite). That is a
+        # deliberate branch, not a programming error to be caught below: skip
+        # FTS entirely and go straight to the vector fallback so personal
+        # recall still works in cloud instead of silently returning "".
+        if self.sqlite_index is None:
             fts_hits = []
+        else:
+            try:
+                fts_hits = self.sqlite_index.search(normalized, limit=8)
+            except Exception as exc:
+                print(f"LOG: RetrievalBroker FTS5 search failed: {exc}")
+                fts_hits = []
 
         top_overlap = (
             _token_overlap(normalized, _row_searchable_text(fts_hits[0])) if fts_hits else 0.0
