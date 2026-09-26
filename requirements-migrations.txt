@@ -1,0 +1,34 @@
+# requirements-migrations.txt
+# ----------------------------
+# Alembic (ledger 3.1) — needed ONLY to run `alembic upgrade head`/`alembic
+# downgrade` against the cloud Postgres schema (migrations/, alembic.ini).
+# Neither the running app nor any Vercel function imports it at runtime, and
+# bundling it into requirements.txt (which vercel.json ships straight into
+# the production function) would pay a real cold-start/size cost for a
+# dependency production never touches. Mirrors requirements-local.txt's own
+# house pattern of an install-time-only, non-runtime manifest kept separate
+# from requirements.txt and named in vercel.json's functions.excludeFiles.
+#
+# SQLAlchemy (Alembic's own hard dependency) is deliberately NOT pinned here.
+# requirements.txt already declares `sqlalchemy>=2.0` under its "Scheduler
+# (Phase 4 / E1)" section — a genuine, pre-existing, unrelated-to-Alembic
+# runtime dependency (core/routine_scheduler.py's apscheduler.jobstores.
+# sqlalchemy import, used by both the local RoutineScheduler and the cloud
+# cron-tick handler's helper functions from that same module). Installing
+# `alembic` here lets pip resolve a SQLAlchemy version compatible with
+# whatever requirements.txt already pulled in, rather than fighting it with a
+# second, differently-pinned constraint on the same package.
+#
+# Installed by:
+#   - .github/workflows/deploy-vercel.yml's "Install Alembic" step, before
+#     `alembic upgrade head` runs against production (that job also installs
+#     psycopg directly alongside this file, since it does not install
+#     requirements.txt at all).
+#   - .github/workflows/tests.yml's `cloud-tests` job (installed AFTER
+#     requirements.txt), so test/cloud_integration/migrations_schema_parity_test.py
+#     can run a real `alembic upgrade head` subprocess against the CI
+#     Postgres container.
+#
+# Install with: pip install -r requirements.txt -r requirements-migrations.txt
+
+alembic==1.16.5
