@@ -17,13 +17,11 @@ Auth model:
 """
 from __future__ import annotations
 
-import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import jwt
-import aiosqlite
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, EmailStr
@@ -32,6 +30,7 @@ from core.config import settings
 from core.identity import identity_manager, normalize_email
 from core.paths import PERSONAL_MEMORY_DIR, RAG_DATA_DIR
 from core.telemetry import emit as emit_event
+from core.tenant_purge import purge_user as _purge_user
 
 
 ALGORITHM = "HS256"
@@ -122,28 +121,48 @@ def _last_seen(user_dir: Path) -> str | None:
 
 @router.get("/admin/users")
 async def admin_users(x_admin_token: str | None = Header(default=None)) -> JSONResponse:
-    """Return a list of users with rough usage metrics. Read-only."""
+    """Return a list of users with rough usage metrics. Read-only.
+
+    Goes through identity_manager.list_users() (the async surface both
+    IdentityManager and PostgresIdentityManager expose) instead of a raw
+    ``aiosqlite.connect(identity_manager.db_path)`` query — that attribute
+    only exists on the local manager, so the old direct-SQLite version raised
+    AttributeError on every call in cloud mode.
+
+    The per-user filesystem stats (storage_bytes/rag_bytes/journal_events/
+    last_seen) only mean anything against local disk — cloud mode has no
+    such filesystem, so those fields are reported as null there rather than
+    walking a directory tree that doesn't exist for that deploy.
+    """
     _require_admin(x_admin_token)
 
     await identity_manager.init_db()
+    rows = await identity_manager.list_users()
 
     users: list[dict[str, Any]] = []
-    async with aiosqlite.connect(identity_manager.db_path) as db:
-        async with db.execute(
-            "SELECT user_id, primary_email, created_at FROM users ORDER BY created_at DESC"
-        ) as cursor:
-            rows = await cursor.fetchall()
-    for user_id, primary_email, created_at in rows:
-        user_dir = PERSONAL_MEMORY_DIR / user_id
-        users.append({
+    for row in rows:
+        user_id = row["user_id"]
+        entry: dict[str, Any] = {
             "user_id": user_id,
-            "primary_email": primary_email,
-            "created_at": created_at,
-            "storage_bytes": _dir_size_bytes(user_dir),
-            "rag_bytes": _dir_size_bytes(RAG_DATA_DIR / user_id),
-            "journal_events": _journal_event_count(user_dir),
-            "last_seen": _last_seen(user_dir),
-        })
+            "primary_email": row["primary_email"],
+            "created_at": row["created_at"],
+        }
+        if settings.is_cloud:
+            entry.update({
+                "storage_bytes": None,
+                "rag_bytes": None,
+                "journal_events": None,
+                "last_seen": None,
+            })
+        else:
+            user_dir = PERSONAL_MEMORY_DIR / user_id
+            entry.update({
+                "storage_bytes": _dir_size_bytes(user_dir),
+                "rag_bytes": _dir_size_bytes(RAG_DATA_DIR / user_id),
+                "journal_events": _journal_event_count(user_dir),
+                "last_seen": _last_seen(user_dir),
+            })
+        users.append(entry)
 
     return JSONResponse({
         "users": users,
@@ -189,17 +208,15 @@ async def forget_me_start(req: Request, body: ForgetMeRequest) -> JSONResponse:
     email = normalize_email(body.email)
     await identity_manager.init_db()
 
-    # Resolve without creating — only act when the user exists.
-    async with aiosqlite.connect(identity_manager.db_path) as db:
-        async with db.execute(
-            "SELECT user_id FROM channel_mappings WHERE channel = ? AND channel_user_id = ?",
-            ("web_email", email),
-        ) as cursor:
-            row = await cursor.fetchone()
+    # Resolve without creating — only act when the user exists. lookup_user
+    # is the shared non-minting async surface both managers expose (see
+    # core/identity.py); this used to be a raw
+    # aiosqlite.connect(identity_manager.db_path) query, which raised
+    # AttributeError in cloud mode (PostgresIdentityManager has no db_path).
+    user_id = await identity_manager.lookup_user("web_email", email)
     # Always return 200 so existence of the email is not leaked.
-    if not row:
+    if not user_id:
         return JSONResponse({"status": "sent"})
-    user_id = row[0]
 
     ttl = max(1, int(settings.magic_link_jwt_ttl_minutes))
     expire = datetime.now(UTC) + timedelta(minutes=ttl)
@@ -238,39 +255,6 @@ async def forget_me_start(req: Request, body: ForgetMeRequest) -> JSONResponse:
 
     emit_event("forget_me_requested", user_id=user_id)
     return JSONResponse({"status": "sent"})
-
-
-async def _purge_user(user_id: str) -> dict[str, Any]:
-    """Hard-delete every artifact tied to a user_id."""
-    removed: dict[str, Any] = {"memory": False, "rag": False, "rows": 0}
-
-    memory_dir = PERSONAL_MEMORY_DIR / user_id
-    if memory_dir.exists():
-        # This rmtree also removes account.json (it lives inside memory_dir).
-        # That is REQUIRED, not incidental: the marker is the durable email->id
-        # binding resolve_user() rebinds from, so it MUST die with the dir or a
-        # purged user could be silently resurrected on the next onboarding.
-        # Nothing else to delete for the marker — it has no separate location.
-        shutil.rmtree(memory_dir, ignore_errors=True)
-        removed["memory"] = not memory_dir.exists()
-
-    rag_dir = RAG_DATA_DIR / user_id
-    if rag_dir.exists():
-        shutil.rmtree(rag_dir, ignore_errors=True)
-        removed["rag"] = not rag_dir.exists()
-
-    async with aiosqlite.connect(identity_manager.db_path) as db:
-        cursor = await db.execute(
-            "DELETE FROM channel_mappings WHERE user_id = ?", (user_id,)
-        )
-        removed["rows"] += cursor.rowcount or 0
-        cursor = await db.execute(
-            "DELETE FROM users WHERE user_id = ?", (user_id,)
-        )
-        removed["rows"] += cursor.rowcount or 0
-        await db.commit()
-
-    return removed
 
 
 @router.get("/forget-me/confirm")
