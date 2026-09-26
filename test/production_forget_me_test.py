@@ -2,8 +2,11 @@
 Phase 7 — /forget-me purge.
 
 The endpoint is the GDPR backstop. The test pins the deletion semantics:
-when ``_purge_user`` runs, the user's memory dir, RAG dir, and SQLite rows
-must all be gone.
+when ``_purge_user`` (now core.tenant_purge.purge_user, re-exported by
+apps.admin_routes as ``_purge_user`` — WP 2.A / ledger 2.3) runs, the user's
+memory dir, RAG dir, and SQLite rows must all be gone. Local-mode behaviour
+is unchanged; see test/cloud_integration/tenant_purge_cloud_test.py for the
+cloud-mode equivalent.
 """
 from __future__ import annotations
 
@@ -16,10 +19,12 @@ from pathlib import Path
 try:
     import aiosqlite  # noqa: F401
     from apps import admin_routes
+    from core import tenant_purge as tenant_purge_mod
     _IMPORT_ERROR: Exception | None = None
 except Exception as _e:  # pragma: no cover — missing optional deps in test env
     _IMPORT_ERROR = _e
     admin_routes = None  # type: ignore[assignment]
+    tenant_purge_mod = None  # type: ignore[assignment]
 
 from core import paths as paths_mod
 from core.identity import identity_manager
@@ -30,17 +35,24 @@ class ForgetMePurgeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path("test") / "_tmp" / f"forget_me_{uuid.uuid4().hex}"
         self.tmp.mkdir(parents=True, exist_ok=True)
-        # Redirect every on-disk location the purge touches.
+        # Redirect every on-disk location the purge touches. The actual
+        # rmtree logic now lives in core/tenant_purge.py, so that module's
+        # own PERSONAL_MEMORY_DIR/RAG_DATA_DIR bindings need patching too —
+        # admin_routes' own copies are only used by /admin/users now.
         self._orig_personal = paths_mod.PERSONAL_MEMORY_DIR
         self._orig_rag = paths_mod.RAG_DATA_DIR
         self._orig_admin_personal = admin_routes.PERSONAL_MEMORY_DIR
         self._orig_admin_rag = admin_routes.RAG_DATA_DIR
+        self._orig_purge_personal = tenant_purge_mod.PERSONAL_MEMORY_DIR
+        self._orig_purge_rag = tenant_purge_mod.RAG_DATA_DIR
         self._orig_db = identity_manager.db_path
 
         paths_mod.PERSONAL_MEMORY_DIR = self.tmp / "personal"
         paths_mod.RAG_DATA_DIR = self.tmp / "rag"
         admin_routes.PERSONAL_MEMORY_DIR = paths_mod.PERSONAL_MEMORY_DIR
         admin_routes.RAG_DATA_DIR = paths_mod.RAG_DATA_DIR
+        tenant_purge_mod.PERSONAL_MEMORY_DIR = paths_mod.PERSONAL_MEMORY_DIR
+        tenant_purge_mod.RAG_DATA_DIR = paths_mod.RAG_DATA_DIR
         identity_manager.db_path = self.tmp / "users.sqlite"
 
     def tearDown(self) -> None:
@@ -48,6 +60,8 @@ class ForgetMePurgeTests(unittest.TestCase):
         paths_mod.RAG_DATA_DIR = self._orig_rag
         admin_routes.PERSONAL_MEMORY_DIR = self._orig_admin_personal
         admin_routes.RAG_DATA_DIR = self._orig_admin_rag
+        tenant_purge_mod.PERSONAL_MEMORY_DIR = self._orig_purge_personal
+        tenant_purge_mod.RAG_DATA_DIR = self._orig_purge_rag
         identity_manager.db_path = self._orig_db
         shutil.rmtree(self.tmp, ignore_errors=True)
 
