@@ -29,7 +29,7 @@ class _FakeCursor:
 
 class _FakeConn:
     def __init__(self, table: dict):
-        self.table = table  # code -> dict(channel, channel_user_id, source_user_id, expires_at, consumed_at, reserved_for, reserved_at)
+        self.table = table  # code -> dict(channel, channel_user_id, source_user_id, expires_at, consumed_at, reserved_for, reserved_at, expected_email)
 
     def execute(self, sql: str, params=None):
         sql_norm = " ".join(sql.split())
@@ -40,19 +40,23 @@ class _FakeConn:
                     del self.table[code]
             return _FakeCursor(None)
         if sql_norm.startswith("INSERT INTO link_codes"):
-            code, channel, channel_user_id, source_user_id, expires_at = params
+            code, channel, channel_user_id, source_user_id, expires_at, expected_email = params
             self.table[code] = {
                 "channel": channel, "channel_user_id": channel_user_id,
                 "source_user_id": source_user_id, "expires_at": expires_at,
                 "consumed_at": None, "reserved_for": None, "reserved_at": None,
+                "expected_email": expected_email,
             }
             return _FakeCursor(None)
-        if sql_norm.startswith("SELECT channel, channel_user_id, source_user_id, expires_at, consumed_at FROM link_codes"):
+        if sql_norm.startswith("SELECT channel, channel_user_id, source_user_id, expires_at, consumed_at, expected_email FROM link_codes"):
             code = params[0]
             row = self.table.get(code)
             if row is None:
                 return _FakeCursor(None)
-            return _FakeCursor((row["channel"], row["channel_user_id"], row["source_user_id"], row["expires_at"], row["consumed_at"]))
+            return _FakeCursor((
+                row["channel"], row["channel_user_id"], row["source_user_id"],
+                row["expires_at"], row["consumed_at"], row.get("expected_email"),
+            ))
         if sql_norm.startswith("UPDATE link_codes SET reserved_for = NULL"):
             code, target_user_id = params
             row = self.table.get(code)
@@ -126,6 +130,21 @@ class PostgresLinkCodeStoreTest(unittest.TestCase):
         self.assertIsNotNone(peeked)
         self.assertEqual(peeked.channel, "discord")
         self.assertEqual(peeked.source_user_id, "usr_src")
+        self.assertIsNone(peeked.expected_email)
+
+    def test_issue_normalizes_and_carries_expected_email(self) -> None:
+        issued = self.store.issue(
+            channel="discord", channel_user_id="123", source_user_id="usr_src",
+            expected_email="  Me@Example.COM  ",
+        )
+        self.assertEqual(issued.expected_email, "me@example.com")
+        peeked = self.store.peek(issued.code)
+        self.assertEqual(peeked.expected_email, "me@example.com")
+        status, claim = self.store.reserve(issued.code, "usr_target")
+        self.assertEqual(status, "ok")
+        self.assertEqual(claim.expected_email, "me@example.com")
+        consumed = self.store.consume(issued.code)
+        self.assertEqual(consumed.expected_email, "me@example.com")
 
     def test_issue_drops_previous_unconsumed_code_for_same_identity(self) -> None:
         first = self.store.issue(channel="discord", channel_user_id="123", source_user_id="usr_src")

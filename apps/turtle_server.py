@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import functools
 import base64
 import hashlib
 import hmac
@@ -100,7 +101,14 @@ from core.email_flow import (
     validate_recipients,
     validate_send_email_args,
 )
-from core.output_clean import clean_text_for_model, clean_text_for_tts, clean_text_for_display
+from core.output_clean import (
+    clean_text_for_model,
+    clean_text_for_tts,
+    clean_text_for_display,
+    sanitize_for_envelope,
+    wrap_untrusted,
+    extract_tool_result_urls,
+)
 from core.confirmation_gate import ConfirmationGate
 from core.guardrails import StorageCapExceededError, WebSocketRateLimitExceeded
 from core.storage.factory import get_channel_gate_buffer, get_ws_rate_limiter
@@ -442,6 +450,12 @@ class SharedState:
     # Phase 1: the memory block for the current turn. Delivered to the model
     # via per-turn instructions (never inside the persisted user prompt).
     memory_context: str = ""
+    # WP1.H: URLs a TOOL actually returned this turn (extracted from the
+    # sanitised, pre-envelope text at the registration-loop wrapper). Reset
+    # at the top of each turn; the "done" frame carries this list so the
+    # client can allow-list anchors instead of trusting anything the model
+    # wrote in prose.
+    tool_sourced_urls: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -829,6 +843,46 @@ def _truncate_tool_output(text: str, *, label: str) -> str:
         f"{text[:TOOL_OUTPUT_MAX_CHARS]}\n\n"
         f"[Output truncated: {label} was too long. Ask follow-up questions for specific details.]"
     )
+
+
+def _wrap_tool_with_envelope(name: str, fn):
+    """Wrap a registered tool's coroutine so its return is always the
+    sanitised, enveloped ``<untrusted source="name">...</untrusted>`` text —
+    see the WP1.H comment at the call site (``_register_tools``) for why this
+    is the one place that can cover all twelve tools regardless of what each
+    closure returns internally.
+
+    ``functools.wraps`` matters beyond cosmetics here: pydantic-ai builds each
+    tool's arguments schema from ``inspect.signature``/``get_type_hints`` on
+    the function object passed to ``Agent.tool()``. Both follow the
+    ``__wrapped__`` pointer ``functools.wraps`` sets, so the wrapper — despite
+    taking ``*args, **kwargs`` — is introspected as if it were the original
+    ``(ctx, args)`` closure, and pydantic-ai builds the correct schema.
+    """
+
+    @functools.wraps(fn)
+    async def _wrapped(*args, **kwargs):
+        raw = await fn(*args, **kwargs)
+        raw = raw if isinstance(raw, str) else str(raw)
+        sanitized = sanitize_for_envelope(raw, max_chars=TOOL_OUTPUT_MAX_CHARS)
+
+        # Collect this turn's tool-sourced URLs onto SharedState (first
+        # positional arg is always `ctx: RunContext[SharedState]` per the
+        # tool signatures above) so the "done" frame can allow-list them.
+        ctx = args[0] if args else kwargs.get("ctx")
+        deps = getattr(ctx, "deps", None)
+        url_bucket = getattr(deps, "tool_sourced_urls", None)
+        if url_bucket is not None:
+            try:
+                for _url in extract_tool_result_urls(sanitized):
+                    if _url not in url_bucket:
+                        url_bucket.append(_url)
+            except Exception:
+                pass
+
+        return wrap_untrusted(name, sanitized)
+
+    return _wrapped
 
 
 def _compose_prompt_with_memory(user_text: str, memory_context: str | list[str]) -> str:
@@ -1792,6 +1846,22 @@ class RememberArgs(_RememberBaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# link_account tool args (WP1.J — two-sided link-code binding, ledger 1b.6)
+# ---------------------------------------------------------------------------
+class LinkAccountArgs(_RememberBaseModel):
+    expected_email: str = _RememberField(
+        ...,
+        description=(
+            "The email address of the Turtle WEB account the user will sign in "
+            "with to finish linking. Ask for it if they haven't given it. This is "
+            "never treated as proof of anything by itself — the authenticated web "
+            "session is still what proves ownership — it only lets the server "
+            "refuse a code redeemed by the wrong account."
+        ),
+    )
+
+
 def _build_model_from_str(model_str: str, settings: Any) -> Any | None:
     """Parse 'provider:model_name' and return a pydantic-ai model object."""
     if not model_str:
@@ -2352,7 +2422,7 @@ class AgentManager:
                 return ToolResult.empty("No relevant information found.").to_agent_string()
             return ToolResult.ok(recall_text).to_agent_string()
 
-        async def link_account(ctx: RunContext[SharedState]) -> str:
+        async def link_account(ctx: RunContext[SharedState], args: LinkAccountArgs) -> str:
             """Issue a claim code to link this channel identity to a web account."""
             deps = ctx.deps
             channel = str(getattr(deps, "channel", "") or "")
@@ -2375,6 +2445,21 @@ class AgentManager:
                     "first would end up with your memory. Send me a direct "
                     "message and I'll set it up there."
                 ).to_agent_string()
+            # Two-sided binding (WP1.J, ledger 1b.6): the caller states which web
+            # account they intend to redeem with. This is NOT trusted as proof of
+            # anything — the authenticated web session at redemption is still the
+            # only thing that proves account ownership — it only lets redemption
+            # REFUSE a session that doesn't match. See core/account_linking.py's
+            # module docstring for the full threat-model writeup.
+            from core.identity import normalize_email
+
+            expected_email = normalize_email(args.expected_email)
+            if not expected_email or "@" not in expected_email:
+                return ToolResult.invalid(
+                    "I need the email address of the Turtle web account you'll "
+                    "sign in with to finish linking — that's what lets me refuse "
+                    "the code if anyone but you tries to redeem it."
+                ).to_agent_string()
             try:
                 from core.account_linking import LINK_CODE_TTL_MINUTES
                 from core.storage.factory import get_link_code_store
@@ -2385,6 +2470,7 @@ class AgentManager:
                     channel=channel,
                     channel_user_id=channel_uid,
                     source_user_id=deps.user_id,
+                    expected_email=expected_email,
                 )
             except Exception as e:
                 return ToolResult.upstream_error(
@@ -2392,9 +2478,10 @@ class AgentManager:
                 ).to_agent_string()
             return ToolResult.ok(
                 f"Link code: {issued.code}\n"
-                f"To finish linking, sign in to Turtle on the web and enter this code "
-                f"in Settings -> Link account. It expires in {LINK_CODE_TTL_MINUTES} minutes "
-                f"and can only be used once. Signing in is what proves the web account is "
+                f"To finish linking, sign in to Turtle on the web as {expected_email} and "
+                f"enter this code in Settings -> Link account. It expires in "
+                f"{LINK_CODE_TTL_MINUTES} minutes, can only be used once, and only that "
+                f"account can redeem it. Signing in is what proves the web account is "
                 f"yours — I can't link on an email address alone."
             ).to_agent_string()
 
@@ -2618,6 +2705,21 @@ class AgentManager:
             ("remember", remember),
             ("link_account", link_account),
         ]
+        # WP1.H (ledger 1b.2): every tool result is attacker-influenced text
+        # (a fetched page, a search snippet, a place review) handed to the
+        # model with nothing marking it as data. Of the twelve tools above,
+        # five never call ToolResult.to_agent_string() on their happy path,
+        # two never touch ToolResult at all, and one re-wraps a
+        # to_agent_string() value through clean_text_for_model — four
+        # distinct return shapes. An envelope placed inside any one of those
+        # shapes would cover under half the surface while looking complete.
+        # This registration loop is the one place every tool's return passes
+        # through regardless of its internal shape, so the envelope is
+        # applied here, once, to all twelve.
+        _tool_registry = [
+            (_name, _wrap_tool_with_envelope(_name, _fn))
+            for _name, _fn in _tool_registry
+        ]
         for _target_agent in [self.main_assistant, *self.main_assistant_fallbacks]:
             for _contract_name, _tool_fn in _tool_registry:
                 _target_agent.tool(description=_load_tool_contract(_contract_name))(_tool_fn)
@@ -2769,6 +2871,44 @@ async def _validate_google_calendar_credentials() -> None:
         print("LOG: GOOGLE_CALENDAR_CREDENTIALS_JSON is valid (client_id + client_secret present).")
     else:
         print(f"LOG: WARNING - GOOGLE_CALENDAR_CREDENTIALS_JSON is misconfigured: {message}")
+
+
+@app.on_event("startup")
+async def _warn_on_missing_calendar_token_key() -> None:
+    """Loudly flag CALENDAR_TOKEN_KEY being unset in cloud mode.
+
+    core/config.py's field_validator already catches a MALFORMED key at
+    settings-construction time (before this even runs) — that one fails
+    process boot outright, because a malformed key is unambiguously a typo
+    to fix before anything else happens. An UNSET key in cloud is different:
+    it is a valid, working configuration for a deploy that simply hasn't
+    wired up Calendar OAuth token encryption yet, and calendar is one
+    optional integration — the rest of the app (chat, memory, every other
+    tool) works fine without it. So this warns instead of refusing to start,
+    mirroring _warn_on_vercel_deploy_mode_mismatch above rather than
+    _require_cloud_backends_configured's refuse-to-boot posture: without
+    this warning, the only signal an operator gets is a user hitting a 503
+    on /integrations/google_calendar/callback — possibly days after
+    deploying, and reported as a complaint rather than caught in logs.
+
+    No-op in local mode: CALENDAR_TOKEN_KEY there is optional by design
+    (falls back to plaintext-on-disk, today's dev-box behaviour — see
+    core/calendar_token_crypto.py), so an unset key locally is not
+    noteworthy.
+    """
+    if not settings.is_cloud:
+        return
+    if settings.calendar_token_key is not None:
+        return
+    print(
+        "LOG: WARNING - CALENDAR_TOKEN_KEY is unset in cloud mode. Google "
+        "Calendar connections will be refused (503 on "
+        "/integrations/google_calendar/callback) rather than silently "
+        "storing tokens unencrypted in Postgres. Generate one with: "
+        "python -c \"import secrets, base64; print(base64.urlsafe_b64encode"
+        "(secrets.token_bytes(32)).decode())\" and set CALENDAR_TOKEN_KEY.",
+        flush=True,
+    )
 
 
 @app.on_event("startup")
@@ -3751,6 +3891,42 @@ async def confirm_memory(request: Request):
     return JSONResponse({"status": "ok", "applied": accepted})
 
 
+async def _get_target_account_email(user_id: str) -> str | None:
+    """The authoritative email on file for ``user_id`` (the ``users.primary_email``
+    column) — used ONLY to check the two-sided link binding (WP1.J, ledger
+    1b.6). Deliberately a raw query against the SAME `users` table
+    core.identity.IdentityManager / core.storage.cloud.identity_store.
+    PostgresIdentityManager already own, rather than a new method on either —
+    both files belong to a parallel WP and are not touched here. This value
+    is NOT something the redeemer supplies; it's whatever the web sign-in
+    flow (magic-link claim / dev fast-path) already put in the users table,
+    so there is nothing for a redeemer to spoof by typing a different email
+    into this endpoint.
+    """
+    if not user_id:
+        return None
+    if settings.is_cloud:
+        from core.storage.cloud import get_pg_pool
+
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT primary_email FROM users WHERE user_id = $1", user_id
+            )
+            return row["primary_email"] if row else None
+
+    import aiosqlite
+
+    from core.identity import identity_manager
+
+    async with aiosqlite.connect(identity_manager.db_path) as db:
+        async with db.execute(
+            "SELECT primary_email FROM users WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
 @app.post("/api/account/link")
 async def link_account_redeem(request: Request):
     """Redeem a channel claim code against the CALLER's authenticated account.
@@ -3760,6 +3936,11 @@ async def link_account_redeem(request: Request):
     authentication proves they own the target Turtle account. Neither alone is
     sufficient, which is why linking is never done from a self-claimed email —
     that would let anyone inherit another person's memory.
+
+    WP1.J two-sided binding: if the code names an expected redeemer email
+    (claim.expected_email), the authenticated caller's own account email must
+    match it or redemption is refused — see the binding check below for the
+    full reasoning.
 
     On success the channel mapping is re-pointed at the caller and the channel
     account's memory is folded into theirs.
@@ -3810,6 +3991,34 @@ async def link_account_redeem(request: Request):
             {"error": "That code is invalid or has expired"}, status_code=400
         )
     assert claim is not None  # status=="ok" always yields a claim
+
+    # ── TWO-SIDED BINDING (WP1.J, ledger 1b.6) ───────────────────────────────
+    # claim.expected_email is what the channel-side issuer said their web
+    # account would be — a self-claimed assertion that proves nothing by
+    # itself, so it is never used to grant anything. It is only ever used to
+    # REFUSE a redeemer whose actually-authenticated account doesn't match,
+    # closing the gap where ANY authenticated session (not just the one the
+    # channel user intended) could previously redeem a leaked/intercepted
+    # code. A code minted before this shipped has expected_email=None and is
+    # treated as unbound — see core/account_linking.py's module docstring for
+    # why that's the deliberate, TTL-bounded choice, not an oversight.
+    #
+    # The mismatch response is byte-for-byte the SAME "invalid or expired"
+    # 400 used above for an unknown/locked code (never a distinct message or
+    # status): a prober holding a stolen code who tries authenticating as
+    # different accounts must not be able to learn "wrong account" vs "code
+    # doesn't exist" vs "someone else already claimed it" — that would turn
+    # this endpoint into an oracle for which email a given code is bound to.
+    if claim.expected_email:
+        target_email = await _get_target_account_email(user_id)
+        if not target_email or target_email.strip().lower() != claim.expected_email:
+            # Release rather than let the wrong target squat on the
+            # reservation for the full 60s TTL — the intended redeemer should
+            # not have to wait out someone else's failed attempt.
+            await asyncio.to_thread(release_reservation, store, code, user_id)
+            return JSONResponse(
+                {"error": "That code is invalid or has expired"}, status_code=400
+            )
 
     if claim.source_user_id == user_id:
         # Nothing to merge; burn the reservation so it can't be replayed.
@@ -4972,6 +5181,10 @@ async def _execute_turn(
     """
     timings: dict[str, float] = {}
     overall_start = time.time()
+    # WP1.H: reset this turn's tool-sourced URL bucket. Populated by the
+    # envelope wrapper (_wrap_tool_with_envelope) as tools run below, read
+    # when the "done" frame is sent.
+    state.tool_sourced_urls = []
     # Hoisted to the top (rather than created just before the agent call, as
     # it used to be) so it exists on EVERY exit path — including one that
     # raises before ever reaching the agent call — for
@@ -5115,7 +5328,11 @@ async def _execute_turn(
         # Send complete response. The chat gets the display-cleaned text (markdown
         # links preserved → clickable), while final_output (links flattened) feeds
         # TTS/RAG.
-        await _emit(ws, {"type": "done", "content": clean_text_for_display(response.output)})
+        await _emit(ws, {
+            "type": "done",
+            "content": clean_text_for_display(response.output),
+            "tool_urls": list(state.tool_sourced_urls),
+        })
 
         # Update session
         message_history = _persist_history(message_history, response)
@@ -5267,6 +5484,8 @@ async def _execute_turn_streaming(
     the caller can transparently fall back to the batch path for this turn.
     """
     # --- pre-run: identical inputs to the batch path -----------------------
+    # WP1.H: reset this turn's tool-sourced URL bucket (mirrors _execute_turn).
+    state.tool_sourced_urls = []
     if state.user_id:
         emit_event_once(state.user_id, "first_message_sent", channel=channel)
 
@@ -5371,7 +5590,11 @@ async def _execute_turn_streaming(
 
     # Send the full reply text for the transcript UI once synthesis is underway.
     # Display-cleaned (markdown links preserved) so the chat renders clickable links.
-    await _ws_send_json(ws, {"type": "done", "content": clean_text_for_display(collector.output or "")})
+    await _ws_send_json(ws, {
+        "type": "done",
+        "content": clean_text_for_display(collector.output or ""),
+        "tool_urls": list(state.tool_sourced_urls),
+    })
 
     # --- post-run: identical bookkeeping to the batch path -----------------
     message_history = _persist_history(message_history, collector)
