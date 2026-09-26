@@ -40,11 +40,22 @@ def _tables_in_ddl() -> set[str]:
 def test_table_enumeration_matches_ddl() -> None:
     found = _tables_in_ddl()
     enumerated = set(table_enumeration().keys())
+    missing = found - enumerated
+    stale = enumerated - found
     assert enumerated == found, (
         "core/tenant_purge.py's table enumeration is out of sync with the "
         f"DDL under core/storage/cloud/. Missing from the enumeration: "
-        f"{found - enumerated}; stale entries no longer backed by any DDL: "
-        f"{enumerated - found}"
+        f"{missing}; stale entries no longer backed by any DDL: {stale}. "
+        "Fix is one of two things, not a third: (1) if the new table holds "
+        "durable per-user data an erasure request must cover, add it to "
+        "core/tenant_purge.py's _TABLE_USER_COLUMNS with the column(s) that "
+        "identify the user (see telemetry_once there for a worked example, "
+        "including how to flag a real consequence of purging it); or (2) if "
+        "it must NEVER be purged (it's data ABOUT the purge itself, or "
+        "otherwise not user data an erasure request covers — purge_log is "
+        "the existing example), add it to this test's own "
+        "_INTENTIONALLY_UNPURGED_TABLES with a comment saying which and why. "
+        "Do not silence this test any other way — that is what it's for."
     )
 
 

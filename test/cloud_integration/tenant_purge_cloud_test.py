@@ -51,6 +51,7 @@ async def _ensure_all_tables() -> None:
     from core.storage.cloud.rag_session_staging_store import _CREATE_TABLE_SQL as _RAG_STAGE_SQL
     from core.storage.cloud.routine_last_fired_store import _CREATE_TABLE_SQL as _RLF_SQL
     from core.storage.cloud.routine_outbox_store import _CREATE_TABLE_SQL as _OUTBOX_SQL
+    from core.storage.cloud.telemetry_claim_store import _CREATE_TABLE_SQL as _TELEMETRY_SQL
 
     statements = list(_IDENTITY_SQLS) + list(_PM_SQLS) + [
         _LINK_CODES_SQL,
@@ -63,6 +64,7 @@ async def _ensure_all_tables() -> None:
         _RAG_STAGE_SQL,
         _RLF_SQL,
         _OUTBOX_SQL,
+        _TELEMETRY_SQL,
     ]
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
@@ -157,6 +159,10 @@ async def _seed_all_tables(user_id: str, *, other_user_id: str) -> None:
         )
         await conn.execute(
             "INSERT INTO confirmation_state (user_id, pending) VALUES ($1, '[]'::jsonb)",
+            user_id,
+        )
+        await conn.execute(
+            "INSERT INTO telemetry_once (user_id, event) VALUES ($1, 'first_message')",
             user_id,
         )
 

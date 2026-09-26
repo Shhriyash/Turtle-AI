@@ -22,12 +22,14 @@ Cloud mode, in this order:
      never aborts the purge — mirrors /disconnect's own posture: the
      user-controllable, local half of an erasure request must not be held
      hostage by an upstream call.
-  2. Delete every row keyed to this user across all 16 cloud tables, in ONE
-     asyncpg transaction — hard delete is the only shape that can actually
-     promise erasure. See _TABLE_USER_COLUMNS for the enumeration (and
-     test/cloud_integration/tenant_purge_cloud_test.py's DDL cross-check,
-     which fails the next time a table is added here without a matching
-     _TABLE_USER_COLUMNS entry).
+  2. Delete every row keyed to this user across every purgeable cloud table,
+     in ONE asyncpg transaction — hard delete is the only shape that can
+     actually promise erasure. See _TABLE_USER_COLUMNS below for the
+     enumeration (its count drifts as tables are added; don't hard-code it
+     in prose) and test/tenant_purge_enumeration_test.py's DDL cross-check,
+     which fails the next time a table is added anywhere in
+     core/storage/cloud/ without a matching _TABLE_USER_COLUMNS entry (or a
+     documented exclusion, for the rare table that must never be purged).
   3. Delete the user's Redis keys (spend counter, places-cap, ws-rate,
      live-delivery channel, channel-gate buffer, idempotency keys) — see
      _redis_patterns_for_user for the exact patterns and why 3 other key
@@ -47,19 +49,36 @@ from core.paths import PERSONAL_MEMORY_DIR, RAG_DATA_DIR
 # ---------------------------------------------------------------------------
 # Cloud table enumeration (ledger 2.3's "the enumeration IS the deliverable").
 #
-# One entry per CREATE TABLE IF NOT EXISTS found under core/storage/cloud/.
-# test/cloud_integration/tenant_purge_cloud_test.py::test_table_enumeration_
-# matches_ddl greps every core/storage/cloud/*.py module for its own
+# One entry per CREATE TABLE IF NOT EXISTS found under core/storage/cloud/
+# that holds DURABLE, PER-USER data an erasure request must cover.
+# test/tenant_purge_enumeration_test.py::test_table_enumeration_matches_ddl
+# greps every core/storage/cloud/*.py module for its own
 # "CREATE TABLE IF NOT EXISTS <name>" statements and asserts this dict's key
-# set is IDENTICAL — a purge that silently omits a newly-added table is worse
-# than one that fails loudly, so the next table added anywhere in
-# core/storage/cloud/ without a matching entry here fails that test instead
-# of shipping a quiet gap.
+# set is IDENTICAL (minus the deliberate exclusions documented at that
+# test's _INTENTIONALLY_UNPURGED_TABLES) — a purge that silently omits a
+# newly-added table is worse than one that fails loudly, so the next table
+# added anywhere in core/storage/cloud/ without EITHER a matching entry here
+# OR a documented exclusion at that test fails it instead of shipping a
+# quiet gap. That test's own failure message points here for the fix.
 #
 # link_codes is the one two-column case: a code either ORIGINATES from this
 # user (source_user_id) or is RESERVED for this user by a redemption in
 # flight (reserved_for) — see core/storage/cloud/account_linking_store.py.
 # Both must be cleared or a purge leaves the other side's row behind.
+#
+# telemetry_once (core/storage/cloud/telemetry_claim_store.py, WP2.C/ledger
+# 2.6) records that ONE SPECIFIC USER reached ONE SPECIFIC funnel event —
+# that is user data (who did what), not audit data about the purge itself
+# (contrast with purge_log below, which is deliberately EXCLUDED because it
+# IS the erasure's own proof and deleting it on every erasure would defeat
+# it). A consequence worth flagging to whoever next reads the telemetry
+# funnel: purging these rows means that if the SAME user_id ever recurred
+# (e.g. a rebind from a surviving account.json marker, or — in principle —
+# an id reused after a purge), first-run telemetry events would fire again
+# for it. That is correct, not a bug: a purged identity must not carry
+# residue that makes a fresh one look "already seen" — but it does mean a
+# purge can be visible downstream as a dip-then-repeat in first-run funnel
+# counts, which is worth knowing before chasing it as a tracking bug.
 # ---------------------------------------------------------------------------
 _TABLE_USER_COLUMNS: dict[str, tuple[str, ...]] = {
     "users": ("user_id",),
@@ -77,6 +96,7 @@ _TABLE_USER_COLUMNS: dict[str, tuple[str, ...]] = {
     "vector_chunks": ("user_id",),
     "routine_last_fired": ("user_id",),
     "journal_events": ("user_id",),
+    "telemetry_once": ("user_id",),
     "confirmation_state": ("user_id",),
 }
 
