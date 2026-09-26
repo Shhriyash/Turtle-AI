@@ -97,6 +97,27 @@ class RoutineOutboxStoreTest(unittest.TestCase):
         self.assertEqual(store.load_outbox_pg("usr_a"), [{"n": 1}])
         self.assertEqual(store.load_outbox_pg("usr_b"), [{"n": 2}])
 
+    def test_load_failure_is_counted(self) -> None:
+        """Ledger 3.6(e): both load/save already degrade gracefully (never
+        raise), but the failure was only ever printed, never counted."""
+        before = store.get_outbox_failure_counts()["load_failures"]
+        with patch(
+            "core.storage.cloud.routine_outbox_store.get_pg_sync_pool",
+            side_effect=RuntimeError("db unreachable"),
+        ):
+            result = store.load_outbox_pg("usr_a")
+        self.assertIsNone(result)
+        self.assertEqual(store.get_outbox_failure_counts()["load_failures"], before + 1)
+
+    def test_save_failure_is_counted(self) -> None:
+        before = store.get_outbox_failure_counts()["save_failures"]
+        with patch(
+            "core.storage.cloud.routine_outbox_store.get_pg_sync_pool",
+            side_effect=RuntimeError("db unreachable"),
+        ):
+            store.save_outbox_pg("usr_a", [{"n": 1}], max_frames=5)  # must not raise
+        self.assertEqual(store.get_outbox_failure_counts()["save_failures"], before + 1)
+
 
 class RoutineOutboxCloudBranchTest(unittest.TestCase):
     """core.routine_outbox.load_outbox/save_outbox must delegate to the

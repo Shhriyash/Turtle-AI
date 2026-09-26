@@ -13,6 +13,7 @@ database is reachable — these tests do not replace that.
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -67,14 +68,27 @@ class _FakeAsyncpgConn:
     async def fetch(self, sql: str, *args):
         sql_norm = " ".join(sql.split())
         if sql_norm.startswith("SELECT session_id, data FROM sessions"):
-            if "WHERE user_id" in sql_norm:
-                user_id = args[0]
-                return [
-                    {"session_id": sid, "data": row["data"]}
-                    for sid, row in self._sessions.items()
-                    if row["user_id"] == user_id
+            # Mirror postgres_store.list_sessions's positional-arg ordering:
+            # user_id predicate (if present) always binds before the status
+            # JSONB predicate (if present) -- see the $N numbering there.
+            rows = list(self._sessions.items())
+            arg_idx = 0
+            if "user_id = $" in sql_norm:
+                user_id = args[arg_idx]
+                arg_idx += 1
+                rows = [(sid, row) for sid, row in rows if row["user_id"] == user_id]
+            if "data->>'status' = $" in sql_norm:
+                status = args[arg_idx]
+                arg_idx += 1
+                rows = [
+                    (sid, row) for sid, row in rows
+                    if json.loads(row["data"]).get("status") == status
                 ]
-            return [{"session_id": sid, "data": row["data"]} for sid, row in self._sessions.items()]
+            result = [{"session_id": sid, "data": row["data"]} for sid, row in rows]
+            limit_match = re.search(r"LIMIT (\d+)", sql_norm)
+            if limit_match:
+                result = result[: int(limit_match.group(1))]
+            return result
         if sql_norm.startswith("SELECT doc_id, text, metadata"):
             emb, user_id, k = args
             candidates = [r for r in self._vector_docs if r["user_id"] == user_id and not r["deleted"]]
@@ -159,6 +173,47 @@ class PostgresSessionStoreTest(unittest.IsolatedAsyncioTestCase):
         await self.store.put(Session(session_id="p2", data={"user_id": "usr_a", "status": "completed"}))
         active_only = await self.store.list_sessions(status_filter="active", user_id="usr_a")
         self.assertEqual([s.session_id for s in active_only], ["p1"])
+
+    async def test_list_sessions_emits_sql_with_user_id_predicate_and_limit(self) -> None:
+        """Ledger 3.9: the query itself must carry the user_id predicate and
+        the LIMIT clause, not just filter correctly by accident in Python."""
+        captured: dict[str, Any] = {}
+
+        class _CapturingConn(_FakeAsyncpgConn):
+            async def fetch(self, sql: str, *args):
+                captured["sql"] = " ".join(sql.split())
+                captured["args"] = args
+                return await super().fetch(sql, *args)
+
+        class _CapturingAcquireCtx:
+            async def __aenter__(self_inner):
+                return _CapturingConn(self.pool._sessions, self.pool._vector_docs)
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        with patch.object(self.pool, "acquire", return_value=_CapturingAcquireCtx()):
+            await self.store.put(Session(session_id="q1", data={"user_id": "usr_a", "status": "pending_finalization"}))
+            await self.store.list_sessions(status_filter="pending_finalization", user_id="usr_a", limit=20)
+
+        self.assertIn("user_id = $1", captured["sql"])
+        self.assertIn("data->>'status' = $2", captured["sql"])
+        self.assertIn("LIMIT 20", captured["sql"])
+        self.assertEqual(captured["args"], ("usr_a", "pending_finalization"))
+
+    async def test_list_sessions_does_not_return_a_second_users_row(self) -> None:
+        """Ledger 3.9 acceptance criterion: a second user's pending session
+        is not returned once user_id is passed through."""
+        await self.store.put(
+            Session(session_id="mine", data={"user_id": "usr_a", "status": "pending_finalization"})
+        )
+        await self.store.put(
+            Session(session_id="theirs", data={"user_id": "usr_b", "status": "pending_finalization"})
+        )
+        result = await self.store.list_sessions(
+            status_filter="pending_finalization", user_id="usr_a", limit=20
+        )
+        self.assertEqual([s.session_id for s in result], ["mine"])
 
     async def test_delete_removes_session(self) -> None:
         await self.store.put(Session(session_id="d1", data={"user_id": "usr_a"}))
