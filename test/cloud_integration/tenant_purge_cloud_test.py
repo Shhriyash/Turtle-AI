@@ -229,6 +229,56 @@ def test_purge_leaves_zero_rows_in_every_table_including_link_codes_both_columns
         run_async(_cleanup_control_user(other_user_id))
 
 
+def test_purge_tolerates_a_table_that_does_not_exist_yet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP 2.A follow-up: every cloud store creates its table LAZILY (CREATE
+    TABLE IF NOT EXISTS behind a module-level _initialized flag) — there is
+    no migrations framework. So a table in _TABLE_USER_COLUMNS can be
+    genuinely absent from a live database until its feature is first used
+    there (telemetry_once, added by WP2.C, is the sharpest real example:
+    it cannot exist until the first telemetry claim lands after deploy).
+
+    Rather than DROP a real table this whole package's other tests rely on
+    (which would leave the shared test database missing a table for
+    whichever test runs next, order-dependently, and could desync a store
+    module's own _initialized flag from reality), this monkeypatches the
+    enumeration to include one extra table name that has never been created
+    in this database at all — functionally identical to "this table has
+    never been exercised yet", without touching any real table other tests
+    depend on. Asserts the purge still succeeds, still deletes every REAL
+    table normally, and reports the missing one as None — not 0 (0 would
+    falsely claim the question "did this user have rows here" was asked and
+    answered "no"; the honest answer is the question couldn't be asked)."""
+    import core.tenant_purge as tenant_purge
+    from core.tenant_purge import purge_user
+
+    user_id = _uid()
+    fake_table = f"nonexistent_table_{uuid.uuid4().hex[:8]}"
+    patched = dict(tenant_purge._TABLE_USER_COLUMNS)
+    patched[fake_table] = ("user_id",)
+    monkeypatch.setattr(tenant_purge, "_TABLE_USER_COLUMNS", patched)
+
+    async def _run():
+        await _ensure_all_tables()
+        await _seed_all_tables(user_id, other_user_id=_uid())
+        return await purge_user(user_id)
+
+    result = run_async(_run())
+
+    assert result["tables"][fake_table] is None, (
+        "a table absent from the database must be reported as None, "
+        "never as 0 or silently omitted"
+    )
+    real_tables = {k: v for k, v in result["tables"].items() if k != fake_table}
+    assert real_tables, "the real tables must still be present in the result"
+    assert all(v is not None for v in real_tables.values()), (
+        f"a nonexistent extra table must not stop the REAL tables from "
+        f"being purged normally: {real_tables}"
+    )
+    assert real_tables["users"] == 1
+
+
 def test_redis_keys_purged_but_global_and_ephemeral_families_survive() -> None:
     from core.storage.cloud import get_redis_sync_client
     from core.tenant_purge import purge_user

@@ -267,14 +267,50 @@ def _parse_delete_count(result: str) -> int:
         return 0
 
 
-async def _purge_tables_cloud(user_id: str) -> dict[str, int]:
+async def _existing_tables(conn: Any, table_names: list[str]) -> set[str]:
+    """Resolve which of ``table_names`` actually exist in this database,
+    OUTSIDE (before) the delete transaction.
+
+    Why this has to happen here rather than by catching UndefinedTableError
+    per-DELETE: every cloud store under core/storage/cloud/ creates its own
+    table LAZILY (CREATE TABLE IF NOT EXISTS behind a module-level
+    _initialized flag, on first use) — there is no migrations framework. So
+    a table in _TABLE_USER_COLUMNS only exists once that feature has
+    actually been exercised in this database. asyncpg aborts the ENTIRE
+    transaction the instant one statement inside it raises
+    UndefinedTableError; a caught exception does not un-abort it without a
+    savepoint. Checking existence first, before the transaction opens, lets
+    us skip absent tables cleanly while still deleting from a real, single
+    transaction across everything that does exist.
+
+    to_regclass() returns NULL for a name that doesn't resolve to an
+    existing relation, and never raises — safe to run against an arbitrary
+    enumerated name.
+    """
+    rows = await conn.fetch(
+        "SELECT t AS name, to_regclass('public.' || t) IS NOT NULL AS exists "
+        "FROM unnest($1::text[]) AS t",
+        table_names,
+    )
+    return {row["name"] for row in rows if row["exists"]}
+
+
+async def _purge_tables_cloud(user_id: str) -> dict[str, Optional[int]]:
     from core.storage.cloud import get_pg_pool
 
     pool = await get_pg_pool()
-    counts: dict[str, int] = {}
+    counts: dict[str, Optional[int]] = {}
     async with pool.acquire() as conn:
+        existing = await _existing_tables(conn, list(_TABLE_USER_COLUMNS.keys()))
         async with conn.transaction():
             for table, columns in _TABLE_USER_COLUMNS.items():
+                if table not in existing:
+                    # The table has never been created in this database
+                    # (lazy DDL, never exercised here yet). Distinct from a
+                    # genuine zero: None means "the question could not be
+                    # asked", 0 means "asked, and the user had no rows".
+                    counts[table] = None
+                    continue
                 where = " OR ".join(f"{column} = $1" for column in columns)
                 result = await conn.execute(
                     f"DELETE FROM {table} WHERE {where}", user_id  # noqa: S608 — table/column names are our own fixed enum, never user input
