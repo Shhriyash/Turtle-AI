@@ -56,11 +56,17 @@ Shared backends
 `-- Identity Manager (core/identity.py) - SQLite (channel, channel_user_id) → user_id
 
 Channel Adapters (apps/channels/) - all funnel into the same _execute_turn
+Open (mounted):
+|-- Web       → WebSocket           (/ws)
+|-- Telegram  → Bot API webhook     (POST /channels/telegram/webhook)
+`-- Discord   → Interactions webhook (POST /channels/discord)
+
+Closed by policy (unmounted - module + router still in the tree):
 |-- WhatsApp  → Twilio Cloud API (POST /channels/whatsapp)
 |-- iMessage  → SendBlue API    (POST /channels/imessage)
 |-- Slack     → Events API      (POST /channels/slack/events)
 `-- Voice     → Twilio Media Streams WebSocket (/channels/twilio/voice/stream)
-      STT: Groq Whisper · TTS: Deepgram μ-law 8 kHz
+      unmounted for a real hazard, not just policy - see apps/turtle_server.py
 ```
 
 ---
