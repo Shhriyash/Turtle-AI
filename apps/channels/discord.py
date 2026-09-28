@@ -242,7 +242,10 @@ async def _send_followup(interaction_token: str, text: str) -> None:
     """
     app_id = _application_id()
     if not app_id:
-        print(f"[Discord] No application id — cannot deliver follow-up. Reply: {text!r}")
+        print(
+            f"[Discord] No application id — cannot deliver follow-up "
+            f"({len(text)} chars)."
+        )
         return
     url = f"{_DISCORD_API_BASE}/webhooks/{app_id}/{interaction_token}/messages/@original"
     try:

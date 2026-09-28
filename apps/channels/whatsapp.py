@@ -100,7 +100,10 @@ async def _send_whatsapp_reply(to: str, body: str) -> None:
     from_number = settings.twilio_whatsapp_number
 
     if not (account_sid and auth_token and from_number):
-        print(f"[WhatsApp] Skipping send — Twilio creds not configured. Reply would be: {body!r}")
+        print(
+            f"[WhatsApp] Skipping send — Twilio creds not configured. "
+            f"Reply not sent ({len(body)} chars)."
+        )
         return
 
     url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid.get_secret_value()}/Messages.json"

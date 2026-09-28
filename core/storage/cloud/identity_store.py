@@ -30,11 +30,25 @@ with the payload.
 """
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from core.storage.cloud import get_pg_pool, get_pg_sync_pool
+
+
+def _hash_identifier_for_log(identifier: str) -> str:
+    """A stable, non-reversible stand-in for a user identifier (email or a
+    channel handle that is one, e.g. web_email's channel_user_id) in
+    diagnostic logs — same rationale and approach as
+    core/storage/cloud/purge_log_store.py::hash_user_id: a log line can say
+    "this identity rebound/linked/minted" without becoming a second place
+    the plaintext identifier lingers (Vercel's log stream is retained and
+    operator-viewable, unlike our own DB rows which are covered by
+    /forget-me). Every print() in this module that would otherwise
+    interpolate a channel_user_id/email routes through this."""
+    return hashlib.sha256((identifier or "").encode("utf-8")).hexdigest()[:16]
 
 _CREATE_TABLES_SQL = (
     """
@@ -142,7 +156,7 @@ class PostgresIdentityManager:
                 channel, target, user_id,
             )
         print(
-            f"LOG: linked {channel}/{target} -> {user_id}"
+            f"LOG: linked {channel}/{_hash_identifier_for_log(target)} -> {user_id}"
             + (f" (was {previous})" if previous else "")
         )
         return previous
@@ -251,7 +265,8 @@ class PostgresIdentityManager:
                     )
                     if winner:
                         print(
-                            f"LOG: identity mint race for {channel}:{lookup_id} — "
+                            f"LOG: identity mint race for {channel}:"
+                            f"{_hash_identifier_for_log(lookup_id)} — "
                             f"yielding to existing {winner['user_id']}"
                         )
                         return winner["user_id"]
@@ -273,7 +288,8 @@ class PostgresIdentityManager:
             # stranger, matching IdentityManager's own require_verified rule.
             if not row["email_verified"]:
                 print(
-                    f"LOG: identity rebind skipped (unverified marker in cloud) email={email}"
+                    f"LOG: identity rebind skipped (unverified marker in cloud) "
+                    f"email_sha256={_hash_identifier_for_log(email)}"
                 )
                 return None
             user_id = row["user_id"]
@@ -289,7 +305,10 @@ class PostgresIdentityManager:
                 "ON CONFLICT (channel, channel_user_id) DO UPDATE SET user_id = EXCLUDED.user_id",
                 channel, email, user_id,
             )
-        print(f"LOG: identity rebound from marker email={email} user_id={user_id} verified=True")
+        print(
+            f"LOG: identity rebound from marker email_sha256={_hash_identifier_for_log(email)} "
+            f"user_id={user_id} verified=True"
+        )
         return user_id
 
 
