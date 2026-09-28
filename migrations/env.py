@@ -3,7 +3,18 @@ migrations/env.py
 ------------------
 Alembic environment for Turtle's cloud (Neon) Postgres schema (ledger 3.1).
 
-DATABASE_URL_DIRECT, not DATABASE_URL: DATABASE_URL is documented in
+Resolution order for the DDL connection string (see get_url()):
+
+  1. DATABASE_URL_DIRECT  - explicit operator override, wins if set.
+  2. DATABASE_URL_UNPOOLED - what Neon's Vercel integration itself provides
+     (the same database as DATABASE_URL, direct/non-pooler host). This is
+     the variable that exists on a freshly-provisioned Neon-via-Vercel
+     project with NO hand-copied setup step, and it is re-synced by the
+     integration automatically whenever the owner rotates the database
+     password - a hand-copied DATABASE_URL_DIRECT would not be.
+  3. Neither set: fail loudly, naming both variables.
+
+DATABASE_URL is never an acceptable fallback: it is documented in
 .env.example as Neon's *pooled* endpoint (PgBouncer, transaction mode) —
 correct for the app's own short-lived serverless queries, but wrong for DDL.
 Per the Postgres docs, transaction-mode pooling does not support session-level
@@ -11,11 +22,25 @@ features, and CREATE INDEX CONCURRENTLY cannot run inside a transaction block
 at all (pgbouncer's transaction mode wraps every statement in one). Alembic
 must therefore run against Neon's direct, non-pooler host.
 
-Fails loudly and early when DATABASE_URL_DIRECT is unset — this module never
-falls back to DATABASE_URL. A silent fallback would route DDL over the
-pooler, silently reintroducing the exact failure mode this design avoids
-(works today, breaks the day a migration finally needs CONCURRENTLY or a
-session-level setting).
+POSTGRES_URL_NON_POOLING (also present on Vercel/Neon integrations) is
+deliberately NOT accepted as a third source. It is the same direct host as
+DATABASE_URL_UNPOOLED (Neon's integration sets both to the same connection
+string), so accepting it buys no new capability, only a second name that can
+silently drift from the first if Neon or Vercel ever stop keeping them in
+sync, and a second thing a reader of this file has to know about. One
+integration-provided name (DATABASE_URL_UNPOOLED) plus one explicit override
+(DATABASE_URL_DIRECT) is the smallest set that covers "the integration did
+it for you" and "you need to point somewhere else".
+
+Fails loudly and early when neither DATABASE_URL_DIRECT nor
+DATABASE_URL_UNPOOLED is set — this module never falls back to DATABASE_URL.
+A silent fallback would route DDL over the pooler, silently reintroducing the
+exact failure mode this design avoids (works today, breaks the day a
+migration finally needs CONCURRENTLY or a session-level setting). The
+resolved URL is also checked for "-pooler" in its host even when it came
+from DATABASE_URL_DIRECT: an operator can paste a pooled DSN into the
+override by mistake, and that must fail the same way, not "work" until the
+day a migration needs a session feature.
 
 This module deliberately does not import anything from the `core` package:
 it has no dependency on app settings/config, so `alembic upgrade head` can run
@@ -26,6 +51,7 @@ from __future__ import annotations
 
 import os
 from logging.config import fileConfig
+from urllib.parse import urlsplit
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
@@ -41,22 +67,57 @@ if config.config_file_name is not None:
 target_metadata = None
 
 
+def _resolve_raw_url() -> tuple[str, str]:
+    """Pick the raw (untranslated) DDL connection string per the module
+    docstring's resolution order, returning it together with the name of
+    the environment variable it came from (used in error messages and by
+    the pooler guard below). Raises immediately, naming both accepted
+    variables, if neither is set.
+    """
+    direct = os.environ.get("DATABASE_URL_DIRECT", "").strip()
+    if direct:
+        return direct, "DATABASE_URL_DIRECT"
+    unpooled = os.environ.get("DATABASE_URL_UNPOOLED", "").strip()
+    if unpooled:
+        return unpooled, "DATABASE_URL_UNPOOLED"
+    raise RuntimeError(
+        "Neither DATABASE_URL_DIRECT nor DATABASE_URL_UNPOOLED is set. "
+        "Alembic DDL must run against Neon's DIRECT (non-pooler) connection "
+        "string — see .env.example. DATABASE_URL_UNPOOLED is what Neon's "
+        "Vercel integration provides automatically; DATABASE_URL_DIRECT is "
+        "an explicit override if you need to point somewhere else. Refusing "
+        "to fall back to DATABASE_URL (the pooled endpoint): transaction-mode "
+        "pooling doesn't support session features and cannot run CREATE "
+        "INDEX CONCURRENTLY inside its wrapping transaction. Set one of "
+        "DATABASE_URL_DIRECT or DATABASE_URL_UNPOOLED and re-run."
+    )
+
+
+def _assert_not_pooled(raw: str, source: str) -> None:
+    """Guard against a pooled Neon DSN reaching Alembic even via the
+    explicit DATABASE_URL_DIRECT override — someone will eventually paste
+    the wrong string into the right variable, and "-pooler" in the hostname
+    is a cheap, reliable tell for Neon's pooled endpoint.
+    """
+    host = urlsplit(raw).hostname or ""
+    if "-pooler" in host:
+        raise RuntimeError(
+            f"{source} resolves to a pooled Neon host ({host!r}) — Alembic "
+            "DDL must not run over PgBouncer's transaction-mode pooler "
+            "(no session features, and CREATE INDEX CONCURRENTLY cannot run "
+            f"inside its wrapping transaction). Set {source} to Neon's "
+            "DIRECT (non-pooler) connection string instead — the host "
+            "without \"-pooler\" in it."
+        )
+
+
 def get_url() -> str:
     """Return the direct (non-pooler) Neon connection string, translated to
-    SQLAlchemy's psycopg3 dialect. Raises immediately, naming the variable,
-    if DATABASE_URL_DIRECT is not set — see module docstring for why this
-    must never fall back to DATABASE_URL.
+    SQLAlchemy's psycopg3 dialect. See the module docstring for the
+    resolution order and why this must never fall back to DATABASE_URL.
     """
-    raw = os.environ.get("DATABASE_URL_DIRECT", "").strip()
-    if not raw:
-        raise RuntimeError(
-            "DATABASE_URL_DIRECT is not set. Alembic DDL must run against "
-            "Neon's DIRECT (non-pooler) connection string — see .env.example. "
-            "Refusing to fall back to DATABASE_URL (the pooled endpoint): "
-            "transaction-mode pooling doesn't support session features and "
-            "cannot run CREATE INDEX CONCURRENTLY inside its wrapping "
-            "transaction. Set DATABASE_URL_DIRECT and re-run."
-        )
+    raw, source = _resolve_raw_url()
+    _assert_not_pooled(raw, source)
     # SQLAlchemy's plain "postgresql://" scheme resolves to psycopg2, which
     # this project does not install (it uses psycopg 3 — requirements.txt's
     # "psycopg[binary,pool]>=3.2"). Force the psycopg3 dialect explicitly
@@ -72,9 +133,9 @@ def get_url() -> str:
 
 def run_migrations_offline() -> None:
     """Emit SQL to stdout without a live DB connection (`alembic upgrade
-    head --sql`). Still requires DATABASE_URL_DIRECT to be set (get_url()
-    raises otherwise) so the emitted SQL's dialect assumptions match what
-    the direct host actually is.
+    head --sql`). Still requires DATABASE_URL_DIRECT or DATABASE_URL_UNPOOLED
+    to be set (get_url() raises otherwise) so the emitted SQL's dialect
+    assumptions match what the direct host actually is.
     """
     context.configure(
         url=get_url(),

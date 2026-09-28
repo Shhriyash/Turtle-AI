@@ -65,7 +65,28 @@ audioop-lts==0.2.2; python_version >= "3.13"
 # matters. See requirements-local.txt for local voice-hardware tooling.
 
 # Web server
-fastapi>=0.115.0
+# fastapi was unpinned (`>=0.115.0`) and that let CI, a fresh local install,
+# and the repo venv (installed at different times) silently resolve
+# different FastAPI versions from the same requirements.txt: 0.135.2 in the
+# repo venv agents actually run, 0.141.1+ on a fresh `pip install` (CI or a
+# new clone). That is not cosmetic drift: on 0.135.2, app.include_router()
+# flattens a child router's routes directly into app.routes with real
+# `.path` values; on 0.141.1 it instead appends an `_IncludedRouter` wrapper
+# whose `.path` is None. A test asserting on the route table passed on one
+# and failed on the other — two agents reached opposite, individually
+# correct conclusions about the same code from that single unpinned line.
+# Exact-pinned (not just upper-bounded) so a `pip install -r requirements.txt`
+# always reproduces the exact version the suite was verified against below,
+# rather than merely blocking the next minor while still letting today's and
+# tomorrow's fresh installs diverge from each other. Verified: full suite
+# (`pytest test/ -q`) is 1442 passed, 33 skipped, 0 failed on BOTH 0.135.2
+# and 0.141.1 as of 2026-09-28 — this pin is about reproducibility, not a
+# known failure on either version. starlette/pydantic/uvicorn were checked
+# alongside this and did not need the same treatment: pip resolved identical
+# starlette (1.7.0), pydantic (2.13.5), and uvicorn (0.54.0) versions against
+# both fastapi versions above, so there is no observed divergence to pin
+# against for them.
+fastapi==0.141.1
 uvicorn[standard]>=0.34.0
 websockets>=15.0
 # apps/channels/whatsapp.py's Twilio-style webhook route takes form-encoded

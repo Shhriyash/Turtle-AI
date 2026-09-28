@@ -77,33 +77,95 @@ jobs:
         # for Alembic automatically as its own declared dependency.
         run: pip install -r requirements-migrations.txt "psycopg[binary,pool]>=3.2"
 
+      # Pulls the "production" Vercel environment's variables to a gitignored
+      # temp file OUTSIDE the checkout (so there is nothing to accidentally
+      # `git add`), instead of requiring a hand-copied DATABASE_URL_DIRECT
+      # GitHub secret. This is what removes that owner action: Neon's Vercel
+      # integration already maintains DATABASE_URL_UNPOOLED (the direct,
+      # non-pooler host — see migrations/env.py's module docstring) on this
+      # project, re-syncing it automatically on events like a password
+      # rotation, which a hand-copied secret would not do. The Vercel CLI is
+      # already installed above (needed for the deploy step later in this
+      # job) — this step is the only NEW thing migrations needs.
+      #
+      # Never printed, never committed: no step here echoes/cats the file's
+      # contents, and "Remove pulled Vercel environment file" below deletes
+      # it with `if: always()` so it is gone even if a later step fails.
+      - name: Pull production environment variables from Vercel
+        id: pull-env
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          env_file="$RUNNER_TEMP/vercel-production.env"
+          echo "env_file=$env_file" >> "$GITHUB_OUTPUT"
+          if ! vercel env pull "$env_file" --environment=production --yes --token="$VERCEL_TOKEN"; then
+            echo "::error::'vercel env pull --environment=production' failed. Refusing to proceed without production's environment variables — a silently skipped migration is exactly the hazard this step exists to prevent. See migrations/env.py and .env.example for DATABASE_URL_UNPOOLED / DATABASE_URL_DIRECT."
+            exit 1
+          fi
+          if [ ! -s "$env_file" ]; then
+            echo "::error::'vercel env pull --environment=production' produced an empty file. Refusing to proceed."
+            exit 1
+          fi
+
       # Additive-first (ledger 3.1's "new columns and tables ship before the
       # code that uses them"): migrations run BEFORE the deploy below, so the
       # new schema exists before any new code that might read/write it goes
       # live, and so a broken migration blocks the deploy outright rather
       # than shipping code against a schema it doesn't match.
       #
-      # DATABASE_URL_DIRECT is not set in the "production" GitHub environment
-      # yet (ledger 3.1's owner action: "add DATABASE_URL_DIRECT to the
-      # production GitHub environment"). This step deliberately does NOT skip
-      # quietly when it's absent — migrations/env.py already fails loudly and
-      # names the variable, and a silent skip here would let a schema-less
-      # deploy proceed, which is the exact hazard ledger 3.1 exists to avoid.
-      # Concretely: THIS STEP MAKES PRODUCTION DEPLOYS FAIL until the owner
-      # sets DATABASE_URL_DIRECT as a secret on the "production" environment.
-      # That is a deliberate, not an accidental, consequence of landing this
-      # migration framework before the secret exists — flagged here rather
-      # than engineered around.
+      # DATABASE_URL_UNPOOLED comes from the file pulled above — Neon's own
+      # integration-managed, direct (non-pooler) connection string.
+      # DATABASE_URL_DIRECT stays available as an explicit override: it is
+      # read from the "production" GitHub environment's own secret (if the
+      # owner ever sets one) and always wins over a value extracted from the
+      # pulled file. Neither variable, nor the pulled file's contents, is
+      # echoed here. migrations/env.py's get_url() does the actual
+      # DIRECT-wins-over-UNPOOLED resolution and is the thing that fails
+      # loudly (naming both variables) if neither is set — this step does
+      # not duplicate that decision, but it does fail loudly and early on
+      # its own precondition (something resolved at all) rather than let a
+      # missing variable surface as a confusing alembic error.
+      #
+      # The pulled file is PARSED for the one key needed, never executed
+      # (no `source`/`set -a`). `source`-ing a pulled dotenv file is a real
+      # hazard, not a theoretical one — verified against this project's own
+      # actual pulled-file shape (test/deploy_workflow_env_extraction_test.py):
+      # a double-quoted value containing "$cd" is silently truncated by
+      # `source` (bash expands the `$cd` reference inside the double quotes
+      # instead of erroring), which is exactly the failure mode a Neon
+      # password rotation could produce with zero warning; and `source`
+      # exports every OTHER variable in the file (every other production
+      # secret) into this step's process environment, where a later crash
+      # traceback or an accidentally-added debug flag could leak all of them
+      # into a CI log — the `if: always()` cleanup below only ever deletes
+      # the file, not variables already exported into the process. The
+      # Python one-liner below reads the raw text of exactly one line and
+      # strips one layer of matching quotes; it never evaluates the value.
       - name: Run database migrations (alembic upgrade head)
         env:
           DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
         run: |
           set -euo pipefail
-          if [ -z "${DATABASE_URL_DIRECT:-}" ]; then
-            echo "::error::DATABASE_URL_DIRECT is not set in the 'production' GitHub environment. Refusing to deploy without running migrations first — set this secret (Neon's direct, non-pooler connection string) to unblock deploys. See .env.example and migrations/env.py."
+          env_file="${{ steps.pull-env.outputs.env_file }}"
+          extracted_unpooled="$(python3 -c 'import re,sys; text=open(sys.argv[1],encoding="utf-8").read(); m=re.search(r"^DATABASE_URL_UNPOOLED=(.*)$", text, re.M); v=(m.group(1) if m else ""); v=(v[1:-1] if len(v)>=2 and v[0]=="\"" and v[-1]=="\"" else v); sys.stdout.write(v)' "$env_file")"
+          if [ -n "${DATABASE_URL_DIRECT:-}" ]; then
+            : # GitHub-secret override already set in this step's env — wins.
+          else
+            export DATABASE_URL_DIRECT=""
+          fi
+          export DATABASE_URL_UNPOOLED="$extracted_unpooled"
+          if [ -z "${DATABASE_URL_DIRECT:-}" ] && [ -z "${DATABASE_URL_UNPOOLED:-}" ]; then
+            echo "::error::Neither DATABASE_URL_DIRECT (GitHub secret override) nor DATABASE_URL_UNPOOLED (pulled from Vercel's 'production' environment) is set. Refusing to deploy without running migrations first. See .env.example and migrations/env.py."
             exit 1
           fi
           alembic upgrade head
+
+      - name: Remove pulled Vercel environment file
+        if: always()
+        run: rm -f "${{ steps.pull-env.outputs.env_file }}"
 
       # --skip-domain deploys without assigning the production domain, so a
       # deployment that fails the /healthz or /readyz probes below is never

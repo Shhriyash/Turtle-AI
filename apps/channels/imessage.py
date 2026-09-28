@@ -63,7 +63,10 @@ async def _send_imessage_reply(to_number: str, text: str) -> None:
     """Send reply via SendBlue Messages API."""
     key, secret = _get_api_creds()
     if not (key and secret):
-        print(f"[iMessage] Skipping send — SendBlue creds not configured. Reply: {text!r}")
+        print(
+            f"[iMessage] Skipping send — SendBlue creds not configured. "
+            f"Reply not sent ({len(text)} chars)."
+        )
         return
 
     async with httpx.AsyncClient() as client:

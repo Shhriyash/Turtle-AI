@@ -140,7 +140,10 @@ def _should_handle(chat_type: str, is_mention: bool, is_bot_author: bool) -> boo
 async def _send_reply(chat_id: int | str, text: str) -> None:
     token = _bot_token()
     if not token:
-        print(f"LOG: [Telegram webhook] No bot token — cannot deliver reply: {text!r}")
+        print(
+            f"LOG: [Telegram webhook] No bot token — cannot deliver reply "
+            f"({len(text)} chars)."
+        )
         return
     url = f"{_TELEGRAM_API_BASE}/bot{token}/sendMessage"
     html_reply = markdown_to_telegram_html(text)[:_MAX_REPLY_CHARS]
