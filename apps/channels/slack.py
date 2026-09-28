@@ -72,7 +72,7 @@ async def _post_slack_message(channel: str, text: str, thread_ts: str | None = N
     """Send a message via Slack Web API."""
     token = _bot_token()
     if not token:
-        print(f"[Slack] No bot token — skipping send. Message: {text!r}")
+        print(f"[Slack] No bot token — skipping send. Message not sent ({len(text)} chars).")
         return
 
     payload: dict = {"channel": channel, "text": text}

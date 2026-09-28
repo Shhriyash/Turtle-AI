@@ -30,11 +30,22 @@ with the payload.
 """
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from core.storage.cloud import get_pg_pool, get_pg_sync_pool
+
+
+def _hash_email_for_log(email: str) -> str:
+    """A stable, non-reversible stand-in for an email address in diagnostic
+    logs — same rationale and approach as
+    core/storage/cloud/purge_log_store.py::hash_user_id: a log line can say
+    "this identity rebound" without becoming a second place the plaintext
+    address lingers (Vercel's log stream is retained and operator-viewable,
+    unlike our own DB rows which are covered by /forget-me)."""
+    return hashlib.sha256((email or "").encode("utf-8")).hexdigest()[:16]
 
 _CREATE_TABLES_SQL = (
     """
@@ -289,7 +300,10 @@ class PostgresIdentityManager:
                 "ON CONFLICT (channel, channel_user_id) DO UPDATE SET user_id = EXCLUDED.user_id",
                 channel, email, user_id,
             )
-        print(f"LOG: identity rebound from marker email={email} user_id={user_id} verified=True")
+        print(
+            f"LOG: identity rebound from marker email_sha256={_hash_email_for_log(email)} "
+            f"user_id={user_id} verified=True"
+        )
         return user_id
 
 
