@@ -120,30 +120,43 @@ jobs:
       # integration-managed, direct (non-pooler) connection string.
       # DATABASE_URL_DIRECT stays available as an explicit override: it is
       # read from the "production" GitHub environment's own secret (if the
-      # owner ever sets one) and, since it is exported into this step's
-      # environment BEFORE the pulled file is sourced, a value pulled from
-      # Vercel can never silently clobber it. Neither variable, nor the
-      # pulled file's contents, is echoed here. migrations/env.py's
-      # get_url() does the actual DIRECT-wins-over-UNPOOLED resolution and
-      # is the thing that fails loudly (naming both variables) if neither
-      # is set — this step does not duplicate that decision, but it does
-      # fail loudly and early on its own precondition (the pulled file
-      # existing) rather than let a missing variable surface as a confusing
-      # alembic error.
+      # owner ever sets one) and always wins over a value extracted from the
+      # pulled file. Neither variable, nor the pulled file's contents, is
+      # echoed here. migrations/env.py's get_url() does the actual
+      # DIRECT-wins-over-UNPOOLED resolution and is the thing that fails
+      # loudly (naming both variables) if neither is set — this step does
+      # not duplicate that decision, but it does fail loudly and early on
+      # its own precondition (something resolved at all) rather than let a
+      # missing variable surface as a confusing alembic error.
+      #
+      # The pulled file is PARSED for the one key needed, never executed
+      # (no `source`/`set -a`). `source`-ing a pulled dotenv file is a real
+      # hazard, not a theoretical one — verified against this project's own
+      # actual pulled-file shape (test/deploy_workflow_env_extraction_test.py):
+      # a double-quoted value containing "$cd" is silently truncated by
+      # `source` (bash expands the `$cd` reference inside the double quotes
+      # instead of erroring), which is exactly the failure mode a Neon
+      # password rotation could produce with zero warning; and `source`
+      # exports every OTHER variable in the file (every other production
+      # secret) into this step's process environment, where a later crash
+      # traceback or an accidentally-added debug flag could leak all of them
+      # into a CI log — the `if: always()` cleanup below only ever deletes
+      # the file, not variables already exported into the process. The
+      # Python one-liner below reads the raw text of exactly one line and
+      # strips one layer of matching quotes; it never evaluates the value.
       - name: Run database migrations (alembic upgrade head)
         env:
           DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
         run: |
           set -euo pipefail
           env_file="${{ steps.pull-env.outputs.env_file }}"
-          prior_direct="${DATABASE_URL_DIRECT:-}"
-          set -a
-          # shellcheck disable=SC1090
-          source "$env_file"
-          set +a
-          if [ -n "$prior_direct" ]; then
-            DATABASE_URL_DIRECT="$prior_direct"
+          extracted_unpooled="$(python3 -c 'import re,sys; text=open(sys.argv[1],encoding="utf-8").read(); m=re.search(r"^DATABASE_URL_UNPOOLED=(.*)$", text, re.M); v=(m.group(1) if m else ""); v=(v[1:-1] if len(v)>=2 and v[0]=="\"" and v[-1]=="\"" else v); sys.stdout.write(v)' "$env_file")"
+          if [ -n "${DATABASE_URL_DIRECT:-}" ]; then
+            : # GitHub-secret override already set in this step's env — wins.
+          else
+            export DATABASE_URL_DIRECT=""
           fi
+          export DATABASE_URL_UNPOOLED="$extracted_unpooled"
           if [ -z "${DATABASE_URL_DIRECT:-}" ] && [ -z "${DATABASE_URL_UNPOOLED:-}" ]; then
             echo "::error::Neither DATABASE_URL_DIRECT (GitHub secret override) nor DATABASE_URL_UNPOOLED (pulled from Vercel's 'production' environment) is set. Refusing to deploy without running migrations first. See .env.example and migrations/env.py."
             exit 1
