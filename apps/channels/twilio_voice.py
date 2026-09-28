@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import audioop
 import base64
+import hashlib
 import io
 import json
 import struct
@@ -57,6 +58,17 @@ _FRAME_SAMPLES = int(_SAMPLE_RATE * _FRAME_MS / 1000)  # 160 samples
 _SILENCE_THRESHOLD_ENERGY = 300  # μ-law RMS threshold for silence detection
 _SILENCE_TRIGGER_MS = 800         # ms of silence before STT fires
 _SILENCE_FRAMES = int(_SILENCE_TRIGGER_MS / _FRAME_MS)  # 40 frames
+
+
+def _hash_phone_for_log(phone: str) -> str:
+    """A stable, non-reversible stand-in for a caller's phone number in
+    diagnostic logs — same rationale and approach as
+    core/storage/cloud/identity_store.py::_hash_identifier_for_log (itself
+    matching core/storage/cloud/purge_log_store.py::hash_user_id): a log
+    line can say "this caller's stream started/was rejected" without a
+    second, plaintext copy of their number sitting in Vercel's retained,
+    operator-viewable log stream."""
+    return hashlib.sha256((phone or "").encode("utf-8")).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +272,7 @@ async def voice_stream(ws: WebSocket):
         if not text:
             return
 
-        print(f"[TwilioVoice] STT: {text!r}")
+        print(f"[TwilioVoice] STT transcribed ({len(text)} chars)")
 
         # A caller whose number Twilio didn't share must NOT collapse onto a
         # shared "anon" identity — the dispatch pipeline now builds a full
@@ -322,7 +334,10 @@ async def voice_stream(ws: WebSocket):
                         # instead of minting a tenant. This is a live audio
                         # stream, not a text reply, so the refusal has to be
                         # synthesized and streamed like any other reply.
-                        print(f"[TwilioVoice] Rejecting unknown caller {from_number} (invite-only)")
+                        print(
+                            f"[TwilioVoice] Rejecting unknown caller "
+                            f"phone_sha256={_hash_phone_for_log(from_number)} (invite-only)"
+                        )
                         await _speak_and_hang_up(CHANNEL_INVITE_ONLY_MESSAGE)
                         return
                 elif normalize_channel_signup(settings.channel_signup) == CHANNEL_SIGNUP_INVITE:
@@ -336,7 +351,10 @@ async def voice_stream(ws: WebSocket):
                     print("[TwilioVoice] Rejecting caller with no from_number (invite-only)")
                     await _speak_and_hang_up(CHANNEL_INVITE_ONLY_MESSAGE)
                     return
-                print(f"[TwilioVoice] Stream started: call_sid={call_sid} from={from_number}")
+                print(
+                    f"[TwilioVoice] Stream started: call_sid={call_sid} "
+                    f"from_sha256={_hash_phone_for_log(from_number)}"
+                )
 
             elif event_name == "media":
                 payload_b64 = msg.get("media", {}).get("payload", "")
