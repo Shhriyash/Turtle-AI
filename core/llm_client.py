@@ -866,6 +866,7 @@ async def stream_agent_text_with_fallbacks(
             continue
 
         emitted_any = False
+        result = None  # reset per-iteration: see the except block below.
         if stats is not None:
             stats.attempts += 1
         try:
@@ -911,6 +912,24 @@ async def stream_agent_text_with_fallbacks(
                 stats.failed_attempts += 1
                 if _is_timeout_error(exc):
                     stats.timed_out_attempts += 1
+                # WP4.5: a rung that already streamed some tokens before
+                # failing mid-stream (emitted_any=True) genuinely spent them —
+                # they were billed by the provider whether or not the run
+                # completed. Those tokens can no longer be un-spoken (the
+                # caller re-raises this immediately rather than falling back,
+                # per this function's docstring), so count them as wasted the
+                # same way the batch runner counts a failed rung's spend —
+                # see WASTED TOKENS COUNT in apps/turtle_server.py. Best
+                # effort: `result` may be a partially-drained stream whose
+                # usage isn't final, or None if run_stream() itself raised
+                # before binding it.
+                if result is not None:
+                    try:
+                        _tin, _tout, _ = _extract_usage(result)
+                        stats.wasted_input_tokens += _tin
+                        stats.wasted_output_tokens += _tout
+                    except Exception:
+                        pass
             if _is_output_validation_error(exc):
                 poisoned_families.add(_model_family(agent))
             if _is_timeout_error(exc) and not emitted_any:

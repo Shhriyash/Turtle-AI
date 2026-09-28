@@ -5102,15 +5102,13 @@ def _classify_handler_error(exc: Exception) -> tuple[str, str]:
 # whole cascade gave up). Those tokens were genuinely spent; excluding them
 # would undercount exactly the expensive-failure case most worth capturing.
 #
-# STREAMING GAP: _execute_turn_streaming (the voice/streaming path) performs
-# NEITHER a reservation NOR a spend record — it has no CascadeStats to read
-# a real cost from at all. This BYPASSES the daily budget ENTIRELY for voice
-# turns, not merely "leaves them uncounted": a user can exhaust every bit of
-# ledger 1a.4's intended spend ceiling by speaking instead of typing, with no
-# refusal, ever, on this path. See the comment at its call to
-# stream_agent_text_with_fallbacks. The ledger accepts this explicitly
-# ("streaming joins in Phase 4") — it is not an oversight, but whoever picks
-# up Phase 4 should understand the size of the gap, not just its existence.
+# STREAMING (WP4.5 / ledger 4.5): _execute_turn_streaming now reserves and
+# finalizes against this SAME mechanism — see its docstring for the
+# reserve-before/reconcile-after shape, the refusal-via-fallback-to-batch
+# choice, and how a mid-stream death with partial usage is handled. It does
+# not roll a second limiter; it calls _reserve_daily_spend/_finalize_daily_
+# spend exactly as this function does, with the reservation held across the
+# whole streamed run rather than one blocking call.
 
 def _utc_day_str() -> str:
     from datetime import UTC, datetime
@@ -5620,153 +5618,196 @@ async def _execute_turn_streaming(
 
     Raises ``_StreamPreAudioError`` if it fails before the first audio frame, so
     the caller can transparently fall back to the batch path for this turn.
-    """
-    # --- pre-run: identical inputs to the batch path -----------------------
-    # WP1.H: reset this turn's tool-sourced URL bucket (mirrors _execute_turn).
-    state.tool_sourced_urls = []
-    if state.user_id:
-        emit_event_once(state.user_id, "first_message_sent", channel=channel)
 
-    pending_prompt = state.confirmation_gate.next_prompt()
-    if pending_prompt is not None:
+    WP4.5 (ledger 4.5): reserves against the same daily spend ceiling the
+    batch path uses (``_reserve_daily_spend``/``_finalize_daily_spend``), not
+    a second mechanism — see the module comment above those functions for why
+    reservation-before-run beats check-then-act under concurrency.
+
+    Reserve-before / reconcile-after shape: the reservation is taken BEFORE
+    anything else runs (same "refusal costs nothing further" contract as the
+    batch path) and reconciled in a ``finally`` around the entire streamed
+    run, so it fires on a normal return, a caught exception, AND a
+    ``asyncio.CancelledError`` from a client dropping the socket mid-stream
+    (``BaseException``, not ``Exception`` — a plain ``except Exception``
+    would miss it and strand the reservation; see ``_finalize_daily_spend``'s
+    docstring). A stream that dies mid-way still reconciles against whatever
+    ``cascade_stats`` recorded up to that point (including tokens from a rung
+    that streamed partial output before failing — see the wasted-token
+    capture in ``stream_agent_text_with_fallbacks``), never the untouched
+    worst-case reservation.
+
+    Refusal shape: when the reservation is refused, NOTHING has been sent to
+    the client yet (no status frame, no audio) — so this raises
+    ``_StreamPreAudioError`` rather than emitting its own refusal frame,
+    letting the existing pre-audio fallback in ``_reply_and_speak`` hand the
+    turn to the batch path, whose own (separate) reservation refuses again
+    and — critically for voice — gets its refusal message SPOKEN via TTS,
+    which this function has no TTS pipeline armed to do at this point. The
+    first reservation attempt is refunded to 0 by ``_reserve_daily_spend``
+    itself before returning, so nothing leaks from the extra round trip.
+    """
+    # WP4.5: reserve BEFORE any other work, mirroring _execute_turn — a
+    # refusal here costs nothing further (no memory-context resolution, no
+    # confirmation-prompt frame, no LLM call).
+    _budget_allowed, _budget_refusal, _budget_reserved, _budget_key = _reserve_daily_spend(state.user_id)
+    if not _budget_allowed:
+        raise _StreamPreAudioError(_budget_refusal or "daily budget exceeded")
+
+    # Hoisted so it's available to the outer `finally` below on every exit
+    # path, including one that raises before the stream itself starts.
+    cascade_stats = CascadeStats()
+    try:
+        # --- pre-run: identical inputs to the batch path -------------------
+        # WP1.H: reset this turn's tool-sourced URL bucket (mirrors _execute_turn).
+        state.tool_sourced_urls = []
+        if state.user_id:
+            emit_event_once(state.user_id, "first_message_sent", channel=channel)
+
+        pending_prompt = state.confirmation_gate.next_prompt()
+        if pending_prompt is not None:
+            await _ws_send_json(ws, {
+                "type": "confirmation_prompt",
+                "event_ids": list(pending_prompt.all_event_ids),
+                "topic": pending_prompt.topic,
+                "key": pending_prompt.key,
+                "message": pending_prompt.question,
+            })
+
+        task_type = _detect_task_type(user_text)
+        if task_type == "general":
+            _pending_email = state.session_store.get_pending_email() or {}
+            if _pending_email.get("recipients") or _pending_email.get("subject") or _pending_email.get("content"):
+                task_type = "email"
+
+        state.memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=user_text)
+        turn_id = _new_turn_id(state)
+
+        # --- streamed run + TTS ---------------------------------------------
+        collector = StreamCollector()
+        first_audio_sent = False
+        chunks_sent = 0
+        llm_start = time.time()
+
+        async def _token_source():
+            # Yields raw model text deltas; StreamCollector captures the finished run.
+            # WP4.5: stats=cascade_stats closes the daily-budget bypass — the
+            # cascade's real token cost is now recorded the same way the batch
+            # path records it, reconciled against the reservation above in
+            # this function's outer `finally`.
+            async for delta in stream_agent_text_with_fallbacks(
+                agents_mgr.main_assistant,
+                agents_mgr.main_assistant_fallbacks,
+                user_text,
+                deps=state,
+                message_history=message_history,
+                usage_limits=agents_mgr.usage_limits,
+                collector=collector,
+                stats=cascade_stats,
+            ):
+                yield delta
+
+        from core.latency_budgets import budgets, check_sla
+        from core.streaming_tts import stream_tts_from_token_stream
+
+        await _ws_send_json(ws, {"type": "status", "status": "speaking"})
+        tts_start = time.time()
+        try:
+            # One per-turn trace span, same record the batch path writes to disk, so
+            # "why did Turtle answer X" stays answerable for streamed turns too.
+            with trace_sink.span(
+                "turtle.turn",
+                user_id=state.user_id,
+                session_id=state.session_store.session_id or "",
+                turn_id=turn_id,
+                intent=task_type,
+                memory_context_chars=len(state.memory_context or ""),
+                channel=channel,
+                streamed=True,
+            ):
+                async for _sentence, audio_bytes in stream_tts_from_token_stream(
+                    _token_source(),
+                    speed=float(config.get("TURTLE_TTS_SPEED", 1.2)),
+                    tts_timeout_s=budgets.TOOL_S,
+                    clean_fn=clean_text_for_tts,
+                ):
+                    if not first_audio_sent:
+                        timings["tts_first_byte_ms"] = round((time.time() - tts_start) * 1000)
+                        check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
+                        first_audio_sent = True
+                    await ws.send_bytes(audio_bytes)
+                    chunks_sent += 1
+        except Exception as exc:
+            # Nothing spoken yet → the batch path can still serve this turn cleanly.
+            if not first_audio_sent:
+                print(f"LOG: voice stream failed pre-audio ({channel}): {exc}")
+                raise _StreamPreAudioError(str(exc)) from exc
+            # Audio already went out; log and continue to persist what we have.
+            print(f"LOG: voice stream error after first audio ({channel}): {exc}")
+            traceback.print_exc()
+
+        timings["llm_ms"] = round((time.time() - llm_start) * 1000)
+
+        final_output = clean_text_for_model(collector.output or "")
+        if not final_output:
+            # No usable text produced and nothing spoken → fall back to batch.
+            if not first_audio_sent:
+                raise _StreamPreAudioError("stream produced no output")
+            return TurnOutcome(message_history, None, "")
+
+        # Send the full reply text for the transcript UI once synthesis is underway.
+        # Display-cleaned (markdown links preserved) so the chat renders clickable links.
         await _ws_send_json(ws, {
-            "type": "confirmation_prompt",
-            "event_ids": list(pending_prompt.all_event_ids),
-            "topic": pending_prompt.topic,
-            "key": pending_prompt.key,
-            "message": pending_prompt.question,
+            "type": "done",
+            "content": clean_text_for_display(collector.output or ""),
+            "tool_urls": list(state.tool_sourced_urls),
         })
 
-    task_type = _detect_task_type(user_text)
-    if task_type == "general":
-        _pending_email = state.session_store.get_pending_email() or {}
-        if _pending_email.get("recipients") or _pending_email.get("subject") or _pending_email.get("content"):
-            task_type = "email"
-
-    state.memory_context = await _resolve_memory_context(state, task_type=task_type, user_text=user_text)
-    turn_id = _new_turn_id(state)
-
-    # --- streamed run + TTS ------------------------------------------------
-    collector = StreamCollector()
-    first_audio_sent = False
-    chunks_sent = 0
-    llm_start = time.time()
-
-    async def _token_source():
-        # Yields raw model text deltas; StreamCollector captures the finished run.
-        # WP1.D2 (ledger 1a.4 part 4): this path BYPASSES the daily token
-        # budget ENTIRELY, not merely "leaves it uncounted" — there is no
-        # _reserve_daily_spend/_finalize_daily_spend call anywhere on this
-        # path (stream_agent_text_with_fallbacks takes no `stats=`, so there
-        # is no CascadeStats to reconcile against even if there were). A
-        # user can exhaust the WHOLE intent of ledger 1a.4's spend ceiling by
-        # speaking instead of typing, with no refusal ever, on this path.
-        # This is the ledger's accepted, explicit gap ("streaming joins in
-        # Phase 4") — not an oversight, but whoever picks up Phase 4 should
-        # understand the size of it, not just its existence. Not fixed here
-        # (usage_limits.total_tokens_limit still bounds one streamed turn's
-        # OWN worst case via pydantic-ai, it just never touches
-        # turtle:spend:{uid}:{yyyymmdd} at all).
-        async for delta in stream_agent_text_with_fallbacks(
-            agents_mgr.main_assistant,
-            agents_mgr.main_assistant_fallbacks,
-            user_text,
-            deps=state,
-            message_history=message_history,
-            usage_limits=agents_mgr.usage_limits,
-            collector=collector,
-        ):
-            yield delta
-
-    from core.latency_budgets import budgets, check_sla
-    from core.streaming_tts import stream_tts_from_token_stream
-
-    await _ws_send_json(ws, {"type": "status", "status": "speaking"})
-    tts_start = time.time()
-    try:
-        # One per-turn trace span, same record the batch path writes to disk, so
-        # "why did Turtle answer X" stays answerable for streamed turns too.
-        with trace_sink.span(
-            "turtle.turn",
-            user_id=state.user_id,
-            session_id=state.session_store.session_id or "",
-            turn_id=turn_id,
-            intent=task_type,
-            memory_context_chars=len(state.memory_context or ""),
-            channel=channel,
-            streamed=True,
-        ):
-            async for _sentence, audio_bytes in stream_tts_from_token_stream(
-                _token_source(),
-                speed=float(config.get("TURTLE_TTS_SPEED", 1.2)),
-                tts_timeout_s=budgets.TOOL_S,
-                clean_fn=clean_text_for_tts,
-            ):
-                if not first_audio_sent:
-                    timings["tts_first_byte_ms"] = round((time.time() - tts_start) * 1000)
-                    check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
-                    first_audio_sent = True
-                await ws.send_bytes(audio_bytes)
-                chunks_sent += 1
-    except Exception as exc:
-        # Nothing spoken yet → the batch path can still serve this turn cleanly.
-        if not first_audio_sent:
-            print(f"LOG: voice stream failed pre-audio ({channel}): {exc}")
-            raise _StreamPreAudioError(str(exc)) from exc
-        # Audio already went out; log and continue to persist what we have.
-        print(f"LOG: voice stream error after first audio ({channel}): {exc}")
-        traceback.print_exc()
-
-    timings["llm_ms"] = round((time.time() - llm_start) * 1000)
-
-    final_output = clean_text_for_model(collector.output or "")
-    if not final_output:
-        # No usable text produced and nothing spoken → fall back to batch.
-        if not first_audio_sent:
-            raise _StreamPreAudioError("stream produced no output")
-        return TurnOutcome(message_history, None, "")
-
-    # Send the full reply text for the transcript UI once synthesis is underway.
-    # Display-cleaned (markdown links preserved) so the chat renders clickable links.
-    await _ws_send_json(ws, {
-        "type": "done",
-        "content": clean_text_for_display(collector.output or ""),
-        "tool_urls": list(state.tool_sourced_urls),
-    })
-
-    # --- post-run: identical bookkeeping to the batch path -----------------
-    message_history = _persist_history(message_history, collector)
-    await state.session_store.replace_messages(message_history)
-    state.rag_system.add_conversation(user_text, final_output)
-    _apply_explicit_facts_from_turn(
-        state,
-        session_id=state.session_store.session_id or "unknown_session",
-        turn_id=turn_id,
-        user_text=user_text,
-        task_type=task_type,
-    )
-    _queue_confirmation_candidates_from_turn(
-        state,
-        session_id=state.session_store.session_id or "unknown_session",
-        user_text=user_text,
-    )
-    cap_notice = pop_pending_storage_cap_notice(_storage_cap_key(state))
-    if cap_notice:
-        await _ws_send_json(ws, cap_notice)
-    if state.reflector is not None:
-        await state.reflector.on_turn(
+        # --- post-run: identical bookkeeping to the batch path -------------
+        message_history = _persist_history(message_history, collector)
+        await state.session_store.replace_messages(message_history)
+        state.rag_system.add_conversation(user_text, final_output)
+        _apply_explicit_facts_from_turn(
             state,
-            session_id=state.session_store.session_id or "",
-            message_history=message_history or [],
+            session_id=state.session_store.session_id or "unknown_session",
+            turn_id=turn_id,
+            user_text=user_text,
+            task_type=task_type,
         )
+        _queue_confirmation_candidates_from_turn(
+            state,
+            session_id=state.session_store.session_id or "unknown_session",
+            user_text=user_text,
+        )
+        cap_notice = pop_pending_storage_cap_notice(_storage_cap_key(state))
+        if cap_notice:
+            await _ws_send_json(ws, cap_notice)
+        if state.reflector is not None:
+            await state.reflector.on_turn(
+                state,
+                session_id=state.session_store.session_id or "",
+                message_history=message_history or [],
+            )
 
-    timings["tts_ms"] = round((time.time() - tts_start) * 1000)
-    timings["total_ms"] = round((time.time() - overall_start) * 1000)
-    await _ws_send_json(ws, {"type": "timing", **timings})
-    print(f"LOG: voice stream done — {chunks_sent} chunks, "
-          f"first_audio={timings.get('tts_first_byte_ms')}ms, total={timings['total_ms']}ms")
+        timings["tts_ms"] = round((time.time() - tts_start) * 1000)
+        timings["total_ms"] = round((time.time() - overall_start) * 1000)
+        await _ws_send_json(ws, {"type": "timing", **timings})
+        print(f"LOG: voice stream done — {chunks_sent} chunks, "
+              f"first_audio={timings.get('tts_first_byte_ms')}ms, total={timings['total_ms']}ms")
 
-    return TurnOutcome(message_history, final_output, final_output)
+        return TurnOutcome(message_history, final_output, final_output)
+    finally:
+        # WP4.5: reconcile on EVERY exit path — normal return, a caught
+        # exception, a re-raised _StreamPreAudioError, AND a bare
+        # BaseException (asyncio.CancelledError on a dropped websocket).
+        # `finally` runs for all of these; `except Exception` alone would
+        # miss the cancellation and strand the reservation. No-op when
+        # nothing was reserved (see _reserve_daily_spend's return contract).
+        _finalize_daily_spend(
+            _budget_key,
+            _budget_reserved,
+            cascade_stats.total_input_tokens + cascade_stats.total_output_tokens,
+        )
 
 
 async def _handle_audio_message(
