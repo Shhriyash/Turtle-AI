@@ -29,7 +29,19 @@ file:
      happened.
 
 The fixture below reproduces both: a DATABASE_URL_UNPOOLED value containing
-"$", a backtick, and "&", plus an unrelated GEMINI_API_KEY in the same file.
+"$", a backtick, and "&", plus an unrelated variable in the same file. That
+unrelated variable is a project-specific SENTINEL name
+(TURTLE_EXTRACTION_SENTINEL_MUST_NOT_LEAK), not a real secret name like
+GEMINI_API_KEY: an earlier version of this test used GEMINI_API_KEY and
+passed locally, then failed in CI, because .github/workflows/tests.yml
+exports a real (dummy) GEMINI_API_KEY into the whole job — the subprocess
+inherited it from the AMBIENT environment regardless of what the extraction
+did, so the "did not leak" assertion was answering "is GEMINI_API_KEY set
+at all?" rather than "did the extraction set it from the pulled file?". A
+name this project will never legitimately export sidesteps that, and the
+subprocess's environment is additionally passed explicitly (see
+_run_extraction's `env=`) with the sentinel scrubbed out, so the assertion
+does not depend on luck about what happens to be ambient either way.
 """
 from __future__ import annotations
 
@@ -73,6 +85,11 @@ _TRICKY_VALUE = (
     "postgresql://u:npg_ab$cd`whoami`@host/db"
     "?sslmode=require&channel_binding=require"
 )
+# A name that cannot collide with anything real: not GEMINI_API_KEY or any
+# other variable this project (or its CI) genuinely exports, so the "did it
+# leak" assertion can only be answered by the extraction under test, never
+# by ambient environment the test happens to inherit.
+_SENTINEL_KEY = "TURTLE_EXTRACTION_SENTINEL_MUST_NOT_LEAK"
 _UNRELATED_SECRET = "sk-fake-should-never-leave-this-step-0000000000"
 
 
@@ -81,7 +98,7 @@ def _write_fixture(tmp_path: Path) -> Path:
     fixture.write_text(
         'DATABASE_URL="postgresql://u:p@ep-fake-pooler.c-10.us-east-1.aws.neon.tech/db"\n'
         f'DATABASE_URL_UNPOOLED="{_TRICKY_VALUE}"\n'
-        f'GEMINI_API_KEY="{_UNRELATED_SECRET}"\n',
+        f'{_SENTINEL_KEY}="{_UNRELATED_SECRET}"\n',
         encoding="utf-8",
     )
     return fixture
@@ -121,7 +138,7 @@ def _run_extraction(fixture: Path, tmp_path: Path) -> subprocess.CompletedProces
         f"env_file={shlex.quote(_bash_path(fixture))}\n"
         f"{_extraction_command_from_workflow()}\n"
         'printf "%s\\n" "$extracted_unpooled"\n'
-        'printf "GEMINI_API_KEY=[%s]\\n" "${GEMINI_API_KEY:-<not set>}"\n'
+        f'printf "{_SENTINEL_KEY}=[%s]\\n" "${{{_SENTINEL_KEY}:-<not set>}}"\n'
     )
     script_path = tmp_path / "run_extraction.sh"
     # newline="": write literal "\n" only — Path.write_text's default
@@ -131,11 +148,20 @@ def _run_extraction(fixture: Path, tmp_path: Path) -> subprocess.CompletedProces
     # plain "set -euo pipefail" line).
     with open(script_path, "w", encoding="utf-8", newline="") as f:
         f.write(script)
+    # Explicit env=, with the sentinel scrubbed: the assertion must be about
+    # what the extraction under test wrote into the environment, not about
+    # whatever this test process happened to inherit. `os.environ` is
+    # unlikely to already contain our made-up sentinel name, but the point
+    # is to not rely on that being true by luck — pop it defensively so the
+    # subprocess starts from a known state either way.
+    subprocess_env = dict(os.environ)
+    subprocess_env.pop(_SENTINEL_KEY, None)
     return subprocess.run(
         ["bash", _bash_path(script_path)],
         capture_output=True,
         text=True,
         cwd=str(ROOT_DIR),
+        env=subprocess_env,
     )
 
 
@@ -156,6 +182,6 @@ def test_workflow_extraction_recovers_value_byte_identical_and_does_not_leak_oth
     # was expanded or executed.
     assert recovered_value == _TRICKY_VALUE
 
-    # The unrelated GEMINI_API_KEY in the same pulled file must never enter
-    # this step's environment.
-    assert leaked_line == "GEMINI_API_KEY=[<not set>]"
+    # The unrelated sentinel variable in the same pulled file must never
+    # enter this step's environment.
+    assert leaked_line == f"{_SENTINEL_KEY}=[<not set>]"
