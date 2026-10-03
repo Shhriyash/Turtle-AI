@@ -3611,10 +3611,21 @@ async def readyz():
 
     from core.storage.cloud import probe_postgres, probe_redis
 
-    postgres_ok, redis_ok = await asyncio.gather(probe_postgres(), probe_redis())
+    from apps.admin_routes import cron_liveness
+
+    postgres_ok, redis_ok, cron = await asyncio.gather(
+        probe_postgres(), probe_redis(), cron_liveness()
+    )
     ok = postgres_ok and redis_ok
+    # Cron liveness is informational: status_code depends ONLY on the probes
+    # (deploy-vercel.yml gates promotion on 200; a stale tick must not block it).
     return JSONResponse(
-        {"postgres": postgres_ok, "redis": redis_ok},
+        {
+            "postgres": postgres_ok,
+            "redis": redis_ok,
+            "cron_last_tick_age_s": cron["last_tick_age_s"],
+            "cron_tick_status": cron["status"],
+        },
         status_code=200 if ok else 503,
     )
 

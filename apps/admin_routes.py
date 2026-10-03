@@ -115,6 +115,67 @@ def _last_seen(user_dir: Path) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Cron-tick liveness (ledger 5.8)
+# ---------------------------------------------------------------------------
+
+# A tick older than this is "stale". Single source of truth: sent to the admin
+# page in the payload (``cron.stale_after_s``) so the page cannot drift, and
+# used for the /readyz ``cron_tick_status`` label.
+CRON_TICK_STALE_AFTER_S = 30 * 60
+
+
+def _classify_cron_age(age_s: float | None) -> str:
+    if age_s is None:
+        return "never"
+    return "stale" if age_s > CRON_TICK_STALE_AFTER_S else "ok"
+
+
+async def cron_liveness() -> dict[str, Any]:
+    """Seconds since the cron tick last committed, for /readyz and the admin page.
+
+    INFORMATIONAL ONLY: callers must never derive an HTTP status from this.
+    deploy-vercel.yml promotes to production only on /readyz == 200, and the
+    tick gap is routinely hours, so coupling them would block every deploy.
+
+    ``status``: ``ok`` | ``stale`` (> CRON_TICK_STALE_AFTER_S) | ``never``
+    (cron_state.last_tick_at is NULL; age is null, not 0, which would read as
+    "just ticked") | ``unknown`` (the read failed or timed out; fails soft) |
+    ``not_applicable`` (local mode uses the in-process APScheduler and has no
+    cron_state table).
+
+    Uses the non-locking reader so it never contends with a running tick.
+    """
+    base: dict[str, Any] = {"stale_after_s": CRON_TICK_STALE_AFTER_S}
+    if not settings.is_cloud:
+        return {**base, "last_tick_age_s": None, "status": "not_applicable"}
+
+    import asyncio
+
+    from core.storage import cloud as _cloud
+    from core.storage.cloud import cron_state_store
+
+    # The arithmetic is inside the try deliberately, not just the read: this
+    # coroutine runs inside /readyz's asyncio.gather, so ANY exception escaping
+    # here becomes a 500 -- and deploy-vercel.yml promotes only on 200, so it
+    # would block every deploy. A tz-naive last_tick_at (the column is
+    # TIMESTAMPTZ, so this should be impossible) would otherwise raise TypeError
+    # on the subtraction. CancelledError inherits BaseException and is
+    # deliberately NOT caught, so cancellation still propagates.
+    try:
+        last = await asyncio.wait_for(
+            asyncio.to_thread(cron_state_store.get_last_tick_at),
+            timeout=_cloud.READYZ_TIMEOUT_S,
+        )
+        if last is None:
+            return {**base, "last_tick_age_s": None, "status": "never"}
+        age = round(max(0.0, (datetime.now(UTC) - last).total_seconds()), 1)
+    except Exception:  # driver errors, pool timeout, TimeoutError, bad tz data
+        return {**base, "last_tick_age_s": None, "status": "unknown"}
+
+    return {**base, "last_tick_age_s": age, "status": _classify_cron_age(age)}
+
+
+# ---------------------------------------------------------------------------
 # /admin/users
 # ---------------------------------------------------------------------------
 
@@ -168,6 +229,7 @@ async def admin_users(x_admin_token: str | None = Header(default=None)) -> JSONR
         "users": users,
         "count": len(users),
         "storage_cap_mb": settings.user_storage_cap_mb,
+        "cron": await cron_liveness(),
     })
 
 
