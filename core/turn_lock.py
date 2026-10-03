@@ -37,6 +37,16 @@ Usage::
 The release runs in ``__aexit__``, i.e. a ``finally`` -- it executes on
 ``asyncio.CancelledError`` (a BaseException that escapes ``except Exception``),
 so an interrupted turn does not leak the key for its whole TTL.
+
+SESSION LEASE (ledger 6.4) lives here too, on the same primitive and the same
+two backends: ``SessionLease`` claims ``turtle:session_lease:{session_id}``
+(``SET NX EX 90``), is refreshed by the connection's 30 s ping, and is released
+by compare-and-delete. It exists because two connections that resume the same
+session each write their whole in-memory history over the other's (Postgres
+``put`` is a full overwrite), and one tab's disconnect finalises -- and
+compacts -- the session under the other. See ``SessionLease`` for the one
+addition the ledger's text lacks (identity-based takeover, so a client
+reconnecting after an unclean drop is not locked out by its own stale lease).
 """
 from __future__ import annotations
 
@@ -70,8 +80,41 @@ RELEASE_LUA = (
 )
 
 
+# Session lease (ledger 6.4).
+SESSION_LEASE_KEY_PREFIX = "turtle:session_lease:"
+SESSION_LEASE_TTL_S = 90
+# The client pings every 30 s; the lease TTL is three missed pings.
+
+# Refresh only if the key still holds OUR token (an unconditional EXPIRE would
+# extend somebody else's lease). Same compare-and-act shape as RELEASE_LUA.
+REFRESH_LUA = (
+    'if redis.call("get", KEYS[1]) == ARGV[1] then\n'
+    '    return redis.call("expire", KEYS[1], ARGV[2])\n'
+    "else\n"
+    "    return 0\n"
+    "end"
+)
+
+# Take over a lease held by a PREVIOUS connection of the same client identity.
+# Values are "<identity>:<uuid>", so the identity prefix (ARGV[1], including the
+# trailing colon) is compared atomically with the overwrite: no window in which
+# another client's freshly-won lease could be replaced.
+TAKEOVER_LUA = (
+    'local cur = redis.call("get", KEYS[1])\n'
+    "if cur and string.sub(cur, 1, string.len(ARGV[1])) == ARGV[1] then\n"
+    '    redis.call("set", KEYS[1], ARGV[2], "EX", ARGV[3])\n'
+    "    return 1\n"
+    "end\n"
+    "return 0"
+)
+
+
 def turn_lock_key(user_id: str) -> str:
     return f"{TURN_LOCK_KEY_PREFIX}{user_id}"
+
+
+def session_lease_key(session_id: str) -> str:
+    return f"{SESSION_LEASE_KEY_PREFIX}{session_id}"
 
 
 def new_token(owner: str) -> str:
@@ -105,6 +148,31 @@ class InProcessTurnLockBackend:
             return True
         return False
 
+    # -- session-lease operations (ledger 6.4) ------------------------------
+    def _live(self, key: str) -> tuple[str, float] | None:
+        cur = self._held.get(key)
+        if cur is not None and cur[1] > time.monotonic():
+            return cur
+        return None
+
+    async def holder(self, key: str) -> str | None:
+        cur = self._live(key)
+        return cur[0] if cur else None
+
+    async def refresh(self, key: str, token: str, ttl_s: int) -> bool:
+        cur = self._live(key)
+        if cur is not None and cur[0] == token:
+            self._held[key] = (token, time.monotonic() + ttl_s)
+            return True
+        return False
+
+    async def takeover(self, key: str, prefix: str, token: str, ttl_s: int) -> bool:
+        cur = self._live(key)
+        if cur is not None and cur[0].startswith(prefix):
+            self._held[key] = (token, time.monotonic() + ttl_s)
+            return True
+        return False
+
 
 class RedisTurnLockBackend:
     """Cloud mode: SET NX EX to acquire, Lua compare-and-delete to release."""
@@ -122,6 +190,22 @@ class RedisTurnLockBackend:
         client = await self._client()
         deleted = await client.eval(RELEASE_LUA, 1, key, token)
         return bool(deleted)
+
+    # -- session-lease operations (ledger 6.4) ------------------------------
+    async def holder(self, key: str) -> str | None:
+        client = await self._client()
+        value = await client.get(key)
+        if value is None:
+            return None
+        return value.decode() if isinstance(value, (bytes, bytearray)) else str(value)
+
+    async def refresh(self, key: str, token: str, ttl_s: int) -> bool:
+        client = await self._client()
+        return bool(await client.eval(REFRESH_LUA, 1, key, token, ttl_s))
+
+    async def takeover(self, key: str, prefix: str, token: str, ttl_s: int) -> bool:
+        client = await self._client()
+        return bool(await client.eval(TAKEOVER_LUA, 1, key, prefix, token, ttl_s))
 
 
 _in_process_backend = InProcessTurnLockBackend()
@@ -211,6 +295,144 @@ class TurnLock:
 
 def turn_lock(user_id: str, owner: str, **kwargs: Any) -> TurnLock:
     return TurnLock(user_id, owner, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Session lease (ledger 6.4)
+# ---------------------------------------------------------------------------
+class SessionLease:
+    """One WebSocket connection's claim on a session.
+
+    ``SET turtle:session_lease:{session_id} <identity>:<uuid> NX EX 90``,
+    refreshed by the 30 s ping, released by compare-and-delete. A second
+    connection that finds the lease held opens a NEW session instead of
+    resuming (and does not demote, sweep or compact the holder's); compaction
+    and finalisation run only for the holder.
+
+    Addition to the ledger's text -- IDENTITY. The ledger's bare NX has a
+    hole: after an unclean drop (Vercel's 300 s cut, a dead network) the dead
+    connection's lease lives for up to 90 s while the client retries every
+    1-30 s, so the reconnecting client would find its OWN stale lease held and
+    open a new session on every cut. The lease value therefore carries the
+    client's identity (a per-tab id the client sends as ``?cid=``), and a
+    claim by the same identity takes the lease over atomically (TAKEOVER_LUA).
+    A different client (another tab, another device) is still refused. A
+    connection with no client id uses its own connection id, which can never
+    match a previous connection -- exactly the ledger's behaviour.
+
+    Posture: FAIL OPEN, like the turn lock. If the backend errors the claim
+    succeeds as ``degraded`` and the connection behaves as it did before the
+    lease existed; a Redis blip must not take sessions down.
+    """
+
+    def __init__(
+        self,
+        identity: str,
+        *,
+        ttl_s: int = SESSION_LEASE_TTL_S,
+        backend: Any = None,
+    ) -> None:
+        self.identity = identity
+        self.token = new_token(identity)
+        self._prefix = f"{identity}:"
+        self.ttl_s = ttl_s
+        self._backend = backend
+        self.session_id: str | None = None
+        self.held = False
+        self.degraded = False
+        self.lost = False
+
+    def _be(self) -> Any:
+        if self._backend is None:
+            self._backend = get_turn_lock_backend()
+        return self._backend
+
+    @property
+    def is_holder(self) -> bool:
+        """True when this connection may write/finalise its session."""
+        return (self.held or self.degraded) and not self.lost
+
+    async def claim(self, session_id: str, *, takeover: bool = True) -> bool:
+        """Claim ``session_id``. False means another client holds it.
+
+        ``takeover`` lets a new connection of the SAME client identity replace
+        its predecessor's lease. ``ensure`` passes False: a connection that has
+        been superseded must not steal the lease back."""
+        key = session_lease_key(session_id)
+        backend = self._be()
+        try:
+            got = await asyncio.wait_for(
+                backend.try_acquire(key, self.token, self.ttl_s),
+                timeout=_REDIS_OP_TIMEOUT_S,
+            )
+            if not got and takeover:
+                got = await asyncio.wait_for(
+                    backend.takeover(key, self._prefix, self.token, self.ttl_s),
+                    timeout=_REDIS_OP_TIMEOUT_S,
+                )
+        except Exception as exc:  # noqa: BLE001 - fail open on ANY backend error
+            print(f"LOG: session lease unavailable, failing OPEN: {type(exc).__name__}: {exc}")
+            self.degraded = True
+            self.session_id = session_id
+            return True
+        if got:
+            self.held = True
+            self.lost = False
+            self.session_id = session_id
+        return bool(got)
+
+    async def held_by_other(self, session_id: str) -> bool:
+        """Read-only probe: is ``session_id`` leased by a DIFFERENT client?"""
+        try:
+            value = await asyncio.wait_for(
+                self._be().holder(session_lease_key(session_id)),
+                timeout=_REDIS_OP_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail open
+            print(f"LOG: session lease probe failed, assuming free: {type(exc).__name__}: {exc}")
+            return False
+        return value is not None and not value.startswith(self._prefix)
+
+    async def ensure(self) -> bool:
+        """Refresh (ping / turn boundaries). If the key vanished -- expiry
+        during a stall, a Redis eviction -- try to re-claim it; if somebody
+        else has it by now the lease is LOST and the caller must stop writing.
+        Returns ``is_holder``."""
+        if self.session_id is None or self.lost:
+            return self.is_holder
+        if not self.held:
+            return self.is_holder  # degraded: nothing to refresh
+        try:
+            ok = await asyncio.wait_for(
+                self._be().refresh(
+                    session_lease_key(self.session_id), self.token, self.ttl_s
+                ),
+                timeout=_REDIS_OP_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail open: keep holding
+            print(f"LOG: session lease refresh failed (TTL decides): {type(exc).__name__}: {exc}")
+            return True
+        if ok:
+            return True
+        # Not ours any more.
+        self.held = False
+        if await self.claim(self.session_id, takeover=False):
+            return True
+        self.lost = True
+        print(f"LOG: session lease lost for {self.session_id}")
+        return False
+
+    async def release(self) -> None:
+        if not self.held or self.session_id is None:
+            return
+        self.held = False
+        try:
+            await asyncio.wait_for(
+                self._be().release(session_lease_key(self.session_id), self.token),
+                timeout=_REDIS_OP_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"LOG: session lease release failed (TTL will reclaim): {type(exc).__name__}: {exc}")
 
 
 BUSY_MESSAGE = (

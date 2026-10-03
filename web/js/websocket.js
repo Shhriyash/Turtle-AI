@@ -17,39 +17,124 @@ import { updateTimings } from './devmode.js';
 import { renderConfirmationPrompt } from './memory.js';
 import { showHeard } from './ambient.js';
 
+/** Reconnect backoff (ledger 6.8): 1 s, doubling to 30 s, reset on open. */
+export const RECONNECT_BASE_MS = 1000;
+export const RECONNECT_MAX_MS = 30000;
+
+/** A stable per-tab id. sessionStorage survives a reload and a reconnect but is
+ *  NOT shared between tabs, so two tabs are two clients (the server's session
+ *  lease then gives the second its own session instead of clobbering the first). */
+export function getClientId() {
+    if (AppState.clientId) return AppState.clientId;
+    let id = null;
+    try { id = sessionStorage.getItem('turtle_cid'); } catch (_) {}
+    if (!id || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) {
+        const c = globalThis.crypto;
+        id = (c && c.randomUUID)
+            ? c.randomUUID().replace(/-/g, '')
+            : Array.from({ length: 24 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+        try { sessionStorage.setItem('turtle_cid', id); } catch (_) {}
+    }
+    AppState.clientId = id;
+    return id;
+}
+
+/** Schedule the next reconnect attempt (one timer at a time). */
+function scheduleReconnect() {
+    if (AppState.reconnectTimer) return;
+    const delay = AppState.reconnectDelayMs;
+    AppState.reconnectDelayMs = Math.min(delay * 2, RECONNECT_MAX_MS);
+    AppState.reconnectTimer = setTimeout(() => {
+        AppState.reconnectTimer = null;
+        if (!AppState.isConnected) connectWebSocket();
+    }, delay);
+}
+
+/** Resume protocol: tell the server which session/turn we last saw, then
+ *  resend anything it refused to start before the planned cut. */
+function sendResumeAndResend(ws) {
+    if (AppState.hasConnected && AppState.sessionId) {
+        ws.send(JSON.stringify({
+            type: 'resume',
+            session_id: AppState.sessionId,
+            last_turn_id: AppState.lastTurnId,
+        }));
+    }
+    AppState.hasConnected = true;
+    const queue = AppState.resendQueue;
+    AppState.resendQueue = [];
+    for (const item of queue) {
+        if (item.kind === 'text') {
+            // A typed message already has its bubble; a streamed-mic utterance
+            // was never drawn (the server deferred it before `transcription`).
+            if (item.source === 'mic') addMessage('user', item.content);
+            ws.send(JSON.stringify({ type: 'text', content: item.content }));
+        } else if (item.kind === 'audio') {
+            ws.send(JSON.stringify({
+                type: 'audio', data: item.data, sample_rate: item.sample_rate,
+            }));
+        }
+    }
+}
+
 /** Connect (or reconnect) to the WebSocket server */
 export function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${location.host}/ws`;
+    const wsUrl = `${protocol}//${location.host}/ws?cid=${encodeURIComponent(getClientId())}`;
 
+    if (AppState.reconnectTimer) {
+        clearTimeout(AppState.reconnectTimer);
+        AppState.reconnectTimer = null;
+    }
     if (AppState.ws) {
         try { AppState.ws.close(); } catch (_) {}
     }
 
-    AppState.ws = new WebSocket(wsUrl);
+    let sock;
+    try {
+        sock = new WebSocket(wsUrl);
+    } catch (_) {
+        scheduleReconnect();
+        return;
+    }
+    AppState.ws = sock;
 
-    AppState.ws.onopen = () => {
+    sock.onopen = () => {
+        if (AppState.ws !== sock) return;
         AppState.isConnected = true;
+        AppState.reconnectDelayMs = RECONNECT_BASE_MS; // reset on open
+        AppState.plannedReconnect = false;
         setStatus('ready', 'Ready');
         setBubbleState('idle');
         hideBanner();
+        sendResumeAndResend(sock);
         showToast('Connected to Turtle AI');
     };
 
-    AppState.ws.onclose = () => {
+    sock.onclose = () => {
+        if (AppState.ws !== sock) return; // a superseded socket's late close
         AppState.isConnected = false;
-        setStatus('disconnected', 'Disconnected');
-        setBubbleState('disconnected');
-        showBanner();
+        if (AppState.plannedReconnect) {
+            // Deliberate 1012 cut: not an outage, so no banner.
+            setStatus('reconnecting', 'Reconnecting');
+        } else {
+            setStatus('disconnected', 'Disconnected');
+            setBubbleState('disconnected');
+            showBanner();
+        }
+        scheduleReconnect();
     };
 
-    AppState.ws.onerror = () => {
+    sock.onerror = () => {
+        if (AppState.ws !== sock) return;
         AppState.isConnected = false;
-        setStatus('disconnected', 'Connection error');
-        showBanner();
+        if (!AppState.plannedReconnect) {
+            setStatus('disconnected', 'Connection error');
+            showBanner();
+        }
     };
 
-    AppState.ws.onmessage = (event) => {
+    sock.onmessage = (event) => {
         if (event.data instanceof Blob) {
             playAudioBlob(event.data);
             return;
@@ -78,6 +163,11 @@ function handleServerMessage(msg) {
             if (msg.text) showHeard(msg.text, 'heard');
             break;
         case 'done':
+            // Only a turn of the CURRENT session is a valid resume cursor.
+            if (msg.turn_id && AppState.sessionId
+                && msg.turn_id.startsWith(AppState.sessionId + '_turn_')) {
+                AppState.lastTurnId = msg.turn_id;
+            }
             hideThinking();
             // WP1.H: msg.tool_urls is the server's allow-list of this turn's
             // tool-sourced URLs. A frame that omits the key entirely (e.g.
@@ -120,6 +210,15 @@ function handleServerMessage(msg) {
             break;
         case 'pong':
             break;
+        case 'resumed':
+            // Answer to our `resume`. If the server could not put us back in
+            // the session we were in (e.g. it was finalised after an unclean
+            // drop), adopt the new one; its turn numbering starts over.
+            if (msg.session_id && msg.session_id !== AppState.sessionId) {
+                AppState.sessionId = msg.session_id;
+                AppState.lastTurnId = null;
+            }
+            break;
         case 'turn_queued':
             // Ledger 6.1: a turn is already running, so the server queued this
             // message one deep (and `replaced` means it displaced an earlier
@@ -147,11 +246,35 @@ function handleStatusMessage(msg) {
         listening:    'Listening',
         speaking:     'Speaking',
         restored:     'Session restored',
+        reconnect:    'Reconnecting',
     };
+
+    // Ledger 6.8: the server will not start a turn that cannot finish before
+    // its connection ceiling. It sends `reconnect` (carrying any messages it
+    // refused), then closes with 1012; we reconnect, send `resume`, and resend.
+    if (msg.status === 'reconnect') {
+        AppState.plannedReconnect = true;
+        AppState.isConnected = false; // sendMessage now keeps text in the box
+        if (Array.isArray(msg.unstarted)) {
+            AppState.resendQueue.push(...msg.unstarted);
+        }
+        setStatus('reconnecting', 'Reconnecting');
+        return;
+    }
 
     // The ready frame advertises whether the server has streaming STT enabled.
     if (msg.status === 'ready') {
         AppState.streamSttEnabled = !!msg.stream_stt;
+        // First connect (no resume sent): the ready frame names the session.
+        // On a reconnect the `resumed` frame decides instead.
+        if (msg.session_id && !AppState.sessionId) {
+            AppState.sessionId = msg.session_id;
+            AppState.lastTurnId = null;
+        }
+    }
+    if (msg.status === 'restored' && msg.session_id && !AppState.sessionId) {
+        AppState.sessionId = msg.session_id;
+        AppState.lastTurnId = null;
     }
 
     // 'listening' is a streaming-STT state; map its bubble to the recording look.
@@ -176,7 +299,6 @@ export function startConnectionWatchdog() {
         }
     }, 30000);
 
-    setInterval(() => {
-        if (!AppState.isConnected) connectWebSocket();
-    }, 5000);
+    // Reconnection is event-driven now (onclose -> scheduleReconnect, 1 s
+    // doubling to 30 s), replacing the flat 5 s poll.
 }

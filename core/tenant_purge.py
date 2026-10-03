@@ -151,6 +151,18 @@ def _redis_patterns_for_user(user_id: str) -> list[str]:
 #                                   dedup guard, keyed by Discord's own
 #                                   interaction_id (not user id), 900s TTL.
 #                                   Same reasoning.
+#   turtle:session_lease:*        — core/turn_lock.py SessionLease (ledger 6.4),
+#                                   keyed by session_id (no user id in the
+#                                   key), 90s TTL. Holds only an opaque client
+#                                   token; expires on its own.
+#   turtle:turn_result:*          — core/session_store.py TurnResultBuffer
+#                                   (ledger 6.8), keyed by session_id + turn_id
+#                                   (no user id), 120s TTL. It does carry a
+#                                   turn's reply text, so a purge leaves up to
+#                                   two minutes of residue; it cannot be found
+#                                   per user without scanning every key, and
+#                                   the replay path refuses any record whose
+#                                   user_id is not the resuming caller's.
 
 
 async def purge_user(user_id: str) -> dict[str, Any]:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import contextvars
 import functools
 import base64
 import hashlib
@@ -119,7 +120,7 @@ from core.output_clean import (
 )
 from core.confirmation_gate import ConfirmationGate
 from core.guardrails import StorageCapExceededError, WebSocketRateLimitExceeded
-from core.turn_lock import BUSY_MESSAGE as TURN_BUSY_MESSAGE, turn_lock
+from core.turn_lock import BUSY_MESSAGE as TURN_BUSY_MESSAGE, SessionLease, turn_lock
 from core.storage.factory import get_channel_gate_buffer, get_ws_rate_limiter
 from core.telemetry import emit as emit_event, emit_once as emit_event_once
 from core.memory_journal import JournalStore, make_event
@@ -143,7 +144,7 @@ from core.paths import (
     ensure_dirs,
     personal_memory_dir,
 )
-from core.session_store import SessionStore
+from core.session_store import SessionStore, turn_results
 from core.system_prompts import load_prompt
 from core.openrouter_tts import synthesize_speech
 from core.stt_fastrtc import FastRTCSTT
@@ -949,7 +950,16 @@ async def _resolve_memory_context(state: SharedState, *, task_type: str, user_te
 
 
 def _new_turn_id(state: SharedState) -> str:
-    state.turn_counter += 1
+    # P6-B2 (ledger 6.8): the counter is persisted in the session blob and
+    # restored on resume. A fresh SharedState starts at 0, so without this a
+    # reconnect into the SAME session_id restarts at _turn_1 and the buffered
+    # results of the pre-cut turns (turtle:turn_result:{sid}:{turn_id}) would be
+    # overwritten -- and a replay would hand the client the wrong answers.
+    persisted = getattr(state.session_store, "turn_counter", 0)
+    if not isinstance(persisted, int):
+        persisted = 0
+    state.turn_counter = max(state.turn_counter, persisted) + 1
+    state.session_store.turn_counter = state.turn_counter
     return f"{state.session_store.session_id or 'session'}_turn_{state.turn_counter}"
 
 
@@ -3267,6 +3277,15 @@ async def _build_channel_state(user_id: str, channel: str) -> SharedState:
     the duration of each turn (search/url tools need one) and clears it after.
     """
     session_store = SessionStore(user_id=user_id)
+    # P6-B2 (ledger 6.4) decision: a channel turn does NOT claim the session
+    # lease (no ``lease=``). Channels are request/response with no connection to
+    # refresh a lease on, and a channel message is deliberately allowed to
+    # continue the user's live web session (cross-channel continuity). Writers
+    # are serialised by the per-user turn lock (ledger 6.3), which every channel
+    # turn takes. Known remaining hole: a channel turn arriving while a web tab
+    # holds the lease on a session older than the resume window can still demote
+    # it; the holder-only finalisation guards in websocket_endpoint contain the
+    # damage (the web tab's session is re-activated by its own next write).
     restore_result = await session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
     # Personal memory lives under personal_memory_dir(user_id); there is no
     # single-tenant store to construct.
@@ -4269,6 +4288,8 @@ async def get_memory_profile(request: Request):
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     print("LOG: WebSocket client connected")
+    # P6-B2 (ledger 6.8): the connection's wall-clock budget starts at accept.
+    budget = _ConnectionBudget(_ws_max_duration_s())
     
     try:
         user_id = await authenticate_websocket(ws)
@@ -4279,7 +4300,14 @@ async def websocket_endpoint(ws: WebSocket):
     async with httpx.AsyncClient() as client:
         # Tenant-scoped: resume/sweep must never see another user's sessions.
         session_store = SessionStore(user_id=user_id)
-        restore_result = await session_store.start_or_restore(mode=SESSION_RESTORE_MODE)
+        # P6-B2 (ledger 6.4): claim the session for this connection. A session
+        # leased by another live client is neither resumed nor demoted; the
+        # per-tab client id lets a reconnecting tab recognise its own stale
+        # lease (see core.turn_lock.SessionLease).
+        lease = SessionLease(_client_id_from(ws) or uuid.uuid4().hex[:12])
+        restore_result = await session_store.start_or_restore(
+            mode=SESSION_RESTORE_MODE, lease=lease,
+        )
         # Personal memory lives under personal_memory_dir(user_id); there is no
         # single-tenant store to construct.
         personal_memory_store = PersonalMemoryStore(user_id=user_id)
@@ -4384,6 +4412,11 @@ async def websocket_endpoint(ws: WebSocket):
         # list_pending_finalization_archives now returns (session_id, message_history)
         # directly from SQLite — no file-based archive path needed.
         for pending_sid, pending_messages in await session_store.list_pending_finalization_archives():
+            # Ledger 6.4: finalisation (and the compaction inside mark_finalized)
+            # runs only for the lease holder -- never under a live owner.
+            if await lease.held_by_other(pending_sid):
+                print(f"LOG: skipping pending session {pending_sid}: leased by another client")
+                continue
             print(f"LOG: Finalizing pending session {pending_sid}")
             if pending_messages:
                 _sync_personal_memory_from_messages(
@@ -4425,6 +4458,8 @@ async def websocket_endpoint(ws: WebSocket):
             # Capability advertisement: the client only streams mic frames when the
             # server actually has streaming STT enabled.
             "stream_stt": _voice_stream_stt_enabled(),
+            # P6-B2: the client needs the session id for its resume frame.
+            "session_id": restore_result.session_id,
         })
 
         # Phase 5 (W2): drain any routine fires that arrived while this user had
@@ -4458,6 +4493,18 @@ async def websocket_endpoint(ws: WebSocket):
         turn_task: "asyncio.Task | None" = None
         queued_turn: "_PendingTurn | None" = None
         recv_task: "asyncio.Future | None" = None
+        cut_waiter: "asyncio.Future | None" = None
+        planned_cut = False
+
+        def _mic_idle() -> bool:
+            return (
+                mic_session is None
+                or mic_session.current_turn is None
+                or mic_session.current_turn.done()
+            )
+
+        def _admit_mic(text: str) -> bool:
+            return budget.admit(_PendingTurn("text", text, 16000), voice=True, source="mic")
 
         def _start_turn(pending: "_PendingTurn") -> None:
             nonlocal turn_task
@@ -4481,7 +4528,13 @@ async def websocket_endpoint(ws: WebSocket):
             """Run now if idle, else queue ONE deep (a newer message replaces it)."""
             nonlocal queued_turn
             if turn_task is None:
-                _start_turn(pending)
+                # Ledger 6.8: a turn that cannot finish before the cut is not
+                # started; it goes back to the client with the reconnect frame.
+                if budget.admit(pending, voice=pending.kind == "audio"):
+                    _start_turn(pending)
+                return
+            if budget.requested:
+                budget.defer(pending)
                 return
             replaced = queued_turn is not None
             queued_turn = pending
@@ -4496,16 +4549,63 @@ async def websocket_endpoint(ws: WebSocket):
             while True:
                 if recv_task is None:
                     recv_task = asyncio.ensure_future(ws.receive())
+                if cut_waiter is None:
+                    cut_waiter = asyncio.ensure_future(budget.event.wait())
+                _wait_on = {recv_task}
+                if turn_task is not None:
+                    _wait_on.add(turn_task)
+                if not budget.requested:
+                    _wait_on.add(cut_waiter)
+                # Once a cut is pending, poll: a streamed-mic reply is not
+                # ``turn_task`` and its end must be noticed. Otherwise wake when
+                # the connection becomes too old for ANY turn to finish, so an
+                # IDLE connection is cut deliberately too (see _idle_due below).
+                _wake: float | None = 0.25 if budget.requested else None
+                _idle_need = budget.idle_need()
+                if _idle_need is not None and not budget.requested:
+                    _wake = max(0.05, budget.remaining() - _idle_need)
                 await asyncio.wait(
-                    {recv_task} if turn_task is None else {recv_task, turn_task},
+                    _wait_on,
                     return_when=asyncio.FIRST_COMPLETED,
+                    timeout=_wake,
                 )
                 if turn_task is not None and turn_task.done():
                     _harvest_turn()
+                    if not await lease.ensure():
+                        budget.request("lease_lost")
                     if queued_turn is not None:
                         _next, queued_turn = queued_turn, None
-                        _start_turn(_next)
-                if not recv_task.done():
+                        if budget.admit(_next, voice=_next.kind == "audio"):
+                            _start_turn(_next)
+                _idle_need = budget.idle_need()
+                if (
+                    _idle_need is not None and not budget.requested
+                    and turn_task is None and _mic_idle()
+                    and budget.remaining() < _idle_need
+                ):
+                    # IDLE connection past the point where any turn could finish.
+                    # Without this the platform's hard kill lands on an idle
+                    # socket, and the kill runs the full finalisation `finally`
+                    # (compacting a session the client is about to resume).
+                    budget.request("max_duration")
+                if budget.requested and turn_task is None and _mic_idle():
+                    # PLANNED CUT (ledger 6.8; also the lost-lease exit). Nothing
+                    # is in flight. A frame read but not yet handled goes back
+                    # to the client too.
+                    if recv_task.done() and not recv_task.cancelled() and recv_task.exception() is None:
+                        _late = _unstarted_from_raw(recv_task.result())
+                        if _late is not None:
+                            budget.unstarted.append(_late)
+                        recv_task = None
+                    planned_cut = True
+                    await _ws_send_json(ws, {
+                        "type": "status",
+                        "status": "reconnect",
+                        "reason": budget.reason,
+                        "unstarted": budget.unstarted,
+                    })
+                    break
+                if recv_task is None or not recv_task.done():
                     continue
                 # .result() re-raises exactly what ``await ws.receive()`` would
                 # have (WebSocketDisconnect / RuntimeError) into the handlers below.
@@ -4612,6 +4712,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 mic_session = await _open_mic_stream(
                                     ws, state, message_history, sample_rate=sample_rate,
                                 )
+                                mic_session.admit = _admit_mic
                             except Exception as mic_exc:
                                 print(f"LOG: mic_open failed: {mic_exc}")
                                 traceback.print_exc()
@@ -4650,6 +4751,24 @@ async def websocket_endpoint(ws: WebSocket):
 
                     elif msg_type == "ping":
                         await _ws_send_json(ws, {"type": "pong"})
+                        # Ledger 6.4: the 30 s ping refreshes the session lease
+                        # (also while a turn runs -- the loop never awaits it).
+                        if not await lease.ensure():
+                            # Superseded: another client owns this session now.
+                            # Stop writing to it and let the client reconnect
+                            # into a session of its own.
+                            budget.request("lease_lost")
+                            if turn_task is not None and not turn_task.done():
+                                turn_task.cancel()
+                            if queued_turn is not None:
+                                budget.defer(queued_turn)
+                                queued_turn = None
+
+                    elif msg_type == "resume":
+                        # Ledger 6.8: replay what the client missed across the cut.
+                        _voice_replay = await _handle_resume(ws, state, msg)
+                        if _voice_replay and turn_task is None:
+                            _start_turn(_PendingTurn("replay", _voice_replay, 0))
 
         except WebSocketDisconnect:
             print("LOG: WebSocket client disconnected")
@@ -4668,11 +4787,23 @@ async def websocket_endpoint(ws: WebSocket):
             # so the turn's lock is released and its persistence has settled.
             # asyncio.wait, not ``await task``: it never raises the task's
             # CancelledError into this teardown.
+            #
+            # P6-B2 reconciliation with the planned cut: on a PLANNED cut the
+            # loop only exits when no turn is in flight (budget.admit refused
+            # to start one that could not finish), so there is nothing here to
+            # cancel and no answer to lose. On an UNPLANNED drop the in-flight
+            # turn is still cancelled, deliberately: letting it finish detached
+            # would make it a second writer against a session the client has
+            # already resumed on a new connection -- the very clobber the
+            # lease exists to prevent. What that costs: a turn cancelled
+            # BEFORE its `done` frame loses its answer (the user re-sends). A
+            # turn past `done` is persisted (shielded) and buffered, so resume
+            # replays it.
             queued_turn = None
-            for _t in (recv_task, turn_task):
+            for _t in (recv_task, turn_task, cut_waiter):
                 if _t is not None and not _t.done():
                     _t.cancel()
-            _outstanding = {_t for _t in (recv_task, turn_task) if _t is not None}
+            _outstanding = {_t for _t in (recv_task, turn_task, cut_waiter) if _t is not None}
             if _outstanding:
                 await asyncio.wait(_outstanding)
                 for _t in _outstanding:
@@ -4703,7 +4834,30 @@ async def websocket_endpoint(ws: WebSocket):
             session_id = state.session_store.session_id
             # Capture messages before archive_active() clears them.
             final_messages = list(state.session_store.message_history)
-            await state.session_store.archive_active(status="pending_finalization")
+            # P6-B2: three exits.
+            #  * PLANNED CUT, lease held: the conversation continues on the
+            #    client's next connection. Finalising now would run Stage B on a
+            #    half conversation and then mark_finalized, which flips the
+            #    session to `completed` and truncates it to the last 12 messages
+            #    -- start_or_restore would then refuse to resume it and the
+            #    reconnect would get a fresh, empty session. So: NO archive, NO
+            #    Stage B, NO mark_finalized. The session stays `active` exactly
+            #    as the last per-turn write left it; if the client never comes
+            #    back, the next connect's stale-active demotion + sweep
+            #    finalises it the normal way.
+            #  * LEASE LOST: another client owns this session now; writing to it
+            #    (archive/finalise/compact) would clobber them.
+            #  * otherwise (real disconnect, lease held or never contended):
+            #    the historic full finalisation.
+            _skip_finalize = planned_cut or not lease.is_holder
+            if _skip_finalize:
+                print(
+                    "LOG: session lease lost -- skipping finalization"
+                    if not lease.is_holder else
+                    "LOG: planned reconnect -- session left resumable"
+                )
+            else:
+                await state.session_store.archive_active(status="pending_finalization")
             try:
                 # Index this session's conversations into the per-user episodic
                 # store NOW — end_session was previously only reachable from the
@@ -4712,7 +4866,7 @@ async def websocket_endpoint(ws: WebSocket):
                 await state.rag_system.end_session()
             except Exception as _e:
                 print(f"LOG: episodic end_session failed for {session_id}: {_e}")
-            if session_id and final_messages:
+            if session_id and final_messages and not _skip_finalize:
                 _sync_personal_memory_from_messages(
                     state, session_id=session_id, message_history=final_messages,
                 )
@@ -4722,7 +4876,7 @@ async def websocket_endpoint(ws: WebSocket):
                     )
                 except Exception as _e:
                     print(f"LOG: Stage B error for session {session_id}: {_e}")
-            if session_id:
+            if session_id and not _skip_finalize:
                 try:
                     # Extraction just ran on final_messages; without this flip the
                     # next connect re-extracts the same session.
@@ -4748,6 +4902,16 @@ async def websocket_endpoint(ws: WebSocket):
             _unregister_shutdown_state(state)
             # Phase 5 (W2): stop advertising this socket to the scheduler.
             _discard_live_socket(user_id, ws)
+            # Ledger 6.4: free the session for the reconnecting client (a no-op
+            # unless this connection still holds it).
+            await lease.release()
+            if planned_cut:
+                # Ledger 6.8: close only now, with every frame (including the
+                # reconnect frame) already written.
+                try:
+                    await ws.close(code=1012, reason="reconnect")
+                except Exception:  # noqa: BLE001 - the peer may already be gone
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -4757,9 +4921,252 @@ async def websocket_endpoint(ws: WebSocket):
 class _PendingTurn(NamedTuple):
     """One user message waiting to become a turn (P6-B1)."""
 
-    kind: str  # "text" | "audio"
-    payload: Any  # str for text, bytes for audio
+    kind: str  # "text" | "audio" | "replay"
+    payload: Any  # str for text, bytes for audio, list of buffered records for replay
     sample_rate: int
+
+
+# ---------------------------------------------------------------------------
+# P6-B2 (ledger 6.8 + 6.4): planned cut, resume protocol, session lease
+# ---------------------------------------------------------------------------
+# Safety margin added to a turn's deadline when deciding whether it can finish
+# before the platform cuts the socket (ledger: "that turn's deadline plus 5 s").
+_WS_CUT_MARGIN_S = 5.0
+
+
+def _ws_max_duration_s() -> float | None:
+    """The connection's wall-clock ceiling, or None when no cut applies.
+
+    Cloud mode always enforces ``TURTLE_WS_MAX_DURATION_S`` (default 300, the
+    Vercel function limit). Local mode enforces it only when the variable was
+    set explicitly: a local server has no platform cut, so a silent five-minute
+    reconnect would change local behaviour.
+    """
+    try:
+        explicit = "ws_max_duration_s" in settings.model_fields_set
+        if not (settings.is_cloud or explicit):
+            return None
+        value = float(settings.ws_max_duration_s)
+    except Exception:  # noqa: BLE001 - a bad value must never break connect
+        return None
+    return value if value > 0 else None
+
+
+class _ConnectionBudget:
+    """Wall-clock budget of ONE WebSocket connection.
+
+    ``admit`` is the single gate every turn start passes through (text, audio,
+    queued, streamed-mic). Refusing a turn that cannot finish before the cut is
+    what makes the cut lossless: nothing is in flight when the socket closes.
+    A refused message is NOT dropped -- it is recorded in ``unstarted`` and
+    returned to the client in the ``reconnect`` frame, which resends it on the
+    new connection.
+
+    ``request`` also serves the lost-lease path (ledger 6.4), which needs the
+    same "stop cleanly and tell the client to reconnect" exit.
+    """
+
+    def __init__(self, max_s: float | None) -> None:
+        self.started = time.monotonic()
+        self.max_s = max_s
+        self.requested = False
+        self.reason = ""
+        self.unstarted: list[dict[str, Any]] = []
+        self.admitted = 0
+        self.event = asyncio.Event()
+
+    def remaining(self) -> float:
+        if self.max_s is None:
+            return float("inf")
+        return self.max_s - (time.monotonic() - self.started)
+
+    def idle_need(self) -> float | None:
+        """Remaining seconds below which even the SHORTEST turn cannot finish,
+        or None when idle-cutting does not apply (no ceiling, or a ceiling so
+        short that cutting would reconnect forever)."""
+        if self.max_s is None:
+            return None
+        need = min(_TURN_DEADLINE_VOICE_S, _TURN_DEADLINE_TEXT_S) + _WS_CUT_MARGIN_S
+        return need if self.max_s >= need else None
+
+    def request(self, reason: str) -> None:
+        if not self.requested:
+            self.requested = True
+            self.reason = reason
+        self.event.set()
+
+    def defer(self, pending: "_PendingTurn", *, source: str = "") -> None:
+        frame = _pending_to_frame(pending, source=source)
+        if frame is not None:
+            self.unstarted.append(frame)
+
+    def admit(self, pending: "_PendingTurn", *, voice: bool, source: str = "") -> bool:
+        if self.requested:
+            self.defer(pending, source=source)
+            return False
+        if self.max_s is not None:
+            need = (_TURN_DEADLINE_VOICE_S if voice else _TURN_DEADLINE_TEXT_S) + _WS_CUT_MARGIN_S
+            # The first turn of a connection is always admitted: a ceiling
+            # shorter than one turn would otherwise reconnect forever.
+            if self.admitted > 0 and self.remaining() < need:
+                self.request("max_duration")
+                self.defer(pending, source=source)
+                return False
+        self.admitted += 1
+        return True
+
+
+def _pending_to_frame(pending: "_PendingTurn", *, source: str = "") -> dict[str, Any] | None:
+    """A refused turn as the client-resendable frame (``unstarted`` entry)."""
+    if pending.kind == "text":
+        frame: dict[str, Any] = {"kind": "text", "content": pending.payload}
+    elif pending.kind == "audio":
+        frame = {
+            "kind": "audio",
+            "data": base64.b64encode(pending.payload).decode("ascii"),
+            "sample_rate": pending.sample_rate,
+        }
+    else:
+        return None
+    if source:
+        frame["source"] = source
+    return frame
+
+
+def _unstarted_from_raw(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """A frame the loop had already read when the cut was decided. It must go
+    back to the client rather than vanish with the closing socket."""
+    if raw.get("bytes"):
+        return _pending_to_frame(_PendingTurn("audio", raw["bytes"], 16000))
+    if raw.get("text"):
+        try:
+            msg = json.loads(raw["text"])
+        except ValueError:
+            return None
+        if msg.get("type") == "text" and str(msg.get("content", "")).strip():
+            return {"kind": "text", "content": str(msg["content"]).strip()}
+        if msg.get("type") == "audio" and msg.get("data"):
+            return {"kind": "audio", "data": msg["data"],
+                    "sample_rate": int(msg.get("sample_rate", 16000))}
+    return None
+
+
+def _client_id_from(ws: Any) -> str:
+    """The per-tab client id (``?cid=``) used as the session-lease identity.
+
+    Not a credential: it only lets a tab recognise its own earlier connection.
+    Anything that is not a short token is ignored (the connection then uses a
+    private id and behaves as the ledger's plain lease)."""
+    import re as _re
+
+    params = getattr(ws, "query_params", None)
+    raw = params.get("cid") if params is not None and hasattr(params, "get") else None
+    if isinstance(raw, str) and _re.fullmatch(r"[A-Za-z0-9_-]{8,64}", raw):
+        return raw
+    return ""
+
+
+# The per-turn recording context. Set INSIDE the turn task (create_task copies
+# the context, so each turn's value is private to it) by _run_web_turn and
+# _run_streamed_turn; _reply_and_speak adds voice/transcript.
+_TURN_RESULT_CTX: "contextvars.ContextVar[dict[str, Any] | None]" = contextvars.ContextVar(
+    "turtle_turn_result_ctx", default=None
+)
+
+
+async def _buffer_turn_result(frame: dict[str, Any]) -> None:
+    """Buffer one completed turn's ``done`` frame (120 s) for replay on resume.
+
+    Best-effort: an unreachable buffer must not stop the answer reaching the
+    user. CancelledError is a BaseException and deliberately not caught."""
+    ctx = _TURN_RESULT_CTX.get()
+    if ctx is None:
+        return
+    state = ctx["state"]
+    session_id = state.session_store.session_id
+    turn_id = frame.get("turn_id")
+    if not session_id or not turn_id:
+        return
+    record = {
+        "user_id": state.user_id,
+        "session_id": session_id,
+        "frame": frame,
+        "voice": bool(ctx.get("voice")),
+        "transcript": ctx.get("transcript"),
+    }
+    try:
+        await turn_results.put(session_id, turn_id, record)
+    except Exception as exc:  # noqa: BLE001
+        print(f"LOG: turn result not buffered ({turn_id}): {type(exc).__name__}: {exc}")
+
+
+async def _handle_resume(ws: WebSocket, state: SharedState, msg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Answer ``{"type":"resume","session_id","last_turn_id"}``.
+
+    Replays the buffered ``done`` frame of every completed turn numbered above
+    ``last_turn_id`` (and the user's bubble for voice turns). Returns the voice
+    records so the caller can re-synthesise their audio as a serialised task.
+    The session itself was already resumed (or not) by start_or_restore at
+    connect; ``same_session`` tells the client which happened.
+    """
+    requested = str(msg.get("session_id") or "")[:200]
+    last = msg.get("last_turn_id")
+    last_turn_id = str(last)[:240] if last else None
+    current = state.session_store.session_id
+    records: list[dict[str, Any]] = []
+    if requested:
+        # `requested` is CLIENT-SUPPLIED, so the Redis key it builds is
+        # attacker-chosen: the owner check below is the only thing standing
+        # between a guessed session id and another user's reply text.
+        # `state.user_id` is non-empty on any live socket (authenticate_websocket
+        # either returns a real id or raises, and the endpoint returns on raise),
+        # but SharedState.user_id DEFAULTS to "" -- so require truthiness rather
+        # than relying on that invariant holding through a future refactor.
+        # Without it, an empty id on both sides would compare equal.
+        owner = state.user_id
+        for rec in await turn_results.after(requested, last_turn_id) if owner else []:
+            if rec.get("user_id") == owner and isinstance(rec.get("frame"), dict):
+                records.append(rec)
+    await _ws_send_json(ws, {
+        "type": "resumed",
+        "session_id": current,
+        "same_session": bool(requested) and requested == current,
+        "replayed": len(records),
+    })
+    voice: list[dict[str, Any]] = []
+    for rec in records:
+        if rec.get("voice") and rec.get("transcript"):
+            await _ws_send_json(ws, {"type": "transcription", "text": rec["transcript"]})
+        await _ws_send_json(ws, rec["frame"])
+        if rec.get("voice"):
+            voice.append(rec)
+    return voice
+
+
+async def _speak_replayed(ws: WebSocket, records: list[dict[str, Any]]) -> None:
+    """Re-synthesise the audio of replayed voice turns (audio is never stored)."""
+    from core.streaming_tts import stream_tts_from_text
+    from core.latency_budgets import budgets
+
+    for rec in records:
+        text = clean_text_for_tts(clean_text_for_model(str(rec["frame"].get("content", ""))))
+        if not text.strip():
+            continue
+        await _ws_send_json(ws, {"type": "status", "status": "speaking"})
+        try:
+            async with aclosing(
+                stream_tts_from_text(
+                    text,
+                    speed=float(config.get("TURTLE_TTS_SPEED", 1.2)),
+                    tts_timeout_s=budgets.TOOL_S,
+                )
+            ) as _stream:
+                async for _sentence, audio_bytes in _stream:
+                    await _ws_send_bytes(ws, audio_bytes)
+        except Exception as exc:  # noqa: BLE001
+            print(f"LOG: replayed TTS failed: {type(exc).__name__}: {exc}")
+            break
+    await _ws_send_json(ws, {"type": "status", "status": "ready"})
 
 
 async def _run_web_turn(
@@ -4777,6 +5184,12 @@ async def _run_web_turn(
     after the bounded wait, the turn is rejected with an explicit frame and the
     history is returned untouched. If Redis is down the lock fails open.
     """
+    if pending.kind == "replay":
+        # Re-synthesise the audio of turns the client missed. Writes no shared
+        # state, so it needs no turn lock.
+        await _speak_replayed(ws, pending.payload)
+        return message_history
+    _TURN_RESULT_CTX.set({"state": state, "voice": False, "transcript": None})
     async with turn_lock(state.user_id, f"web:{conn_id}") as lock:
         if lock.busy:
             print(f"LOG: turn rejected, another turn in progress for {state.user_id}")
@@ -4800,7 +5213,13 @@ async def _ws_send_json(ws: WebSocket, data: dict[str, Any]) -> None:
     Serialized per socket: routine delivery runs as a separate loop task from
     the connection handler, and interleaved multi-writer sends on one Starlette
     websocket are not safe (Codex P5 #4).
+
+    P6-B2 (ledger 6.8): a completed turn's ``done`` frame is buffered BEFORE it
+    is sent, so a socket that dies mid-send still leaves the answer replayable
+    on resume.
     """
+    if data.get("type") == "done" and data.get("turn_id"):
+        await _buffer_turn_result(data)
     try:
         async with _ws_send_lock(ws):
             await ws.send_json(data)
@@ -5609,6 +6028,8 @@ async def _execute_turn(
             "type": "done",
             "content": clean_text_for_display(response.output),
             "tool_urls": list(state.tool_sourced_urls),
+            # P6-B2: the client's `last_turn_id` for the resume frame.
+            "turn_id": turn_id,
         })
 
         # Update session.
@@ -5888,6 +6309,8 @@ async def _execute_turn_streaming(
         "type": "done",
         "content": clean_text_for_display(collector.output or ""),
         "tool_urls": list(state.tool_sourced_urls),
+        # P6-B2: the client's `last_turn_id` for the resume frame.
+        "turn_id": turn_id,
     })
 
     # --- post-run: identical bookkeeping to the batch path -----------------
@@ -6010,6 +6433,12 @@ async def _reply_and_speak(
     streaming-STT consumer (one call per Flux EndOfTurn), so both routes get the
     identical turn pipeline + TTS behaviour.
     """
+    # P6-B2: tell the result buffer this turn is spoken (replay re-synthesises
+    # the audio) and what the user said (replay re-draws their bubble).
+    _result_ctx = _TURN_RESULT_CTX.get()
+    if _result_ctx is not None:
+        _result_ctx["voice"] = True
+        _result_ctx["transcript"] = transcript
     # Opt-in fast path: stream LLM tokens straight into sentence-chunked TTS so
     # speech starts at the first sentence boundary. Falls back to the canonical
     # batch turn below if streaming fails before any audio is spoken.
@@ -6119,7 +6548,7 @@ class _MicStreamSession:
     """
 
     __slots__ = ("stt", "consumer_task", "history", "sample_rate",
-                 "finishing", "turn_started", "current_turn")
+                 "finishing", "turn_started", "current_turn", "admit")
 
     def __init__(
         self,
@@ -6142,6 +6571,11 @@ class _MicStreamSession:
         # The in-flight reply task (LLM + TTS) for the current turn, or None.
         # The receive loop cancels this to interrupt the agent mid-reply.
         self.current_turn: "asyncio.Task | None" = None
+        # P6-B2 (ledger 6.8): ``admit(text) -> bool`` asked before each
+        # utterance becomes a turn. False = the connection is about to be cut
+        # and this turn could not finish; the consumer stops WITHOUT starting
+        # it and the utterance travels back to the client as ``unstarted``.
+        self.admit: "Any" = None
 
     def interrupt(self) -> bool:
         """Cancel the in-flight reply, if any. Returns True if something was cancelled."""
@@ -6167,6 +6601,7 @@ async def _run_streamed_turn(
     """
     timings: dict[str, float] = {}
     overall_start = time.time()
+    _TURN_RESULT_CTX.set({"state": state, "voice": True, "transcript": text})
     try:
         # Ledger 6.3: the streamed-mic turn takes the same per-user lock as
         # every other surface. Released in __aexit__ (a finally) so the
@@ -6243,6 +6678,9 @@ async def _flux_mic_consumer(
                     if session.finishing.is_set():
                         break
                     continue
+                if session.admit is not None and not session.admit(text):
+                    print("LOG: streamed utterance deferred -- connection is being cut")
+                    break
                 turns += 1
                 session.turn_started.set()
                 await _ws_send_json(ws, {"type": "transcription", "text": text})
