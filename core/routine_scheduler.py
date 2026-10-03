@@ -29,6 +29,7 @@ degraded server module, send error) only logs and never affects step 1.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -323,8 +324,43 @@ def _default_delivery_hook(user_id: str, frame: dict[str, Any]) -> bool:
 _delivery_hook = _default_delivery_hook
 
 
-def _fire_routine(user_id: str, routine_key: str, value: dict[str, Any]) -> None:
-    """APScheduler job body — runs at the cron tick (on a worker thread).
+def fire_event_id(user_id: str, routine_key: str, fire_bucket: str) -> str:
+    """Deterministic id for a scheduled-fire journal event (ledger 5.9):
+    sha1(user_id|routine_key|fire_bucket). JournalStore.append is idempotent
+    on event id, so re-firing a claimed-but-unconfirmed occurrence writes the
+    journal row at most once."""
+    return hashlib.sha1(
+        f"{user_id}|{routine_key}|{fire_bucket}".encode("utf-8")
+    ).hexdigest()
+
+
+def _fire_routine(user_id: str, routine_key: str, value: dict[str, Any]) -> bool:
+    """APScheduler job body (local mode) -- never raises.
+
+    Thin wrapper over _fire_routine_strict that preserves local behaviour: a
+    journal failure or a delivery failure is LOGged and swallowed. Unlike
+    before, the outcome is reported: True when the journal write AND the
+    delivery both succeeded, False otherwise (local APScheduler ignores it).
+    The cloud cron tick calls _fire_routine_strict directly so a failure is
+    visible to it.
+    """
+    try:
+        _fire_routine_strict(user_id, routine_key, value)
+        return True
+    except Exception as e:
+        print(f"LOG: routine fire failed user={user_id} key={routine_key}: {e}")
+        return False
+
+
+def _fire_routine_strict(
+    user_id: str,
+    routine_key: str,
+    value: dict[str, Any],
+    *,
+    fire_bucket: str | None = None,
+    fired_at: str | None = None,
+) -> None:
+    """Fire a routine; RAISES on any failure.
 
     Two ordered steps (see the module docstring for the full contract):
 
@@ -332,17 +368,21 @@ def _fire_routine(user_id: str, routine_key: str, value: dict[str, Any]) -> None
          `workflow.scheduled_fire.<key>` event with applied=False. This is an
          AUDIT record: it is NOT surfaced by any memory read path (replayer /
          sqlite search are applied-only; nothing consumes scheduled_fire).
+         A failure here raises and no delivery is attempted.
 
-      2. Live delivery — best-effort. Builds a routine WS frame and hands it to
-         the delivery hook (the server's live-socket push, with a pending-queue
-         fallback drained on the user's next connect). This is the ONLY real
-         delivery of a fire.
+      2. Live delivery — the ONLY real delivery of a fire. Builds a routine WS
+         frame and hands it to the delivery hook (the server's live-socket
+         push, with a pending-queue fallback drained on the user's next
+         connect). A failure raises; the journal write is already durable.
 
-    The journal write is first and unconditional. A delivery failure (import
-    error, degraded server module, send error) only logs and never affects the
-    journal write.
+    Cloud cron tick (ledger 5.9): the caller passes fire_bucket and fired_at,
+    both derived from the SCHEDULED occurrence rather than the wall clock.
+    With a fire_bucket the journal event id is fire_event_id(...), so a
+    re-fire after a failure between claim and confirmation is a journal no-op,
+    and the delivery frame's (routine_key, fired_at) identity is stable too.
+    Without them (local APScheduler) ids and timestamps are fresh, as before.
     """
-    fired_at = datetime.now(UTC).isoformat()
+    fired_at = fired_at or datetime.now(UTC).isoformat()
     fire_key = f"workflow.scheduled_fire.{routine_key}"
     fire_value = {
         "source_routine": routine_key,
@@ -353,33 +393,28 @@ def _fire_routine(user_id: str, routine_key: str, value: dict[str, Any]) -> None
         "time": value.get("time"),
         "timezone": value.get("timezone"),
     }
-    try:
-        journal = JournalStore(user_id=user_id)
-        event = make_event(
-            kind="behavior",
-            topic="workflow",
-            key=fire_key,
-            value=fire_value,
-            confidence=1.0,
-            source="synthesized",
-            extractor="scheduler",  # honest provenance (was mislabeled "dream_pass")
-            session_id=f"scheduler_{fired_at[:10]}",
-            turn_id=f"scheduler_{fired_at}",
-            applied=False,
-        )
-        journal.append(event)
-        print(f"LOG: routine fired user={user_id} key={routine_key} event_id={event.event_id}")
-    except Exception as e:
-        # Journal write is the source of truth; if it failed there is nothing to
-        # deliver. Do not attempt a push on a failed fire.
-        print(f"LOG: routine fire failed user={user_id} key={routine_key}: {e}")
-        return
+    event_id = fire_event_id(user_id, routine_key, fire_bucket) if fire_bucket else None
+    journal = JournalStore(user_id=user_id)
+    event = make_event(
+        kind="behavior",
+        topic="workflow",
+        key=fire_key,
+        value=fire_value,
+        confidence=1.0,
+        source="synthesized",
+        extractor="scheduler",  # honest provenance (was mislabeled "dream_pass")
+        session_id=f"scheduler_{fired_at[:10]}",
+        turn_id=f"scheduler_{fired_at}",
+        applied=False,
+        event_id=event_id,
+    )
+    # Step 1: journal write. Any failure propagates (nothing to deliver).
+    journal.append(event)
+    print(f"LOG: routine fired user={user_id} key={routine_key} event_id={event.event_id}")
 
-    # Step 2: best-effort live delivery. Strictly additive — wrapped so a failed
-    # import or a degraded server module only logs and never re-raises into the
-    # scheduler (which would surface as an unhandled job error).
-    try:
-        frame = _build_routine_frame(routine_key, value, fired_at)
-        _delivery_hook(user_id, frame)
-    except Exception as e:
-        print(f"LOG: routine delivery skipped user={user_id} key={routine_key}: {e}")
+    # Step 2: delivery. A failed import or a degraded server module raises so
+    # the caller can tell this fire did not complete (the cloud tick leaves
+    # the claim in 'claimed' and retries it; the journal append is a no-op on
+    # retry).
+    frame = _build_routine_frame(routine_key, value, fired_at)
+    _delivery_hook(user_id, frame)

@@ -5,15 +5,28 @@ name: cron-tick
 # external trigger stands in for it — see apps/cron_tick_routes.py's module
 # docstring for the full "why". This workflow is the trigger.
 #
-# GitHub Actions' `schedule` cron does not guarantee to-the-minute execution
-# (it queues on shared runners and can be delayed under load), which is
-# exactly why apps/cron_tick_routes.py evaluates a due WINDOW (5 minutes,
-# TICK_INTERVAL_MINUTES) rather than a single instant, and de-dupes each
-# scheduled occurrence in Postgres (core/storage/cloud/routine_last_fired_store.py)
-# so a late or doubled-up run can never double-fire a routine.
+# GitHub Actions' `schedule` trigger is best-effort, not a clock: runs queue
+# on shared runners, are delayed at peak times (the top of the hour), and are
+# often dropped outright. Measured on this repo over 19 days only ~2% of the
+# expected every-5-minute runs were delivered, with 2-8 hour gaps between them.
+# So nothing here may assume a tick arrives every 5 minutes: the endpoint
+# (apps/cron_tick_routes.py) remembers when it last ticked, enumerates every
+# routine occurrence since then, fires the ones at most an hour late, and
+# records older ones as missed. Each occurrence is claimed in Postgres
+# (core/storage/cloud/routine_last_fired_store.py) so a doubled-up or retried
+# run can never double-fire a routine.
+#
+# The odd minute offset (3-58/5 = :03, :08, ... :58) only avoids the
+# top-of-hour peak; it does not fix the drop rate. `concurrency` queues rather
+# than cancels an overlapping run (the endpoint's own lock makes an
+# overlapping tick a no-op anyway).
+concurrency:
+  group: cron-tick
+  cancel-in-progress: false
+
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "3-58/5 * * * *"
   workflow_dispatch: {}  # manual trigger for testing/debugging a stuck routine
 
 jobs:

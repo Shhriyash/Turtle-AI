@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -134,6 +135,25 @@ def get_gemini_keys() -> list[str]:
     return keys
 
 
+# WP5-C1 (ledger 5.4): GoogleProvider -> google.genai.Client builds several SSL
+# contexts in its constructor (~0.3 s each key, profiled). rebuild() used to
+# construct 9 providers for 3 keys (3 call sites x 3 keys). A provider holds
+# only the client for ONE api key (model name and settings live on the
+# GoogleModel), so it is safely shared by every model on that key. Keyed by the
+# key string itself: a rotated key is a different entry, never a stale client.
+_GOOGLE_PROVIDERS: dict[str, GoogleProvider] = {}
+_GOOGLE_PROVIDERS_LOCK = threading.Lock()
+
+
+def _google_provider_for(api_key: str) -> GoogleProvider:
+    with _GOOGLE_PROVIDERS_LOCK:
+        provider = _GOOGLE_PROVIDERS.get(api_key)
+        if provider is None:
+            provider = GoogleProvider(api_key=api_key)
+            _GOOGLE_PROVIDERS[api_key] = provider
+        return provider
+
+
 def get_google_models(
     model_name: str | None = None,
     settings: ModelSettings | None = None,
@@ -158,7 +178,7 @@ def get_google_models(
     )
     models: list[GoogleModel] = []
     for api_key in get_gemini_keys():
-        provider = GoogleProvider(api_key=api_key)
+        provider = _google_provider_for(api_key)
         models.append(GoogleModel(model, provider=provider, settings=google_settings))
     return models
 
@@ -694,6 +714,9 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
         kwargs["message_history"] = _sanitize_message_history(kwargs["message_history"])
 
     agents = [primary_agent] + (fallback_agents or [])
+    # One MGET for the whole cascade (cloud only, fails open) so a cold instance
+    # sees bucket cooldowns a warm one already set.
+    await health_tracker.refresh_shared(agents)
     eligible = [a for a in agents if not health_tracker.is_cooling(a)]
     if not eligible:
         # Every model is cooling — bypass cooldowns rather than fail outright,
@@ -848,6 +871,9 @@ async def stream_agent_text_with_fallbacks(
         kwargs["message_history"] = _sanitize_message_history(kwargs["message_history"])
 
     agents = [primary_agent] + (fallback_agents or [])
+    # One MGET for the whole cascade (cloud only, fails open) so a cold instance
+    # sees bucket cooldowns a warm one already set.
+    await health_tracker.refresh_shared(agents)
     eligible = [a for a in agents if not health_tracker.is_cooling(a)]
     if not eligible:
         print("LOG: all agents in cooldown; bypassing health tracker for this stream")
@@ -955,6 +981,9 @@ def run_agent_sync_with_fallbacks(primary_agent: Any, fallback_agents: list[Any]
         kwargs["message_history"] = _sanitize_message_history(kwargs["message_history"])
 
     agents = [primary_agent] + (fallback_agents or [])
+    # One MGET for the whole cascade (cloud only, fails open) so a cold instance
+    # sees bucket cooldowns a warm one already set.
+    health_tracker.refresh_shared_sync(agents)
     eligible = [a for a in agents if not health_tracker.is_cooling(a)]
     if not eligible:
         print("LOG: all agents in cooldown; bypassing health tracker for this call")

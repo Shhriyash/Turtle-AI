@@ -663,10 +663,11 @@ pydantic-settings  # Centralised TurtleSettings config
 
 ### Voice Stack
 ```
-pyaudio            # Microphone input
 pydub              # Audio playback
-sounddevice        # Streaming audio
-scipy              # Audio I/O
+# Local-only (requirements-local.txt; not installed by the cloud/Vercel build):
+pyaudio            # Microphone input
+sounddevice        # Streaming audio playback (tools/tts/tts.py)
+scipy              # Audio I/O (rtc_vad/)
 keyboard           # Hotkey recording control
 ```
 

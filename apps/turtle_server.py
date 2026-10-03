@@ -155,11 +155,22 @@ from tools.contracts import (
     GetDirectionsArgs,
 )
 
+def _httpx_capture_all(is_cloud: bool) -> bool:
+    """WP5-C1 (ledger 5.4): logfire.instrument_httpx(capture_all=...).
+
+    capture_all=True records request/response headers AND bodies for every
+    outbound call (model prompts, Gmail/Calendar payloads, user text) and
+    spends CPU/memory serialising them on every request. Off in cloud, where
+    that is both a PII exposure and per-request cost; unchanged locally.
+    """
+    return not is_cloud
+
+
 try:
     import logfire
     logfire.configure(send_to_logfire="if-token-present")
     logfire.instrument_pydantic_ai()
-    logfire.instrument_httpx(capture_all=True)
+    logfire.instrument_httpx(capture_all=_httpx_capture_all(settings.is_cloud))
     _logfire_loaded = True
 except Exception:
     _logfire_loaded = False
@@ -573,8 +584,22 @@ def _on_shutdown(signum, frame) -> None:
         _call_prev_handler(_PREV_SIGTERM, signum, frame)
 
 
-signal.signal(signal.SIGINT, _on_shutdown)
-signal.signal(signal.SIGTERM, _on_shutdown)
+def _install_shutdown_handlers() -> bool:
+    """Install SIGINT/SIGTERM handlers; return True if installed.
+
+    signal.signal raises ValueError when called off the main thread of the main
+    interpreter (Python docs), e.g. when a host imports this module from a
+    worker thread. The atexit hook below still runs the shutdown in that case.
+    """
+    try:
+        signal.signal(signal.SIGINT, _on_shutdown)
+        signal.signal(signal.SIGTERM, _on_shutdown)
+    except ValueError:
+        return False
+    return True
+
+
+_install_shutdown_handlers()
 atexit.register(_run_shutdown_sync)
 
 
@@ -1899,6 +1924,52 @@ _RecallArgsForMode: type = RecallArgs
 # Agent builder — creates agent chain from current config, supports hot-reload
 # ---------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=None)
+def _read_tool_contract(name: str, is_cloud: bool) -> str:
+    """Read + (cloud) adjust one tool contract. Cached per (name, is_cloud).
+
+    WP5-C1 (ledger 5.4): hoisted out of AgentManager._register_tools so the 84
+    registrations (12 tools x 7 agents) read each of the 12 files once, and
+    every rebuild/hot-reload reuses them. Keyed on is_cloud because the
+    `recall` contract is edited for cloud. Raises OSError on a read failure so
+    a transient failure is NOT cached (lru_cache does not cache exceptions);
+    _load_tool_contract turns that into the graceful fallback.
+    """
+    md_path = (
+        Path(__file__).resolve().parents[1]
+        / "core" / "system_prompts" / "tools" / f"{name}.md"
+    )
+    text = md_path.read_text(encoding="utf-8")
+    # WP2.C (ledger 2.5): cloud's recall schema drops scope="tasks"
+    # (see RecallArgsCloud) -- the contract text handed to the model must not
+    # still instruct it to use a scope its own tool schema will reject. Edited
+    # in place rather than a second contract file so
+    # test/tool_contract_lint_test.py's one-file-per-tool invariant holds.
+    if name == "recall" and is_cloud:
+        text = text.replace(
+            "- scope: one of personal, episodic, tasks, working.",
+            "- scope: one of personal, episodic, working.",
+        )
+        lines = [
+            line for line in text.splitlines()
+            if not line.startswith("- tasks:")
+        ]
+        lines.append(
+            "Task/tool-action history recall is not available on "
+            "this deployment."
+        )
+        text = "\n".join(lines) + "\n"
+    return text
+
+
+def _load_tool_contract(name: str, is_cloud: bool) -> str:
+    """Load tool contract markdown as the tool description."""
+    try:
+        return _read_tool_contract(name, is_cloud)
+    except Exception:
+        return f"Tool: {name}"  # graceful fallback
+
+
 class AgentManager:
     """Builds and hot-reloads the Pydantic AI agent chain."""
 
@@ -2096,39 +2167,6 @@ class AgentManager:
         # local, assignment.
         global _RecallArgsForMode
         _RecallArgsForMode = RecallArgsCloud if settings.is_cloud else RecallArgs
-
-        def _load_tool_contract(name: str) -> str:
-            """Load tool contract markdown as the tool description."""
-            md_path = (
-                _Path(__file__).resolve().parents[1]
-                / "core" / "system_prompts" / "tools" / f"{name}.md"
-            )
-            try:
-                text = md_path.read_text(encoding="utf-8")
-            except Exception:
-                return f"Tool: {name}"  # graceful fallback
-            # WP2.C (ledger 2.5): cloud's recall schema drops scope="tasks"
-            # (see RecallArgsCloud below) -- the contract text handed to the
-            # model must not still instruct it to use a scope its own tool
-            # schema will reject. Edited in place rather than a second
-            # contract file so test/tool_contract_lint_test.py's
-            # one-file-per-tool invariant holds and the two variants can
-            # never drift out of sync on everything but the tasks scope.
-            if name == "recall" and settings.is_cloud:
-                text = text.replace(
-                    "- scope: one of personal, episodic, tasks, working.",
-                    "- scope: one of personal, episodic, working.",
-                )
-                lines = [
-                    line for line in text.splitlines()
-                    if not line.startswith("- tasks:")
-                ]
-                lines.append(
-                    "Task/tool-action history recall is not available on "
-                    "this deployment."
-                )
-                text = "\n".join(lines) + "\n"
-            return text
 
         agent = self.main_assistant
 
@@ -2782,7 +2820,7 @@ class AgentManager:
         ]
         for _target_agent in [self.main_assistant, *self.main_assistant_fallbacks]:
             for _contract_name, _tool_fn in _tool_registry:
-                _target_agent.tool(description=_load_tool_contract(_contract_name))(_tool_fn)
+                _target_agent.tool(description=_load_tool_contract(_contract_name, settings.is_cloud))(_tool_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -3119,7 +3157,21 @@ async def no_cache_js(request: Request, call_next):
 
 
 # Serve static files from web/ directory
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
+def _ensure_static_dir() -> None:
+    """Create web/ if missing; tolerate a read-only filesystem.
+
+    web/ ships in the repo, so on a read-only serverless filesystem the
+    directory already exists and mkdir(exist_ok=True) is a no-op; any OSError
+    is therefore ignorable here and StaticFiles below still reports a genuinely
+    missing directory.
+    """
+    try:
+        STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+
+_ensure_static_dir()
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # ---------------------------------------------------------------------------
@@ -3611,10 +3663,21 @@ async def readyz():
 
     from core.storage.cloud import probe_postgres, probe_redis
 
-    postgres_ok, redis_ok = await asyncio.gather(probe_postgres(), probe_redis())
+    from apps.admin_routes import cron_liveness
+
+    postgres_ok, redis_ok, cron = await asyncio.gather(
+        probe_postgres(), probe_redis(), cron_liveness()
+    )
     ok = postgres_ok and redis_ok
+    # Cron liveness is informational: status_code depends ONLY on the probes
+    # (deploy-vercel.yml gates promotion on 200; a stale tick must not block it).
     return JSONResponse(
-        {"postgres": postgres_ok, "redis": redis_ok},
+        {
+            "postgres": postgres_ok,
+            "redis": redis_ok,
+            "cron_last_tick_age_s": cron["last_tick_age_s"],
+            "cron_tick_status": cron["status"],
+        },
         status_code=200 if ok else 503,
     )
 

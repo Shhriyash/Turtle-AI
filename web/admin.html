@@ -123,6 +123,12 @@
     td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); }
     tbody tr:hover { background: var(--row-hover); }
     td.empty { color: var(--muted); text-align: center; padding: 32px; }
+
+    /* Cron-tick liveness (red when stale/never; the threshold comes from the server) */
+    .cron { font-size: 14px; margin-bottom: 12px; color: var(--muted); }
+    .cron strong { color: var(--fg); }
+    .cron.cron-red { color: var(--error); }
+    .cron.cron-red strong { color: var(--error); }
   </style>
 </head>
 <body>
@@ -153,6 +159,7 @@
           </div>
         </div>
         <div class="status" id="dash-status"></div>
+        <div class="cron" id="cron-tick"></div>
         <div class="table-scroll">
           <table id="users-table">
             <thead>
@@ -185,6 +192,7 @@
     const gateStatus = document.getElementById('gate-status');
     const dashStatus = document.getElementById('dash-status');
     const summary = document.getElementById('summary');
+    const cronTick = document.getElementById('cron-tick');
     const usersBody = document.getElementById('users-body');
     const refreshBtn = document.getElementById('refresh-btn');
     const disconnectBtn = document.getElementById('disconnect-btn');
@@ -209,6 +217,42 @@
 
     function fmtMb(bytes) {
       return (Number(bytes || 0) / 1048576).toFixed(1);
+    }
+
+    function fmtAge(sec) {
+      const s = Math.round(Number(sec));
+      if (s < 120) return s + ' s';
+      if (s < 7200) return Math.round(s / 60) + ' min';
+      if (s < 172800) return (s / 3600).toFixed(1) + ' h';
+      return Math.round(s / 86400) + ' d';
+    }
+
+    // data.cron = { status, last_tick_age_s, stale_after_s } from /admin/users.
+    // Red when stale or never ticked; the threshold is the server's, not ours.
+    function renderCron(cron) {
+      cronTick.className = 'cron';
+      if (!cron) { cronTick.textContent = ''; return; }
+      let text;
+      switch (cron.status) {
+        case 'ok':
+          text = 'Last cron tick: <strong>' + fmtAge(cron.last_tick_age_s) + ' ago</strong>';
+          break;
+        case 'stale':
+          cronTick.className = 'cron cron-red';
+          text = 'Last cron tick: <strong>' + fmtAge(cron.last_tick_age_s) + ' ago</strong>'
+            + ' (stale, over ' + fmtAge(cron.stale_after_s) + '). Scheduled routines may not be firing; see ADR-008.';
+          break;
+        case 'never':
+          cronTick.className = 'cron cron-red';
+          text = '<strong>Cron has never ticked.</strong> Scheduled routines are not running.';
+          break;
+        case 'not_applicable':
+          text = 'Cron tick: not applicable (local mode uses the in-process scheduler).';
+          break;
+        default:
+          text = 'Cron tick: <strong>unknown</strong> (could not read scheduler state).';
+      }
+      cronTick.innerHTML = text;
     }
 
     async function fetchUsers() {
@@ -250,6 +294,7 @@
         + ((data.count === 1) ? '' : 's')
         + ' · storage cap <strong>' + cap + '</strong> per user';
       dashStatus.textContent = '';
+      renderCron(data.cron);
       showDash();
       render();
     }
