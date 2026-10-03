@@ -11,7 +11,7 @@ A personal assistant with persistent personal memory, web search, URL analysis, 
 - **URL Analysis**: Custom content extraction from web pages
 - **Email Integration**: Automated email sending with professional formatting
 - **Calendar**: Create and list events via the Google Calendar API
-- **Multi-Channel Messaging**: WhatsApp (Twilio), iMessage (SendBlue), Slack (Events API), and Twilio Voice
+- **Multi-Channel Messaging**: Telegram (webhook) and Discord (Interactions webhook) are the open channels, alongside the web chat UI. WhatsApp (Twilio), iMessage (SendBlue), Slack (Events API) and Twilio Voice adapters exist in the tree but are unmounted — closed by policy, not because anything is broken in them
 - **Single-Agent, Tool-Routed Turns**: one Pydantic AI agent per turn with every tool always available - no separate intent router or graph executor
 - **Provider Fallback Cascade**: an ordered list of model rungs (Gemini / OpenRouter / Groq) with per-rung health cooldowns; a failing rung is skipped on the next call
 - **Identity Management**: Per-channel user identity mapping to a canonical internal user ID
@@ -56,11 +56,17 @@ Shared backends
 `-- Identity Manager (core/identity.py) - SQLite (channel, channel_user_id) → user_id
 
 Channel Adapters (apps/channels/) - all funnel into the same _execute_turn
+Open (mounted):
+|-- Web       → WebSocket           (/ws)
+|-- Telegram  → Bot API webhook     (POST /channels/telegram/webhook)
+`-- Discord   → Interactions webhook (POST /channels/discord)
+
+Closed by policy (unmounted - module + router still in the tree):
 |-- WhatsApp  → Twilio Cloud API (POST /channels/whatsapp)
 |-- iMessage  → SendBlue API    (POST /channels/imessage)
 |-- Slack     → Events API      (POST /channels/slack/events)
 `-- Voice     → Twilio Media Streams WebSocket (/channels/twilio/voice/stream)
-      STT: Groq Whisper · TTS: Deepgram μ-law 8 kHz
+      unmounted for a real hazard, not just policy - see apps/turtle_server.py
 ```
 
 ---
@@ -223,10 +229,12 @@ turtle/
 |   |-- websearch_cli.py         # Web search CLI
 |   `-- channels/
 |       |-- __init__.py          # TurtleEvent / TurtleResponse types + dispatch wiring
-|       |-- whatsapp.py          # WhatsApp adapter - Twilio Cloud API webhook
-|       |-- imessage.py          # iMessage adapter - SendBlue webhook
-|       |-- slack.py             # Slack adapter - Events API (app_mention + DM)
-|       `-- twilio_voice.py      # Voice adapter - Twilio Media Streams WebSocket
+|       |-- telegram_webhook.py  # Telegram adapter - webhook mode (OPEN, mounted)
+|       |-- discord.py           # Discord adapter - Interactions webhook (OPEN, mounted)
+|       |-- whatsapp.py          # WhatsApp adapter - Twilio Cloud API webhook (closed by policy, unmounted)
+|       |-- imessage.py          # iMessage adapter - SendBlue webhook (closed by policy, unmounted)
+|       |-- slack.py             # Slack adapter - Events API (closed by policy, unmounted)
+|       `-- twilio_voice.py      # Voice adapter - Twilio Media Streams WebSocket (unmounted - unauthenticated cross-tenant hazard)
 |-- core/
 |   |-- env.py                   # .env loader (shared)
 |   |-- config.py                # Centralised pydantic-settings config (TurtleSettings)
@@ -344,19 +352,22 @@ TURTLE_EMAIL_PASSKEY="your_app_password"
 # Personal memory
 TURTLE_PERSONAL_MEMORY_ENABLED=1
 
-# Channel adapters - Twilio (WhatsApp + Voice)
-TWILIO_ACCOUNT_SID="your_twilio_account_sid"
-TWILIO_AUTH_TOKEN="your_twilio_auth_token"
-TWILIO_WHATSAPP_NUMBER="whatsapp:+14155238886"   # Twilio sandbox or purchased number
-TWILIO_VOICE_NUMBER="+15005550006"               # Twilio voice number
+# Channel adapters - Telegram (OPEN channel; webhook mode)
+TELEGRAM_BOT_TOKEN="your_telegram_bot_token"        # from @BotFather
+TELEGRAM_WEBHOOK_SECRET="your_telegram_webhook_secret"  # verified on every request
 
-# Channel adapters - iMessage via SendBlue
-SENDBLUE_API_KEY="your_sendblue_api_key"
-SENDBLUE_API_SECRET="your_sendblue_api_secret"
+# Channel adapters - Discord (OPEN channel; Interactions webhook mode)
+DISCORD_PUBLIC_KEY="your_discord_public_key"        # Developer Portal -> General Information
+DISCORD_BOT_TOKEN="your_discord_bot_token"          # Developer Portal -> Bot tab
+DISCORD_APPLICATION_ID="your_discord_application_id"
 
-# Channel adapters - Slack
-SLACK_BOT_TOKEN="xoxb-your-slack-bot-token"
-SLACK_SIGNING_SECRET="your_slack_signing_secret"
+# Channel adapters - WhatsApp/iMessage/Slack/Twilio Voice are CLOSED BY POLICY
+# (only Telegram, Discord and the web UI are open channels; see
+# apps/turtle_server.py for the unmount comments). These vars are only
+# needed if one of those routers is deliberately remounted:
+#   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER,
+#   TWILIO_VOICE_NUMBER, SENDBLUE_API_KEY, SENDBLUE_API_SECRET,
+#   SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET
 
 # Channel adapters - Google Calendar (optional)
 GOOGLE_CALENDAR_CREDENTIALS_JSON='{"installed":{"client_id":"..."}}'
@@ -508,14 +519,14 @@ python scripts/trace_replay.py show <turn_id>   # full span for one turn
 
 ### Channel Adapters (webhook setup)
 
-All channel routes are mounted on `turtle_server.py`. Expose the server publicly (e.g. via ngrok) and configure each platform with the corresponding webhook URL:
+Only Telegram, Discord and the web UI are open channels. Both webhook routes are mounted on `turtle_server.py`; expose the server publicly over HTTPS and configure the corresponding platform:
 
 | Channel | Webhook URL | Platform setup |
 |---------|-------------|---------------|
-| WhatsApp | `POST /channels/whatsapp` | Twilio Console → Messaging → WhatsApp sandbox |
-| iMessage | `POST /channels/imessage` | SendBlue dashboard → Webhook URL |
-| Slack | `POST /channels/slack/events` | api.slack.com/apps → Event Subscriptions |
-| Voice | `POST /channels/twilio/voice/incoming` | Twilio Console → Phone Numbers → Voice |
+| Telegram | `POST /channels/telegram/webhook` | Call `setWebhook` (or `register_telegram_webhook()`) pointing at this URL with `secret_token=<TELEGRAM_WEBHOOK_SECRET>` |
+| Discord | `POST /channels/discord` | Developer Portal → General Information → "Interactions Endpoint URL" |
+
+WhatsApp, iMessage, Slack and Twilio Voice adapters exist in `apps/channels/` but their routers are commented out in `apps/turtle_server.py` — closed by policy, not broken. See the unmount comments there for what remounting each one requires.
 
 Adapters operate without credentials in dev mode (signature verification is skipped), so they can be tested locally without real API keys.
 
@@ -575,34 +586,32 @@ Tool contracts live in `core/system_prompts/tools/*.md`.
 
 All channel adapters normalise inbound payloads to a `TurtleEvent` and call the shared `dispatch_event()` handler. Replies are sent back asynchronously via the respective platform API.
 
-### WhatsApp (`apps/channels/whatsapp.py`)
+**Only Telegram, Discord and the web UI are open channels.** WhatsApp, iMessage, Slack and Twilio Voice adapters are still in the tree (see below) but their routers are unmounted by owner policy in `apps/turtle_server.py` — this is a reversible, deliberate decision, not a sign anything is broken.
 
-- Transport: Twilio Cloud API webhook - `POST /channels/whatsapp`
-- Auth: HMAC-SHA1 `X-Twilio-Signature` verified on every request (403 on failure)
-- Idempotency: `MessageSid` cached for 60 s to deduplicate Twilio retries
-- Reply: Twilio Messages REST API (`From: whatsapp:<TWILIO_WHATSAPP_NUMBER>`)
+### Telegram (`apps/channels/telegram_webhook.py`)
 
-### iMessage (`apps/channels/imessage.py`)
+- Transport: Telegram Bot API webhook - `POST /channels/telegram/webhook`
+- Auth: `X-Telegram-Bot-Api-Secret-Token` header verified against `TELEGRAM_WEBHOOK_SECRET`
+- Reply: plain `httpx` POST to the Bot API (no `python-telegram-bot` dependency)
 
-- Transport: SendBlue webhook - `POST /channels/imessage`
-- Auth: HMAC-SHA256 `X-SendBlue-Signature`
-- Reply: `POST https://api.sendblue.co/api/send-message`
+### Discord (`apps/channels/discord.py`)
 
-### Slack (`apps/channels/slack.py`)
+- Transport: Discord Interactions Endpoint - `POST /channels/discord`
+- Auth: Ed25519 signature (`X-Signature-Ed25519` / `X-Signature-Timestamp`) verified with `cryptography` (403/401 on failure)
+- Flow: PING -> PONG immediately; slash commands ACK with a DEFERRED response, then a background task PATCHes the real reply within Discord's follow-up window
+- Bot-application only — never acts as a self-bot
 
-- Transport: Slack Events API - `POST /channels/slack/events`
-- Auth: HMAC-SHA256 `X-Slack-Signature` with 5-minute replay protection
-- Events handled: `app_mention`, `message.im` (direct messages)
-- Reply: `chat.postMessage` as a threaded reply; response sent as a background task to satisfy Slack's 3-second acknowledgement requirement
+### WhatsApp, iMessage, Slack (closed by policy - unmounted)
 
-### Twilio Voice (`apps/channels/twilio_voice.py`)
+- `apps/channels/whatsapp.py` — Twilio Cloud API webhook adapter (`POST /channels/whatsapp`), HMAC-SHA1 `X-Twilio-Signature` verified
+- `apps/channels/imessage.py` — SendBlue webhook adapter (`POST /channels/imessage`), HMAC-SHA256 `X-SendBlue-Signature` verified
+- `apps/channels/slack.py` — Slack Events API adapter (`POST /channels/slack/events`), HMAC-SHA256 `X-Slack-Signature` verified
 
-- Transport: Twilio Media Streams over WebSocket (`/channels/twilio/voice/stream`)
-- Call entry: `POST /channels/twilio/voice/incoming` returns TwiML `<Connect><Stream>`
-- Audio format: PCMU G.711 μ-law, 8 kHz, 20 ms frames
-- VAD: energy-based silence detection (800 ms threshold)
-- STT: Groq Whisper (`whisper-large-v3-turbo`)
-- TTS: Deepgram Aura (linear16 → transcoded to μ-law 8 kHz)
+None of these three has a known auth hazard; the owner simply does not run them. Remounting only requires uncommenting the corresponding `include_router` call in `apps/turtle_server.py` plus that platform's credentials.
+
+### Twilio Voice (`apps/channels/twilio_voice.py`) — unmounted, unauthenticated hazard
+
+This adapter's WebSocket stream (`/channels/twilio/voice/stream`) has no signature verification and takes the tenant from client-supplied data, making it an unauthenticated, bidirectional cross-tenant read channel. It is **not** safe to expose and is not covered by any setup instructions here. See the unmount comment in `apps/turtle_server.py` for what remounting it safely would require.
 
 ### Identity Manager (`core/identity.py`)
 
@@ -645,7 +654,9 @@ fastrtc            # RTC + VAD
 
 ### Channel Adapters
 ```
-twilio             # WhatsApp + Voice (optional)
+httpx              # Telegram webhook replies (already a core dependency)
+cryptography       # Discord Ed25519 signature verification (already a core dependency)
+twilio             # WhatsApp + Voice (optional; only needed if those unmounted routers are remounted)
 aiosqlite          # Identity manager (users.sqlite)
 pydantic-settings  # Centralised TurtleSettings config
 ```
@@ -702,9 +713,8 @@ Turtle: Got it - I'll default to bullet points going forward.
 - **RAG Memory**: Requires internet for Cohere embeddings; English-optimized; storage grows with volume
 - **Personal Memory Stage B**: The mid-session LLM reflector needs a capable model for quality extraction; it runs best-effort and never blocks a turn
 - **Model Dependencies**: OpenRouter rate limits, Groq model availability, API costs for production use
-- **Twilio Voice VAD**: Uses simple energy-based silence detection (800 ms threshold); full Silero VAD is not yet wired
-- **Channel Adapters**: All adapters require the server to be publicly reachable over HTTPS/WSS; not suitable for local-only setups without a tunnel (e.g. ngrok)
-- **iMessage via SendBlue**: Requires a US phone number and SendBlue account; Apple-native iMessage delivery is not guaranteed for non-Apple hardware
+- **Channel Adapters**: Telegram and Discord require the server to be publicly reachable over HTTPS; not suitable for local-only setups without a tunnel
+- **Closed channels**: WhatsApp, iMessage, Slack and Twilio Voice adapters exist in `apps/channels/` but are unmounted by owner policy — only Telegram, Discord and the web UI are open
 
 ---
 
@@ -728,16 +738,13 @@ Turtle: Got it - I'll default to bullet points going forward.
 - Verify credentials in environment
 - Check Gmail app password setup
 
-### WhatsApp / iMessage / Slack Not Responding
-- Confirm `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_WHATSAPP_NUMBER` are set
-- For iMessage: confirm `SENDBLUE_API_KEY` and `SENDBLUE_API_SECRET`
-- For Slack: confirm `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET`; ensure bot is invited to the channel
-- Check server logs for `403 Invalid * signature` - mismatch between configured secret and platform secret
+### Telegram / Discord Not Responding
+- For Telegram: confirm `TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET` are set and `setWebhook` was called with the matching `secret_token`
+- For Discord: confirm `DISCORD_PUBLIC_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_APPLICATION_ID`; ensure the Interactions Endpoint URL is verified in the Developer Portal
+- Check server logs for a signature-verification failure - mismatch between configured secret and platform secret
 
-### Twilio Voice Call Gets No Audio
-- Confirm `DEEPGRAM_API_KEY` (TTS) and `GROQ_API_KEY` (STT Whisper)
-- Ensure the server is reachable over HTTPS/WSS (Twilio requires TLS for Media Streams)
-- Check logs for `[TwilioVoice] STT failed` or `[TwilioVoice] TTS failed`
+### WhatsApp / iMessage / Slack / Twilio Voice unavailable
+These four adapters are unmounted by owner policy (only Telegram, Discord and the web UI are open channels). This is expected, not a bug — see `apps/turtle_server.py`'s unmount comments for what remounting each one requires.
 
 ### Debug Commands
 ```bash
