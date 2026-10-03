@@ -50,6 +50,168 @@ jobs:
         # via test/smoke_boot_test.py, so no separate CI boot job is needed.
         run: python -m pytest test -q
 
+  secrets-scan:
+    # ledger 1b.6 (item 3): there was no secret scanning, linting, or static
+    # analysis anywhere in this repo's CI before this job, and no
+    # pre-commit configuration of any kind. This runs gitleaks — downloaded
+    # directly from its GitHub release and checksum-verified below, NOT the
+    # `gitleaks/gitleaks-action` wrapper (that wrapper ships under a
+    # separate commercial EULA baked into its action.yml; the gitleaks CLI
+    # itself is MIT) — against just the commit(s) this push/PR introduces.
+    #
+    # BEHAVIOUR CHANGE, not a pure addition: this is a job inside the
+    # `tests` workflow (not a new workflow) specifically so
+    # deploy-vercel.yml's `workflow_run: workflows: ["tests"]` trigger keeps
+    # firing. But a workflow_run's `conclusion` is `success` only when every
+    # job in the run succeeds, so from this commit onward a secret landing
+    # in a push/PR will also fail the `tests` run and therefore newly block
+    # both preview and production deploys. That IS the point of a secret
+    # gate, but flagging it explicitly since nothing about the deploy
+    # workflow's trigger makes that consequence obvious by itself.
+    #
+    # Job, not a step inside `tests`: this needs no Python/pip install at
+    # all, so as its own job it starts immediately and runs fully in
+    # parallel with `tests` instead of serialising behind that job's
+    # dependency install. A step would be simpler (one less job block to
+    # read) but would sit idle behind pip for no reason — this scan doesn't
+    # touch anything `tests` installs.
+    #
+    # Diff-only, not full history: gitleaks is pointed at only the commits
+    # this push/PR adds (`--log-opts` below), not the whole repo history.
+    # Scanning full history on every push would cost the same seconds-long
+    # penalty on every single run forever, and — because this repo had zero
+    # secret scanning before today — would very likely surface old,
+    # already-shipped findings and block ALL work immediately until every
+    # historical hit was triaged or allow-listed, rather than gating what
+    # matters going forward. A one-time full-history audit run by hand is
+    # still worth doing separately; this job is the going-forward gate, not
+    # that audit.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need real history (not the default shallow clone) so the diff
+          # range below resolves against an ancestor commit that's actually
+          # present locally.
+          fetch-depth: 0
+
+      - name: Fetch refs needed to compute the scan range
+        # actions/checkout with fetch-depth: 0 unshallows the ref it checks
+        # out; it does not reliably guarantee a local origin/<branch> ref for
+        # branches this run didn't check out. Fetch explicitly so
+        # merge-base/rev-list below always have something real to resolve
+        # against, rather than depending on checkout's internals.
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "${{ github.event.repository.default_branch }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}"
+          fi
+
+      - name: Determine scan range (this push/PR's new commits only)
+        id: range
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # The merge-base, not pull_request.base.sha directly: base.sha is
+            # wherever the base branch's tip happened to be at event time,
+            # which can drift ahead of where this PR branch actually forked
+            # if the base branch moved since. The merge-base is the real
+            # common ancestor, i.e. exactly the commits this PR introduces.
+            start="$(git merge-base "origin/${{ github.event.pull_request.base.ref }}" "${{ github.event.pull_request.head.sha }}")"
+            end="${{ github.event.pull_request.head.sha }}"
+          else
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              # New branch (or any ref GitHub has no prior SHA for) — the
+              # before-SHA is all zeros, so there is nothing to diff
+              # against directly. This is exactly the case that produced
+              # "0 commits scanned" the first time this job ran: a bare "-1"
+              # (just the tip commit) is not a substitute for it, and even a
+              # single-commit range silently scans empty if that commit is a
+              # merge (see the -m note below). Use the merge-base with the
+              # default branch instead — a new branch's "new commits" are
+              # whatever it carries beyond where it forked.
+              start="$(git merge-base "origin/${{ github.event.repository.default_branch }}" "${{ github.sha }}")"
+            else
+              start="$before"
+            fi
+            end="${{ github.sha }}"
+          fi
+          echo "start=$start" >> "$GITHUB_OUTPUT"
+          echo "end=$end" >> "$GITHUB_OUTPUT"
+
+      - name: Sanity-check the computed range is non-empty
+        # Load-bearing, not a nicety: a scanner silently pointed at an empty
+        # range exits 0 and is indistinguishable in the GitHub UI from "ran
+        # against everything, found nothing". Fail closed here, before
+        # gitleaks ever runs, if the range resolves to zero commits.
+        run: |
+          set -euo pipefail
+          range="${{ steps.range.outputs.start }}..${{ steps.range.outputs.end }}"
+          count="$(git rev-list --count "$range")"
+          echo "commits in range $range: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::computed scan range '$range' contains 0 commits — refusing to run gitleaks against nothing and let that read as a pass."
+            exit 1
+          fi
+
+      - name: Install gitleaks (pinned version, checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -sSL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+
+      - name: Run gitleaks on the incoming change
+        # -m matters: --log-opts configures `git log -p`, and plain
+        # `git log -p` prints NO diff at all for a merge commit (you need -m
+        # or -c/--cc to see one). This is what broke the very first run of
+        # this job: the range resolved to a single merge commit, its diff
+        # was empty under plain `git log -p`, and gitleaks reported
+        # "0 commits scanned ... no leaks found" with exit 0 — a fully green,
+        # fully meaningless run. -m diffs a merge commit against each parent
+        # instead of skipping it; verified locally against this repo's own
+        # merge commit (a0d8d8b): `git log -p -1` on it produces 36 lines
+        # (message only, no diff), `git log -p -m -1` produces 311 (real
+        # diff content).
+        #
+        # The output is re-parsed below rather than trusted at face value:
+        # the range sanity-check above guards the most likely cause (a bad
+        # range), but a scanner that silently covers zero commits for some
+        # other reason (a stray gitleaks-ignore rule, a config option that
+        # filters everything back out) would still exit 0 and look identical
+        # to a real clean pass. Reading gitleaks' own "N commits scanned"
+        # line is a second, independent check against exactly that failure
+        # mode, not a restatement of the first one.
+        run: |
+          set -uo pipefail
+          ./gitleaks git --log-opts="-m ${{ steps.range.outputs.start }}..${{ steps.range.outputs.end }}" -v --exit-code 1 2>&1 | tee gitleaks_output.txt
+          gitleaks_exit="${PIPESTATUS[0]}"
+
+          scanned_line="$(grep -oE '[0-9]+ commits scanned' gitleaks_output.txt || true)"
+          echo "gitleaks reported: ${scanned_line:-<no 'commits scanned' line found in output>}"
+
+          if [ -z "$scanned_line" ]; then
+            echo "::error::gitleaks did not print a 'N commits scanned' line — cannot confirm it scanned anything. Failing closed rather than trusting a bare exit code."
+            exit 1
+          fi
+
+          scanned_count="$(echo "$scanned_line" | grep -oE '^[0-9]+')"
+          if [ "$scanned_count" -eq 0 ]; then
+            echo "::error::gitleaks scanned 0 commits. A green run with zero commits scanned means nothing was checked, not that nothing was found — failing closed instead of reporting a false pass."
+            exit 1
+          fi
+
+          if [ "$gitleaks_exit" -ne 0 ]; then
+            echo "::error::gitleaks found a leak (exit ${gitleaks_exit}) — see findings above."
+            exit "$gitleaks_exit"
+          fi
+
+          echo "gitleaks scanned ${scanned_count} commit(s): no leaks found."
+
   cloud-tests:
     # WP0.C (ledger 0.4 / S-9.5): runs test/cloud_integration/ against a REAL
     # Postgres + Redis, TURTLE_DEPLOY=cloud. The `tests` job above only ever

@@ -28,6 +28,38 @@ it requires an already-authenticated session. A leaked code lets an attacker
 attach THEIR OWN channel handle to their own account — not read anyone's data.
 
 Codes are single-use, TTL-bounded, and stored server-side in users.sqlite.
+
+TWO-SIDED BINDING (ledger 1b.6). The paragraph above was aspirational, not
+accurate: `apps/turtle_server.py`'s `link_account` tool docstring already
+documents the real gap it left open — ANY authenticated web session, not just
+the one the channel user intends, could redeem a leaked/intercepted code and
+walk away with THAT SENDER's memory merged into a stranger's account. The
+missing piece was that the code, while it names no *target* account, also
+named no *expected redeemer* — so "an already-authenticated session" was
+sufficient, when it should have needed to be a SPECIFIC one.
+
+`issue()` now takes an optional `expected_email`: what the channel-side user
+says they will sign in to the web with. This is NOT trusted as an
+authorization credential — a self-claimed email proves nothing, same as
+ever — it is only ever used to REFUSE a redeemer whose authenticated
+account's email doesn't match. Authentication (proof of account ownership)
+still gates the merge exactly as before; the binding is an *additional*
+constraint on top, never a substitute for it. Redemption compares
+`expected_email` against the target account's own `users.primary_email` —
+an attribute the *web sign-in flow* established, not something the redeemer
+types into this endpoint — so there is no read-then-trust step for the
+redeemer to spoof.
+
+What a leaked code gets an attacker now: if the code carries an
+`expected_email`, nothing — redemption 400s exactly like an invalid code
+unless the attacker is ALSO already authenticated as the one specific account
+matching that email, and if they already control that account they had no
+need of the code to begin with (linking that account was the intended
+outcome). Compare to before this change: any authenticated account, chosen
+by the attacker, could redeem — which is strictly worse. A code minted
+before this change shipped (no `expected_email` on the row) still redeems
+under the old, unbound rule until it expires (codes are TTL-bounded to 15
+minutes, so this window is short and self-closing — see `reserve()`).
 """
 from __future__ import annotations
 
@@ -63,6 +95,17 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds")
 
 
+def _normalize_email(email: str | None) -> str:
+    """Mirrors core.identity.normalize_email's policy exactly (strip+lower,
+    no plus-tag/dot folding) but is deliberately a local copy rather than an
+    import: core/identity.py belongs to a parallel WP and this module must
+    not take on a load-bearing dependency on it. The normalization itself is
+    a one-line policy, not the kind of logic that drifting duplication would
+    meaningfully risk (same trade the two LinkCodeStore backends already make
+    for the code alphabet / TTL constants)."""
+    return (email or "").strip().lower()
+
+
 @dataclass(frozen=True)
 class LinkCode:
     code: str
@@ -70,6 +113,11 @@ class LinkCode:
     channel_user_id: str
     source_user_id: str
     expires_at: str
+    # Two-sided binding (ledger 1b.6): what the channel-side issuer says the
+    # redeemer's web account email will be. None on codes issued before this
+    # field existed, or if the issuer didn't supply one — see reserve()/the
+    # redemption endpoint for what that means at redemption time.
+    expected_email: str | None = None
 
 
 class LinkCodeStore:
@@ -115,25 +163,47 @@ class LinkCodeStore:
                     -- the code atomically to ONE target closes it: the second
                     -- caller sees a mismatched reserved_for and is rejected.
                     reserved_for TEXT,
-                    reserved_at TEXT
+                    reserved_at TEXT,
+                    expected_email TEXT
                 )
                 """
             )
-            # Add columns to a pre-reservation table
+            # Add columns to a pre-reservation / pre-binding table. A live
+            # production row with no expected_email (i.e. issued before this
+            # migration ran) reads back as NULL -> LinkCode.expected_email is
+            # None -> redemption treats it as unbound (see module docstring
+            # for why that's the deliberate, bounded-by-TTL choice here).
             cols = {r[1] for r in conn.execute(f"PRAGMA table_info({_TABLE})")}
             if "reserved_for" not in cols:
                 conn.execute(f"ALTER TABLE {_TABLE} ADD COLUMN reserved_for TEXT")
             if "reserved_at" not in cols:
                 conn.execute(f"ALTER TABLE {_TABLE} ADD COLUMN reserved_at TEXT")
+            if "expected_email" not in cols:
+                conn.execute(f"ALTER TABLE {_TABLE} ADD COLUMN expected_email TEXT")
 
-    def issue(self, *, channel: str, channel_user_id: str, source_user_id: str) -> LinkCode:
+    def issue(
+        self,
+        *,
+        channel: str,
+        channel_user_id: str,
+        source_user_id: str,
+        expected_email: str | None = None,
+    ) -> LinkCode:
         """Mint a fresh claim code for a channel identity.
 
         Any previous unconsumed code for the same channel identity is dropped, so
         a user who asks twice can't leave a stale code redeemable.
+
+        ``expected_email`` (two-sided binding, ledger 1b.6): what the issuer
+        says their web account email is. Normalized and stored verbatim; None
+        means "no binding" (see module docstring for what that means at
+        redemption). Never validated against anything at issue time — it is
+        a self-claimed assertion that only ever narrows who may redeem, never
+        who is trusted.
         """
         code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
         expires = _iso(_utc_now() + timedelta(minutes=LINK_CODE_TTL_MINUTES))
+        normalized_email = _normalize_email(expected_email) or None
         with self._connect() as conn:
             conn.execute(
                 f"DELETE FROM {_TABLE} WHERE channel = ? AND channel_user_id = ? "
@@ -141,11 +211,12 @@ class LinkCodeStore:
                 (channel, channel_user_id),
             )
             conn.execute(
-                f"INSERT INTO {_TABLE} (code, channel, channel_user_id, source_user_id, expires_at) "
-                f"VALUES (?, ?, ?, ?, ?)",
-                (code, channel, channel_user_id, source_user_id, expires),
+                f"INSERT INTO {_TABLE} "
+                f"(code, channel, channel_user_id, source_user_id, expires_at, expected_email) "
+                f"VALUES (?, ?, ?, ?, ?, ?)",
+                (code, channel, channel_user_id, source_user_id, expires, normalized_email),
             )
-        return LinkCode(code, channel, channel_user_id, source_user_id, expires)
+        return LinkCode(code, channel, channel_user_id, source_user_id, expires, normalized_email)
 
     def peek(self, code: str) -> LinkCode | None:
         """Read-only lookup used by tests. Endpoint code should call ``reserve``
@@ -167,7 +238,7 @@ class LinkCodeStore:
             return None
         return LinkCode(
             normalized, row["channel"], row["channel_user_id"],
-            row["source_user_id"], row["expires_at"],
+            row["source_user_id"], row["expires_at"], row["expected_email"],
         )
 
     def reserve(self, code: str, target_user_id: str) -> tuple[str, LinkCode | None]:
@@ -231,7 +302,7 @@ class LinkCodeStore:
             return ("locked", None)
         claim = LinkCode(
             normalized, row["channel"], row["channel_user_id"],
-            row["source_user_id"], row["expires_at"],
+            row["source_user_id"], row["expires_at"], row["expected_email"],
         )
         return ("ok", claim)
 
@@ -285,6 +356,7 @@ class LinkCodeStore:
             row["channel_user_id"],
             row["source_user_id"],
             row["expires_at"],
+            row["expected_email"],
         )
 
     def purge_expired(self) -> int:

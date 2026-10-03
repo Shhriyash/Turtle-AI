@@ -46,9 +46,21 @@ CREATE TABLE IF NOT EXISTS link_codes (
     expires_at TIMESTAMPTZ NOT NULL,
     consumed_at TIMESTAMPTZ,
     reserved_for TEXT,
-    reserved_at TIMESTAMPTZ
+    reserved_at TIMESTAMPTZ,
+    expected_email TEXT
 )
 """
+
+# Two-sided binding (ledger 1b.6), mirroring core.account_linking's own
+# ALTER-on-startup path: a live table created before this column existed
+# needs it added in place — there is no migration runner in this project,
+# every schema change is applied idempotently at connect time. A pre-existing
+# row reads back expected_email=NULL, which core.account_linking.LinkCode and
+# the redemption endpoint both treat as "unbound" (see core/account_linking.py
+# module docstring for why that's the deliberate, TTL-bounded choice).
+_ADD_EXPECTED_EMAIL_SQL = (
+    "ALTER TABLE link_codes ADD COLUMN IF NOT EXISTS expected_email TEXT"
+)
 
 _initialized = False
 
@@ -59,12 +71,20 @@ def _ensure_init() -> Any:
     if not _initialized:
         with pool.connection() as conn:
             conn.execute(_CREATE_TABLE_SQL)
+            conn.execute(_ADD_EXPECTED_EMAIL_SQL)
         _initialized = True
     return pool
 
 
 def _normalize_code(code: str) -> str:
     return (code or "").strip().upper().replace(" ", "").replace("-", "")
+
+
+def _normalize_email(email: str | None) -> str:
+    """Mirrors core.account_linking._normalize_email exactly — see that
+    module's docstring for why this is a deliberate local copy rather than a
+    shared import."""
+    return (email or "").strip().lower()
 
 
 def _utc_now() -> datetime:
@@ -86,12 +106,20 @@ class PostgresLinkCodeStore:
         pass  # No per-instance state — every method opens its own connection,
         # matching the local class's own "open/close per operation" posture.
 
-    def issue(self, *, channel: str, channel_user_id: str, source_user_id: str):
+    def issue(
+        self,
+        *,
+        channel: str,
+        channel_user_id: str,
+        source_user_id: str,
+        expected_email: str | None = None,
+    ):
         from core.account_linking import LinkCode
 
         pool = _ensure_init()
         code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
         expires = _utc_now() + timedelta(minutes=LINK_CODE_TTL_MINUTES)
+        normalized_email = _normalize_email(expected_email) or None
         with pool.connection() as conn:
             conn.execute(
                 "DELETE FROM link_codes WHERE channel = %s AND channel_user_id = %s "
@@ -99,11 +127,14 @@ class PostgresLinkCodeStore:
                 (channel, channel_user_id),
             )
             conn.execute(
-                "INSERT INTO link_codes (code, channel, channel_user_id, source_user_id, expires_at) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (code, channel, channel_user_id, source_user_id, expires),
+                "INSERT INTO link_codes "
+                "(code, channel, channel_user_id, source_user_id, expires_at, expected_email) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (code, channel, channel_user_id, source_user_id, expires, normalized_email),
             )
-        return LinkCode(code, channel, channel_user_id, source_user_id, _iso(expires))
+        return LinkCode(
+            code, channel, channel_user_id, source_user_id, _iso(expires), normalized_email
+        )
 
     def peek(self, code: str):
         from core.account_linking import LinkCode
@@ -114,16 +145,18 @@ class PostgresLinkCodeStore:
         pool = _ensure_init()
         with pool.connection() as conn:
             row = conn.execute(
-                "SELECT channel, channel_user_id, source_user_id, expires_at, consumed_at "
-                "FROM link_codes WHERE code = %s",
+                "SELECT channel, channel_user_id, source_user_id, expires_at, consumed_at, "
+                "expected_email FROM link_codes WHERE code = %s",
                 (normalized,),
             ).fetchone()
         if row is None or row[4] is not None:
             return None
-        channel, channel_user_id, source_user_id, expires_at, _consumed = row
+        channel, channel_user_id, source_user_id, expires_at, _consumed, expected_email = row
         if expires_at <= _utc_now():
             return None
-        return LinkCode(normalized, channel, channel_user_id, source_user_id, _iso(expires_at))
+        return LinkCode(
+            normalized, channel, channel_user_id, source_user_id, _iso(expires_at), expected_email
+        )
 
     def reserve(self, code: str, target_user_id: str) -> tuple[str, Optional[Any]]:
         from core.account_linking import LinkCode
@@ -153,20 +186,22 @@ class PostgresLinkCodeStore:
                 (target_user_id, now, normalized, now, target_user_id, cutoff),
             )
             row = conn.execute(
-                "SELECT channel, channel_user_id, source_user_id, expires_at, consumed_at "
-                "FROM link_codes WHERE code = %s",
+                "SELECT channel, channel_user_id, source_user_id, expires_at, consumed_at, "
+                "expected_email FROM link_codes WHERE code = %s",
                 (normalized,),
             ).fetchone()
         if row is None or row[4] is not None:
             return ("invalid", None)
-        channel, channel_user_id, source_user_id, expires_at, _consumed = row
+        channel, channel_user_id, source_user_id, expires_at, _consumed, expected_email = row
         if expires_at <= _utc_now():
             return ("invalid", None)
         if cur.rowcount == 0:
             # An active reservation for a different target is holding the
             # code — don't reveal who to the loser, same as the local class.
             return ("locked", None)
-        claim = LinkCode(normalized, channel, channel_user_id, source_user_id, _iso(expires_at))
+        claim = LinkCode(
+            normalized, channel, channel_user_id, source_user_id, _iso(expires_at), expected_email
+        )
         return ("ok", claim)
 
     def release_reservation(self, code: str, target_user_id: str) -> None:
@@ -190,13 +225,13 @@ class PostgresLinkCodeStore:
         pool = _ensure_init()
         with pool.connection() as conn:
             row = conn.execute(
-                "SELECT channel, channel_user_id, source_user_id, expires_at, consumed_at "
-                "FROM link_codes WHERE code = %s",
+                "SELECT channel, channel_user_id, source_user_id, expires_at, consumed_at, "
+                "expected_email FROM link_codes WHERE code = %s",
                 (normalized,),
             ).fetchone()
             if row is None or row[4] is not None:
                 return None
-            channel, channel_user_id, source_user_id, expires_at, _consumed = row
+            channel, channel_user_id, source_user_id, expires_at, _consumed, expected_email = row
             if expires_at <= _utc_now():
                 return None
             cur = conn.execute(
@@ -205,7 +240,9 @@ class PostgresLinkCodeStore:
             )
             if cur.rowcount != 1:
                 return None  # lost the race
-        return LinkCode(normalized, channel, channel_user_id, source_user_id, _iso(expires_at))
+        return LinkCode(
+            normalized, channel, channel_user_id, source_user_id, _iso(expires_at), expected_email
+        )
 
     def purge_expired(self) -> int:
         pool = _ensure_init()

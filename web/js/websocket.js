@@ -72,7 +72,13 @@ function handleServerMessage(msg) {
             break;
         case 'done':
             hideThinking();
-            addMessage('assistant', msg.content);
+            // WP1.H: msg.tool_urls is the server's allow-list of this turn's
+            // tool-sourced URLs. A frame that omits the key entirely (e.g.
+            // the budget-refusal "done", which never ran a tool) must render
+            // with nothing clickable, not fall back to linkifying everything
+            // — addMessage enforces that fail-closed default for the
+            // 'assistant' role regardless of what's passed here.
+            addMessage('assistant', msg.content, msg.tool_urls);
             setStatus('ready', 'Ready');
             setBubbleState('idle');
             break;
