@@ -2213,6 +2213,14 @@ class AgentManager:
             # the composer (see _recent_conversation_context).
             conversation_context = _recent_conversation_context(ctx.deps)
 
+            # Both keys below must exist in load_profile_snapshot()'s returned
+            # shape. They did not for a long time: the snapshot folded the
+            # contacts topic into workflow.common_recipients and ignored
+            # relations entirely, so this block handed the email agent
+            # {"contacts": {}, "relations": {}} on every single send while
+            # looking like it supplied real context.
+            # test/profile_snapshot_contract_test.py now fails if any
+            # consumer reads a snapshot key the snapshot does not produce.
             known_contacts: dict[str, Any] = {}
             try:
                 _snapshot = ctx.deps.personal_memory_store.load_profile_snapshot()
@@ -2220,7 +2228,11 @@ class AgentManager:
                     "contacts": _snapshot.get("contacts") or {},
                     "relations": _snapshot.get("relations") or {},
                 }
-            except Exception:
+            except Exception as e:
+                # Profile I/O must never block a send, but it should not be
+                # invisible either -- the bare swallow above hid the empty
+                # result as effectively as it hid real failures.
+                print(f"LOG: known-contacts lookup failed: {e}")
                 known_contacts = {}
 
             context_section = (
