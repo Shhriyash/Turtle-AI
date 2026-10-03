@@ -19,7 +19,9 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -154,6 +156,38 @@ from tools.contracts import (
     PlaceDetailsArgs,
     GetDirectionsArgs,
 )
+
+# httpx logs every request as 'HTTP Request: GET <full url> "HTTP/1.1 200 OK"'
+# through the stdlib "httpx" logger. Some providers (Telegram: /bot<TOKEN>/...)
+# put credentials in the URL path or query, so the full URL must never reach a
+# log stream. This is independent of Logfire: the line is emitted by httpx
+# itself whenever the host runtime sets the root logger to INFO. We keep the
+# scheme + host (so an outbound call and its status stay visible) and drop
+# userinfo, path and query.
+_URL_IN_TEXT_RE = re.compile(r"(?P<scheme>https?|wss?)://(?:[^\s/@\"']*@)?(?P<host>[^\s/?#\"']+)(?:[/?#][^\s\"']*)?")
+
+
+def _redact_urls(text: str) -> str:
+    return _URL_IN_TEXT_RE.sub(
+        lambda m: f"{m.group('scheme')}://{m.group('host')}/<redacted>", text
+    )
+
+
+class _RedactUrlsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = _redact_urls(record.getMessage())
+            record.args = None
+        except Exception:
+            record.msg = "<log message withheld: redaction failed>"
+            record.args = None
+        return True
+
+
+for _name in ("httpx", "httpcore"):
+    _lg = logging.getLogger(_name)
+    if not any(isinstance(f, _RedactUrlsFilter) for f in _lg.filters):
+        _lg.addFilter(_RedactUrlsFilter())
 
 try:
     import logfire
