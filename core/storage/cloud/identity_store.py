@@ -166,6 +166,39 @@ class PostgresIdentityManager:
             )
             return row["user_id"] if row else None
 
+    async def find_user_id_by_email(self, email: str) -> Optional[str]:
+        """Cloud counterpart to core.identity.IdentityManager.find_user_id_by_email —
+        non-minting lookup by the users.primary_email column. See that
+        docstring for rationale.
+        """
+        from core.identity import normalize_email  # avoid a circular import at module load
+
+        normalized = normalize_email(email)
+        if not normalized:
+            return None
+        pool = await self._ensure_init()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT user_id FROM users WHERE primary_email = $1", normalized
+            )
+            return row["user_id"] if row else None
+
+    async def list_users(self) -> list[dict]:
+        """Cloud counterpart to core.identity.IdentityManager.list_users."""
+        pool = await self._ensure_init()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id, primary_email, created_at FROM users ORDER BY created_at DESC"
+            )
+        return [
+            {
+                "user_id": row["user_id"],
+                "primary_email": row["primary_email"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            }
+            for row in rows
+        ]
+
     async def resolve_user(self, channel: str, channel_user_id: str) -> str:
         from core.identity import normalize_email  # avoid a circular import at module load
 

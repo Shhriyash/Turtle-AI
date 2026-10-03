@@ -18,6 +18,13 @@ Proves:
       reads it to render; web/js/devmode.js is the only reader).
   (f) GET /api/config is gated behind X-Admin-Token in CLOUD mode, mirroring
       POST — 401 without the header, 200 with the correct one.
+  (g) WP2.C (ledger 2.7 / D7): POST /api/config is unconditionally immutable
+      in cloud — 405 even with a VALID admin token, and _save_config is
+      never called. The pre-WP2.C code let a correct token through to a
+      filesystem write that either crashes (read-only) or silently vanishes
+      at the next cold start while agents_mgr.rebuild still mutated the live
+      process. The 405 body is JSON carrying the message so
+      web/js/devmode.js's existing `result.error` else-branch renders it.
 
 Offline: no network, no live keys. Follows smoke_boot_test.py's guarded-import
 pattern so a genuinely missing optional dep skips rather than erroring collection.
@@ -110,12 +117,20 @@ class AdminDashboardAndConfigGate(unittest.TestCase):
             self.assertIn("admin", r.json().get("error", "").lower())
 
     def test_post_config_fails_closed_in_cloud_without_token(self) -> None:
-        """Cloud always fails closed, regardless of DEV_ANON."""
+        """Cloud always fails closed, regardless of DEV_ANON.
+
+        WP2.C (ledger 2.7): cloud's config-immutability 405 is unconditional
+        and checked before the admin-token gate, so this now short-circuits
+        to 405 rather than the pre-WP2.C 503 ("no admin token configured") --
+        immutability is a stronger and more accurate statement than "the
+        write mechanism is merely disabled". See (g) below for the
+        valid-token case this supersedes.
+        """
         with patch.object(turtle_server.settings, "admin_token", None), \
              patch.object(turtle_server.settings, "dev_anon", True), \
              patch.object(turtle_server.settings, "deploy_mode", "cloud"):
             r = self.client.post("/api/config", json={"temperature": 0.3})
-            self.assertEqual(r.status_code, 503)
+            self.assertEqual(r.status_code, 405)
 
     # (d) -------------------------------------------------------------------
     def test_get_config_open_in_local_regardless(self) -> None:
@@ -144,6 +159,53 @@ class AdminDashboardAndConfigGate(unittest.TestCase):
              patch.object(turtle_server.settings, "deploy_mode", "cloud"):
             r = self.client.get("/api/config")
             self.assertEqual(r.status_code, 401)
+
+    # (g) -------------------------------------------------------------------
+    def test_post_config_immutable_in_cloud_even_with_valid_token(self) -> None:
+        """A CORRECT admin token must NOT unlock a config write in cloud --
+        the token proves identity, not that a filesystem write will persist.
+        setUp already patches _save_config to a no-op; this test additionally
+        asserts it was never even called."""
+        with patch.object(turtle_server, "_save_config") as mock_save, \
+             patch.object(turtle_server.settings, "admin_token", SecretStr("s3cret")), \
+             patch.object(turtle_server.settings, "deploy_mode", "cloud"):
+            r = self.client.post(
+                "/api/config",
+                json={"temperature": 0.3},
+                headers={"X-Admin-Token": "s3cret"},
+            )
+            self.assertEqual(r.status_code, 405)
+            mock_save.assert_not_called()
+
+    def test_post_config_immutable_in_cloud_body_is_json_with_error(self) -> None:
+        """web/js/devmode.js's applyDevConfig does `await res.json()`
+        unconditionally and reads `result.error` on any non-'ok' status --
+        a bare 405 with no body would throw inside res.json() there and show
+        a generic toast instead of this message."""
+        with patch.object(turtle_server.settings, "admin_token", SecretStr("s3cret")), \
+             patch.object(turtle_server.settings, "deploy_mode", "cloud"):
+            r = self.client.post(
+                "/api/config",
+                json={"temperature": 0.3},
+                headers={"X-Admin-Token": "s3cret"},
+            )
+            self.assertEqual(r.status_code, 405)
+            self.assertEqual(r.headers.get("content-type", "").split(";")[0], "application/json")
+            body = r.json()
+            self.assertIn("error", body)
+            self.assertIn("immutable", body["error"].lower())
+
+    def test_post_config_still_works_locally(self) -> None:
+        """Local mode is unaffected by the cloud immutability gate."""
+        with patch.object(turtle_server.settings, "admin_token", SecretStr("s3cret")), \
+             patch.object(turtle_server.settings, "deploy_mode", "local"):
+            r = self.client.post(
+                "/api/config",
+                json={"temperature": 0.3},
+                headers={"X-Admin-Token": "s3cret"},
+            )
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json().get("status"), "ok")
 
 
 if __name__ == "__main__":

@@ -380,6 +380,61 @@ class PersonalTierTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(_token_overlap("best friend pal", "best buddy"), 1 / 3)
 
 
+class CloudPersonalTierTests(unittest.IsolatedAsyncioTestCase):
+    """Ledger 2.1: personal recall must not be dead when sqlite_index is None.
+
+    Cloud mode never has a lexical (SQLite/FTS5) index, so the broker is
+    constructed with sqlite_index=None. Before the fix, _build_personal_tier
+    returned "" immediately on that guard, so recall(scope="personal") was a
+    silent no-op on every cloud turn. These tests exercise that exact
+    construction (no live Postgres needed — vector_store is a plain mock)
+    and assert the vector branch is reached and its hits are surfaced.
+    """
+
+    def setUp(self) -> None:
+        from unittest.mock import AsyncMock
+
+        self.base = Path("test") / "_tmp" / f"cloudptier_{uuid.uuid4().hex}"
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.store = _make_store(self.base)
+        self.task_store = TaskHistoryStore(self.base / "tasks" / "history.jsonl")
+        self.vector_store = AsyncMock()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.base, ignore_errors=True)
+
+    def _broker(self) -> RetrievalBroker:
+        return RetrievalBroker(
+            store=self.store,
+            task_store=self.task_store,
+            sqlite_index=None,  # cloud mode: no lexical index
+            vector_store=self.vector_store,
+            user_id="usr_test",
+        )
+
+    async def test_no_sqlite_index_falls_through_to_vector_search(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from core.storage import Hit
+
+        self.vector_store.search = AsyncMock(
+            return_value=[Hit(doc_id="d1", text="Best friend: Aarav", score=0.9, metadata={"topic": "relations"})]
+        )
+        broker = self._broker()
+        result = await broker.recall(query="who is my best friend", scope="personal")
+        self.vector_store.search.assert_awaited_once()
+        self.assertIn("Aarav", result)
+
+    async def test_no_sqlite_index_and_no_vector_hits_returns_empty_not_crash(self) -> None:
+        from unittest.mock import AsyncMock
+
+        self.vector_store.search = AsyncMock(return_value=[])
+        broker = self._broker()
+        result = await broker.recall(query="anything at all", scope="personal")
+        self.vector_store.search.assert_awaited_once()
+        self.assertEqual(result, "")
+
+
 class RetrievalBudgetTests(unittest.TestCase):
     def test_default_budget_values(self) -> None:
         # Phase 2 W2: prompt-time injection is index + query-aware [Relevant

@@ -212,6 +212,37 @@ class IdentityManager:
                 row = await cursor.fetchone()
                 return row[0] if row else None
 
+    async def find_user_id_by_email(self, email: str) -> Optional[str]:
+        """Non-minting lookup by the users.primary_email column (not
+        channel_mappings): finds a user_id even when the caller only has an
+        email and no channel context (admin tooling, WP 2.A's purge routes).
+        Returns None on no match. Never mints.
+        """
+        normalized = normalize_email(email)
+        if not normalized:
+            return None
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT user_id FROM users WHERE primary_email = ?", (normalized,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else None
+
+    async def list_users(self) -> list[dict]:
+        """All users with their primary_email/created_at — the async-surface
+        replacement for apps/admin_routes.py's raw ``aiosqlite.connect(
+        identity_manager.db_path)`` query, so /admin/users no longer reaches
+        for an attribute (db_path) that PostgresIdentityManager doesn't have.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT user_id, primary_email, created_at FROM users ORDER BY created_at DESC"
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [
+            {"user_id": r[0], "primary_email": r[1], "created_at": r[2]} for r in rows
+        ]
+
     async def resolve_user(self, channel: str, channel_user_id: str) -> str:
         """Resolve a channel user ID to a canonical internal UserId. Creates one if missing.
 
