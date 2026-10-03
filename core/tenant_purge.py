@@ -124,6 +124,7 @@ def _redis_patterns_for_user(user_id: str) -> list[str]:
         f"turtle:live:{user_id}",           # core/storage/cloud/live_delivery.py per-user pub/sub channel name
         f"turtle:gate:{user_id}:*",         # core/storage/cloud/redis_backends.py channel-gate buffer, nested by channel
         f"turtle:idem:{user_id}:*",         # tools/idempotency.py dedup keys, nested by tool (":cal:", email hash, ...)
+        f"turtle:turn_lock:{user_id}",      # core/turn_lock.py per-user turn serialisation lock (120s TTL)
     ]
 
 

@@ -26,6 +26,7 @@ import threading
 import weakref
 import time
 import traceback
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
@@ -118,6 +119,7 @@ from core.output_clean import (
 )
 from core.confirmation_gate import ConfirmationGate
 from core.guardrails import StorageCapExceededError, WebSocketRateLimitExceeded
+from core.turn_lock import BUSY_MESSAGE as TURN_BUSY_MESSAGE, turn_lock
 from core.storage.factory import get_channel_gate_buffer, get_ws_rate_limiter
 from core.telemetry import emit as emit_event, emit_once as emit_event_once
 from core.memory_journal import JournalStore, make_event
@@ -3507,23 +3509,36 @@ async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
                     thread_id=event.thread_id,
                 )
 
-        message_history = state.session_store.message_history or None
-
-        # Tools need a live http client; lend the cached state one for this
-        # turn only (async with so it's always closed).
-        async with httpx.AsyncClient() as client:
-            state.http_client = client
-            try:
-                outcome = await _execute_turn(
-                    None,
-                    state,
-                    event.content,
-                    message_history,
+        # Ledger 6.3: one user's web and channel turns never interleave. The
+        # lock is taken BEFORE the history is read so a turn that waited for a
+        # web turn builds on that turn's result, not a stale copy.
+        async with turn_lock(event.user_id, f"channel:{event.channel}") as _tlock:
+            if _tlock.busy:
+                return TurtleResponse(
+                    content=TURN_BUSY_MESSAGE,
                     channel=event.channel,
-                    send_status=False,
+                    user_id=event.user_id,
+                    message_id=event.message_id,
+                    thread_id=event.thread_id,
                 )
-            finally:
-                state.http_client = None
+
+            message_history = state.session_store.message_history or None
+
+            # Tools need a live http client; lend the cached state one for this
+            # turn only (async with so it's always closed).
+            async with httpx.AsyncClient() as client:
+                state.http_client = client
+                try:
+                    outcome = await _execute_turn(
+                        None,
+                        state,
+                        event.content,
+                        message_history,
+                        channel=event.channel,
+                        send_status=False,
+                    )
+                finally:
+                    state.http_client = None
 
     text = outcome.reply_text or outcome.output_text or ""
 
@@ -4427,9 +4442,75 @@ async def websocket_endpoint(ws: WebSocket):
                     _stash_pending_routine_notice(user_id, _frame)
                 break
 
+        # P6-B1 (ledger 6.1): the receive loop never awaits a turn. Each turn runs
+        # as ``turn_task``; the loop keeps reading frames so ``interrupt`` / ``ping``
+        # are handled mid-turn on EVERY path (text, audio, one-shot binary), not
+        # only the opt-in streaming-STT one.
+        #
+        # HISTORY OWNERSHIP: ``message_history`` is assigned ONLY by this loop,
+        # in ``_harvest_turn``, from the finished task's return value. A task
+        # receives the history as a value at start and never writes a shared
+        # holder, so two tasks can never both assign it. A cancelled task returns
+        # nothing, which leaves ``message_history`` exactly as it was before the
+        # turn -- the invariant that makes an interrupted turn clean (a cancelled
+        # _execute_turn never reaches replace_messages).
+        conn_id = uuid.uuid4().hex[:12]
+        turn_task: "asyncio.Task | None" = None
+        queued_turn: "_PendingTurn | None" = None
+        recv_task: "asyncio.Future | None" = None
+
+        def _start_turn(pending: "_PendingTurn") -> None:
+            nonlocal turn_task
+            turn_task = asyncio.create_task(
+                _run_web_turn(ws, state, conn_id, pending, message_history),
+                name=f"turn_{conn_id}",
+            )
+
+        def _harvest_turn() -> None:
+            nonlocal turn_task, message_history
+            finished, turn_task = turn_task, None
+            if finished is None or finished.cancelled():
+                return
+            exc = finished.exception()
+            if exc is not None:
+                print(f"LOG: turn task failed: {type(exc).__name__}: {exc}")
+                return
+            message_history = finished.result()
+
+        async def _submit_turn(pending: "_PendingTurn") -> None:
+            """Run now if idle, else queue ONE deep (a newer message replaces it)."""
+            nonlocal queued_turn
+            if turn_task is None:
+                _start_turn(pending)
+                return
+            replaced = queued_turn is not None
+            queued_turn = pending
+            await _ws_send_json(ws, {
+                "type": "turn_queued",
+                "kind": pending.kind,
+                "content": pending.payload if pending.kind == "text" else "",
+                "replaced": replaced,
+            })
+
         try:
             while True:
-                raw = await ws.receive()
+                if recv_task is None:
+                    recv_task = asyncio.ensure_future(ws.receive())
+                await asyncio.wait(
+                    {recv_task} if turn_task is None else {recv_task, turn_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if turn_task is not None and turn_task.done():
+                    _harvest_turn()
+                    if queued_turn is not None:
+                        _next, queued_turn = queued_turn, None
+                        _start_turn(_next)
+                if not recv_task.done():
+                    continue
+                # .result() re-raises exactly what ``await ws.receive()`` would
+                # have (WebSocketDisconnect / RuntimeError) into the handlers below.
+                raw = recv_task.result()
+                recv_task = None
 
                 # Starlette sends an explicit disconnect frame before closing.
                 # Exit loop immediately to avoid a RuntimeError on next receive().
@@ -4468,9 +4549,7 @@ async def websocket_endpoint(ws: WebSocket):
                     # Legacy one-shot mode: the whole utterance in a single frame.
                     if not await _check_user_message_rate():
                         break
-                    message_history = await _handle_audio_message(
-                        ws, state, audio_bytes, message_history
-                    )
+                    await _submit_turn(_PendingTurn("audio", audio_bytes, 16000))
                     continue
 
                 # Text frame = JSON message
@@ -4490,12 +4569,10 @@ async def websocket_endpoint(ws: WebSocket):
                                 break
                             # Reclaim a finishing voice session so the text turn
                             # builds on the up-to-date conversation, not a stale copy.
-                            if mic_session is not None:
+                            if mic_session is not None and turn_task is None:
                                 message_history = await _reclaim_mic_session(mic_session)
                                 mic_session = None
-                            message_history = await _handle_text_message(
-                                ws, state, content, message_history
-                            )
+                            await _submit_turn(_PendingTurn("text", content, 16000))
 
                     elif msg_type == "audio":
                         # Base64-encoded audio fallback
@@ -4505,10 +4582,7 @@ async def websocket_endpoint(ws: WebSocket):
                             if not await _check_user_message_rate():
                                 break
                             audio_bytes = base64.b64decode(audio_b64)
-                            message_history = await _handle_audio_message(
-                                ws, state, audio_bytes, message_history,
-                                sample_rate=sample_rate,
-                            )
+                            await _submit_turn(_PendingTurn("audio", audio_bytes, sample_rate))
 
                     elif msg_type == "mic_open":
                         # Begin streaming STT for this utterance/conversation.
@@ -4516,6 +4590,14 @@ async def websocket_endpoint(ws: WebSocket):
                             await _ws_send_json(ws, {
                                 "type": "error",
                                 "message": "Streaming STT is not enabled on the server.",
+                            })
+                        elif turn_task is not None or queued_turn is not None:
+                            # The streaming session is seeded from message_history,
+                            # which a running turn is about to replace.
+                            await _ws_send_json(ws, {
+                                "type": "error",
+                                "code": "turn_in_progress",
+                                "message": TURN_BUSY_MESSAGE,
                             })
                         else:
                             # Reclaim any prior (still-finishing) session first so
@@ -4550,6 +4632,21 @@ async def websocket_endpoint(ws: WebSocket):
                         # Stop the agent mid-reply (barge-in / explicit stop).
                         if mic_session is not None and mic_session.interrupt():
                             print("LOG: interrupt — reply cancelled by user")
+                        # A stop discards the one queued message too: the user
+                        # asked Turtle to stop, not to move on to the next thing.
+                        if queued_turn is not None:
+                            queued_turn = None
+                            await _ws_send_json(ws, {"type": "turn_queue_cleared"})
+                        if turn_task is not None and not turn_task.done():
+                            turn_task.cancel()
+                            print("LOG: interrupt — turn task cancelled by user")
+                            # Same frame shape _run_streamed_turn emits on cancel.
+                            # Sent from the loop, not the task, so it does not
+                            # wait on the task's cleanup. The cancelled task can
+                            # emit nothing more (CancelledError is raised at its
+                            # next await), so no ``done`` can follow.
+                            await _ws_send_json(ws, {"type": "interrupted"})
+                            await _ws_send_json(ws, {"type": "status", "status": "ready"})
 
                     elif msg_type == "ping":
                         await _ws_send_json(ws, {"type": "pong"})
@@ -4567,6 +4664,20 @@ async def websocket_endpoint(ws: WebSocket):
             print(f"LOG: WebSocket error: {e}")
             traceback.print_exc()
         finally:
+            # P6-B1: stop the in-flight turn (and the reader) BEFORE finalizing,
+            # so the turn's lock is released and its persistence has settled.
+            # asyncio.wait, not ``await task``: it never raises the task's
+            # CancelledError into this teardown.
+            queued_turn = None
+            for _t in (recv_task, turn_task):
+                if _t is not None and not _t.done():
+                    _t.cancel()
+            _outstanding = {_t for _t in (recv_task, turn_task) if _t is not None}
+            if _outstanding:
+                await asyncio.wait(_outstanding)
+                for _t in _outstanding:
+                    if not _t.cancelled():
+                        _t.exception()  # mark retrieved; failures already logged
             # Symmetric with the redis_relay_task startup above.
             if redis_relay_task is not None:
                 redis_relay_task.cancel()
@@ -4643,6 +4754,46 @@ async def websocket_endpoint(ws: WebSocket):
 # Message handlers
 # ---------------------------------------------------------------------------
 
+class _PendingTurn(NamedTuple):
+    """One user message waiting to become a turn (P6-B1)."""
+
+    kind: str  # "text" | "audio"
+    payload: Any  # str for text, bytes for audio
+    sample_rate: int
+
+
+async def _run_web_turn(
+    ws: WebSocket,
+    state: SharedState,
+    conn_id: str,
+    pending: _PendingTurn,
+    message_history: list[ModelMessage] | None,
+) -> list[ModelMessage] | None:
+    """Run one web turn under the per-user turn lock (ledger 6.3).
+
+    Runs as the connection's ``turn_task``. RETURNS the new history and writes
+    nothing shared: only the receive loop assigns ``message_history``. If the
+    lock is still held by another turn of this user (another tab, a channel)
+    after the bounded wait, the turn is rejected with an explicit frame and the
+    history is returned untouched. If Redis is down the lock fails open.
+    """
+    async with turn_lock(state.user_id, f"web:{conn_id}") as lock:
+        if lock.busy:
+            print(f"LOG: turn rejected, another turn in progress for {state.user_id}")
+            await _ws_send_json(ws, {
+                "type": "error",
+                "code": "turn_in_progress",
+                "message": TURN_BUSY_MESSAGE,
+            })
+            await _ws_send_json(ws, {"type": "status", "status": "ready"})
+            return message_history
+        if pending.kind == "text":
+            return await _handle_text_message(ws, state, pending.payload, message_history)
+        return await _handle_audio_message(
+            ws, state, pending.payload, message_history, sample_rate=pending.sample_rate,
+        )
+
+
 async def _ws_send_json(ws: WebSocket, data: dict[str, Any]) -> None:
     """Send a JSON message to the WebSocket client.
 
@@ -4655,6 +4806,19 @@ async def _ws_send_json(ws: WebSocket, data: dict[str, Any]) -> None:
             await ws.send_json(data)
     except Exception:
         pass
+
+
+async def _ws_send_bytes(ws: WebSocket, data: bytes) -> None:
+    """Send a binary (audio) frame under the SAME per-socket lock as JSON frames.
+
+    P6-B1 (ledger 6.1): the receive loop now answers ``pong`` / ``interrupted``
+    while a turn task is streaming audio, so a bare ``ws.send_bytes`` would
+    interleave with ``_ws_send_json`` on the one socket. Unlike
+    ``_ws_send_json`` this does NOT swallow errors: the TTS callers rely on the
+    raise to report a "TTS error" / abort the stream.
+    """
+    async with _ws_send_lock(ws):
+        await ws.send_bytes(data)
 
 
 # ---------------------------------------------------------------------------
@@ -5447,9 +5611,17 @@ async def _execute_turn(
             "tool_urls": list(state.tool_sourced_urls),
         })
 
-        # Update session
+        # Update session.
+        # SHIELDED (ledger 6.1): the `done` frame above has already been sent, so
+        # the user has SEEN this answer. Turns are now cancellable tasks, and an
+        # `interrupt` landing in the window between that send and this write
+        # would otherwise cancel the persistence — leaving the user looking at a
+        # reply that is absent from history on their next turn. Stopping a turn
+        # must not un-say something already said, so once `done` is out the
+        # persistence completes regardless. Cancellation still propagates after
+        # the shielded write (the await re-raises), so the turn ends promptly.
         message_history = _persist_history(message_history, response)
-        await state.session_store.replace_messages(message_history)
+        await asyncio.shield(state.session_store.replace_messages(message_history))
         state.rag_system.add_conversation(user_text, final_output)
         # NOTE: the legacy single-tenant memory_store.record_turn block was
         # dropped here. Personal memory now lives under
@@ -5690,7 +5862,7 @@ async def _execute_turn_streaming(
                         timings["tts_first_byte_ms"] = round((time.time() - tts_start) * 1000)
                         check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
                         first_audio_sent = True
-                    await ws.send_bytes(audio_bytes)
+                    await _ws_send_bytes(ws, audio_bytes)
                     chunks_sent += 1
     except Exception as exc:
         # Nothing spoken yet → the batch path can still serve this turn cleanly.
@@ -5719,8 +5891,10 @@ async def _execute_turn_streaming(
     })
 
     # --- post-run: identical bookkeeping to the batch path -----------------
+    # Shielded for the same reason as the batch path: `done` is already sent,
+    # so an interrupt in this window must not lose an answer the user has seen.
     message_history = _persist_history(message_history, collector)
-    await state.session_store.replace_messages(message_history)
+    await asyncio.shield(state.session_store.replace_messages(message_history))
     state.rag_system.add_conversation(user_text, final_output)
     _apply_explicit_facts_from_turn(
         state,
@@ -5896,7 +6070,7 @@ async def _reply_and_speak(
                     check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
                     print(f"LOG: TTS first chunk in {first_byte_ms}ms ({len(audio_bytes)} bytes)")
                     first_chunk_sent = True
-                await ws.send_bytes(audio_bytes)
+                await _ws_send_bytes(ws, audio_bytes)
                 chunks_sent += 1
 
         timings["tts_ms"] = round((time.time() - tts_start) * 1000)
@@ -5994,10 +6168,22 @@ async def _run_streamed_turn(
     timings: dict[str, float] = {}
     overall_start = time.time()
     try:
-        session.history["messages"] = await _reply_and_speak(
-            ws, state, text, session.history["messages"],
-            timings=timings, overall_start=overall_start,
-        )
+        # Ledger 6.3: the streamed-mic turn takes the same per-user lock as
+        # every other surface. Released in __aexit__ (a finally) so the
+        # CancelledError below does not leak it.
+        async with turn_lock(state.user_id, "mic") as lock:
+            if lock.busy:
+                await _ws_send_json(ws, {
+                    "type": "error",
+                    "code": "turn_in_progress",
+                    "message": TURN_BUSY_MESSAGE,
+                })
+                await _ws_send_json(ws, {"type": "status", "status": "ready"})
+                return
+            session.history["messages"] = await _reply_and_speak(
+                ws, state, text, session.history["messages"],
+                timings=timings, overall_start=overall_start,
+            )
     except asyncio.CancelledError:
         print("LOG: streamed reply interrupted")
         try:

@@ -24,6 +24,14 @@ export function setBubbleState(state) {
 // ── Thinking indicator in the panel ──────────────────────────
 
 export function showThinking(label) {
+    // A new turn announcing itself while a message is pending means the server
+    // just promoted the queued message into a running turn (it never emits a
+    // dedicated "started" frame). The turn that was ALREADY running announced
+    // itself before the user could queue anything, and its later 'Speaking'
+    // status does not start a turn.
+    if (AppState.pendingTurn && (label === 'Thinking' || label === 'Transcribing')) {
+        promotePendingTurn();
+    }
     AppState.isThinking = true;
     const { panelThinking, panelThinkingLabel } = AppState.dom;
     if (panelThinkingLabel) panelThinkingLabel.textContent = label || 'Thinking';
@@ -143,6 +151,65 @@ export function addMessage(role, text, toolUrls) {
     msg.appendChild(content);
     container.appendChild(msg);
     scrollPanelToBottom();
+
+    // The running turn just answered, so the queued one is about to start:
+    // move it from the pending slot into the transcript, AFTER this reply.
+    if (role === 'assistant' && AppState.pendingTurn) {
+        promotePendingTurn();
+    }
+}
+
+// ── Pending (queued) message ─────────────────────────────────
+
+/**
+ * Show `text` as the single pending message, below the transcript. A newer
+ * message replaces the pending one in place (the server's queue is one deep
+ * and replaces too), so the UI never shows two.
+ */
+export function setPendingTurn(text) {
+    openResponsePanel();
+    const container = AppState.dom.responseMessages;
+    if (AppState.pendingTurn) {
+        AppState.pendingTurn.text = text;
+        const body = AppState.pendingTurn.el && AppState.pendingTurn.el.contentEl;
+        if (body) body.textContent = text;
+        return;
+    }
+    let el = null;
+    if (container) {
+        el = document.createElement('div');
+        el.className = 'panel-msg panel-msg-user panel-msg-pending';
+        el.style.opacity = '0.55';
+        const label = document.createElement('div');
+        label.className = 'panel-msg-label';
+        label.textContent = 'You (queued)';
+        const content = document.createElement('div');
+        content.className = 'panel-msg-content';
+        content.textContent = text;
+        el.appendChild(label);
+        el.appendChild(content);
+        el.contentEl = content;
+        container.appendChild(el);
+        scrollPanelToBottom();
+    }
+    AppState.pendingTurn = { text, el };
+}
+
+/** The queued message is now running: render it as an ordinary user message. */
+export function promotePendingTurn() {
+    const pending = AppState.pendingTurn;
+    if (!pending) return;
+    AppState.pendingTurn = null;
+    if (pending.el && pending.el.remove) pending.el.remove();
+    addMessage('user', pending.text);
+}
+
+/** The queued message was discarded (interrupt / disconnect). */
+export function clearPendingTurn() {
+    const pending = AppState.pendingTurn;
+    if (!pending) return;
+    AppState.pendingTurn = null;
+    if (pending.el && pending.el.remove) pending.el.remove();
 }
 
 /**
@@ -228,9 +295,15 @@ export function formatMessage(text, toolUrls) {
 export function sendMessage() {
     const { chatInput, btnSend } = AppState.dom;
     const text = chatInput.value.trim();
-    if (!text || !AppState.isConnected || AppState.isThinking) return;
+    if (!text || !AppState.isConnected) return;
 
-    addMessage('user', text);
+    // P6-B1: a turn is still running. The server holds this message one deep
+    // and runs it when the current turn finishes; show it as pending until then.
+    if (AppState.isThinking) {
+        setPendingTurn(text);
+    } else {
+        addMessage('user', text);
+    }
     chatInput.value = '';
     chatInput.style.height = 'auto';
     btnSend.disabled = true;

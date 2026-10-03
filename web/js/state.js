@@ -11,6 +11,12 @@ const AppState = {
     /** Connection flags */
     isConnected: false,
     isThinking: false,
+    /**
+     * P6-B1 (ledger 6.1): a message sent while a turn is still running. The
+     * server queues it one deep (a newer one replaces it), so the client holds
+     * exactly one: { text, el }. null when nothing is pending.
+     */
+    pendingTurn: null,
     isRecording: false,
     voiceMode: 'ptt',
     pttSpaceHeld: false,

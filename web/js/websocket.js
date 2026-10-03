@@ -4,7 +4,14 @@
 
 import AppState from './state.js';
 import { setStatus, showBanner, hideBanner, showToast } from './utils.js';
-import { addMessage, showThinking, hideThinking, setBubbleState } from './chat.js';
+import {
+    addMessage,
+    showThinking,
+    hideThinking,
+    setBubbleState,
+    setPendingTurn,
+    clearPendingTurn,
+} from './chat.js';
 import { playAudioBlob, handleServerInterrupt } from './voice.js';
 import { updateTimings } from './devmode.js';
 import { renderConfirmationPrompt } from './memory.js';
@@ -112,6 +119,20 @@ function handleServerMessage(msg) {
             showToast(msg.message);
             break;
         case 'pong':
+            break;
+        case 'turn_queued':
+            // Ledger 6.1: a turn is already running, so the server queued this
+            // message one deep (and `replaced` means it displaced an earlier
+            // queued one). Drive the pending state from the SERVER's frame
+            // rather than inferring it client-side: the server owns the queue,
+            // so only it knows whether the message was actually accepted.
+            setPendingTurn(msg.content);
+            break;
+        case 'turn_queue_cleared':
+            // The queued message will never run (an interrupt discarded it).
+            // Clear the pending bubble so it does not sit there implying the
+            // answer is still coming.
+            clearPendingTurn();
             break;
         default:
             console.log('Unknown:', msg);
