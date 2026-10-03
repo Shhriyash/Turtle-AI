@@ -6,7 +6,7 @@
   "functions": {
     "main.py": {
       "maxDuration": 300,
-      "excludeFiles": "{data/**,test/**,venv/**,.venv/**,docs/**,scripts/**,rtc_vad/**,output/**,turtle_vault/**,.github/**,requirements-local.txt,*.md,**/__pycache__/**,**/*.pyc}"
+      "excludeFiles": "{data/**,test/**,venv/**,.venv/**,docs/**,scripts/**,rtc_vad/**,output/**,turtle_vault/**,.github/**,requirements-local.txt,requirements-migrations.txt,*.md,**/__pycache__/**,**/*.pyc}"
     }
   }
 }

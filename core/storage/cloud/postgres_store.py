@@ -92,23 +92,44 @@ class PostgresSessionStore(SessionStoreProtocol):
             )
 
     async def list_sessions(
-        self, status_filter: str | None = None, user_id: str | None = None
+        self,
+        status_filter: str | None = None,
+        user_id: str | None = None,
+        limit: int | None = None,
     ) -> list[Session]:
+        """List sessions, filtered in SQL wherever the predicate can be (ledger
+        3.9): ``user_id`` is a real indexed column, and ``status`` -- though it
+        lives inside the ``data`` JSONB blob, not its own column -- can still be
+        pushed into the WHERE clause via a JSONB path expression instead of
+        pulling every row into Python to filter there. ``limit``, when given,
+        bounds the result to the most-recently-updated rows (ORDER BY
+        updated_at DESC) so a caller like the /ws connect-time pending-
+        finalization sweep never pulls an unbounded table scan across every
+        tenant (this was previously unscoped -- see
+        SessionStore.list_pending_finalization_archives).
+        """
         pool = await self._ensure_init()
         sessions: list[Session] = []
+        conditions: list[str] = []
+        params: list[Any] = []
+        if user_id is not None:
+            params.append(user_id)
+            conditions.append(f"user_id = ${len(params)}")
+        if status_filter is not None:
+            params.append(status_filter)
+            conditions.append(f"data->>'status' = ${len(params)}")
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
+        query = (
+            f"SELECT session_id, data FROM sessions {where_clause} "
+            f"ORDER BY updated_at DESC {limit_clause}"
+        ).strip()
         async with pool.acquire() as conn:
-            if user_id is not None:
-                rows = await conn.fetch(
-                    "SELECT session_id, data FROM sessions WHERE user_id = $1", user_id
-                )
-            else:
-                rows = await conn.fetch("SELECT session_id, data FROM sessions")
+            rows = await conn.fetch(query, *params)
         for row in rows:
             try:
                 raw = row["data"]
                 data = raw if isinstance(raw, dict) else json.loads(raw)
-                if status_filter and data.get("status") != status_filter:
-                    continue
                 sessions.append(Session(session_id=row["session_id"], data=data))
             except Exception:
                 pass

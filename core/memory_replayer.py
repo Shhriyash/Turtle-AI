@@ -104,25 +104,40 @@ def replay(
     written: list[str] = []
     cleared: list[str] = []
 
-    for topic in ALL_TOPICS:
-        lines = _sort_lines(topic_lines[topic])
-        if not lines:
-            if store.delete_topic(topic):
-                cleared.append(topic)
-            continue
+    # WP3.D (ledger 3.8, transaction half): every topic write/delete below
+    # must commit together or not at all. store.begin_transaction()
+    # (core/personal_memory_store.py) is a no-op on the local/SQLite backend
+    # — each local topic write is already a single atomic file replace
+    # (core.io_atomic.atomic_write_text), so a partial local replay leaves N
+    # correct files and the rest simply not-yet-written-this-run, a
+    # different (and already benign) failure mode from the cloud backend's,
+    # which opened its own Postgres connection PER topic call: a crash
+    # between topic 3 and topic 4 of ~11 left some topics reflecting the new
+    # journal state and others stale, with nothing recording that it
+    # happened. See PersonalMemoryStore.begin_transaction's docstring for why
+    # this is a direct method call (no getattr/duck-typing into private
+    # backend attributes): a renamed or missing hook must raise loudly here,
+    # not silently degrade this guarantee to a no-op.
+    with store.begin_transaction():
+        for topic in ALL_TOPICS:
+            lines = _sort_lines(topic_lines[topic])
+            if not lines:
+                if store.delete_topic(topic):
+                    cleared.append(topic)
+                continue
 
-        metadata = {
-            "title": TOPIC_TITLES[topic],
-        }
-        source_session = latest_session_by_topic.get(topic)
-        if source_session and source_session != "migration":
-            metadata["source_session_id"] = source_session
+            metadata = {
+                "title": TOPIC_TITLES[topic],
+            }
+            source_session = latest_session_by_topic.get(topic)
+            if source_session and source_session != "migration":
+                metadata["source_session_id"] = source_session
 
-        store.write_topic(topic, lines, metadata)
-        store.update_index_entry(topic, TOPIC_SUMMARIES[topic])
-        written.append(topic)
+            store.write_topic(topic, lines, metadata)
+            store.update_index_entry(topic, TOPIC_SUMMARIES[topic])
+            written.append(topic)
 
-    _prune_stale_index_entries(store, written)
+        _prune_stale_index_entries(store, written)
 
     return ReplayResult(
         written_topics=written,

@@ -259,6 +259,34 @@ class SessionStore:
             previous_session_id=previous_session_id
         )
 
+    def start_fresh_degraded(self) -> SessionRestoreResult:
+        """Build a brand-new, IN-MEMORY-ONLY session without touching the backend.
+
+        Ledger 3.6(d): start_or_restore() had zero error handling, so a DB
+        error during connect (e.g. Postgres momentarily unreachable) used to
+        propagate straight out of websocket_endpoint, uncaught, and Starlette
+        tore the connection down with no application-level frame at all. The
+        /ws call site now wraps start_or_restore() and falls back to this on
+        any failure: a fresh session the user can still talk in this turn, at
+        the cost of no restore/persistence until the backend recovers (the
+        next successful _sync_to_backend() call -- triggered by the very next
+        write -- starts persisting normally again). Deliberately does nothing
+        that could itself fail: no backend call, no I/O.
+        """
+        self.session_id = f"turtle_session_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        self.message_history = []
+        self.pending_email = self._default_pending_email()
+        self._pending_email_updated_at = ""
+        self.pending_calendar = self._default_pending_calendar()
+        self._pending_calendar_updated_at = ""
+        self.rolling_summary = []
+        self.current_status = "active"
+        return SessionRestoreResult(
+            session_id=self.session_id,
+            restored=False,
+            message_count=0,
+        )
+
     async def replace_messages(self, messages: list[ModelMessage]) -> None:
         self.message_history = list(messages)
         await self._sync_to_backend()
@@ -273,6 +301,14 @@ class SessionStore:
         self.message_history = []
         return archived_id
 
+    # Ledger 3.9 (query-shape half): this sweep used to run status_filter=
+    # "pending_finalization" with NO user_id, unconditionally on every /ws
+    # connect (apps/turtle_server.py) — pulling every pending-finalization
+    # session for every tenant into the process just to throw away all but
+    # this user's rows in the loop below. Bounded per fetch so a runaway
+    # backlog can't turn every connect into an unbounded scan.
+    _PENDING_FINALIZATION_SCAN_LIMIT = 20
+
     async def list_pending_finalization_archives(self) -> list[tuple[str, list]]:
         """Return (session_id, message_history) pairs for all pending-finalization sessions.
 
@@ -283,10 +319,45 @@ class SessionStore:
         """
         if not hasattr(self.backend, "list_sessions"):
             return []
-        pending = await getattr(self.backend, "list_sessions")(status_filter="pending_finalization")
+        list_sessions = getattr(self.backend, "list_sessions")
+        try:
+            sig_params = inspect.signature(list_sessions).parameters
+        except (TypeError, ValueError):
+            sig_params = {}
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
+        supports_user_id = "user_id" in sig_params or has_var_kw
+        supports_limit = "limit" in sig_params or has_var_kw
+
+        async def _fetch(uid: str | None) -> list[Session]:
+            kwargs: dict[str, Any] = {"status_filter": "pending_finalization"}
+            if uid is not None:
+                kwargs["user_id"] = uid
+            if supports_limit:
+                kwargs["limit"] = self._PENDING_FINALIZATION_SCAN_LIMIT
+            return await list_sessions(**kwargs)
+
+        if supports_user_id:
+            # Indexed, tenant-scoped fetch (the fix): one query for this
+            # user's own rows, plus a second bounded query for legacy
+            # unowned rows (user_id == "") — pre-tenancy sessions with no
+            # owner recorded still get one-time finalization, exactly as
+            # before this change. Two small indexed lookups instead of one
+            # full-table scan across every tenant.
+            pending = list(await _fetch(self.user_id))
+            if self.user_id != "":
+                pending.extend(await _fetch(""))
+        else:
+            # Backend doesn't support scoping (e.g. a minimal test fake) —
+            # fall back to the prior unscoped behavior unchanged.
+            pending = await _fetch(None)
+
         result = []
         allowed_user_ids = {self.user_id, ""}
+        seen_ids: set[str] = set()
         for s in pending:
+            if s.session_id in seen_ids:
+                continue
+            seen_ids.add(s.session_id)
             if not (hasattr(s, "data") and s.data):
                 continue
             # The sweep extracts into the CONNECTING user's journal; processing

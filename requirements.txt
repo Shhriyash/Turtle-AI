@@ -101,6 +101,24 @@ redis>=5.2.0        # async Redis client (Upstash rediss://) — rate limiter, g
 # replacement for that one call site) uses psycopg instead.
 psycopg[binary,pool]>=3.2
 
+# Alembic (ledger 3.1) moved OUT of this file to requirements-migrations.txt:
+# it is never imported at runtime by the app or any Vercel function, only by
+# the deploy workflow's `alembic upgrade head` step and, in CI, by
+# test/cloud_integration/migrations_schema_parity_test.py's own subprocess
+# call. See requirements-migrations.txt's header for the full reasoning.
+#
+# SQLAlchemy itself is NOT moved — it stays above, under "Scheduler (Phase 4 /
+# E1)": core/routine_scheduler.py imports apscheduler.jobstores.sqlalchemy at
+# module scope (SQLAlchemyJobStore, backing the local RoutineScheduler's
+# persistent job store), and that same module also exports _fire_routine /
+# get_active_routines_for_user, which apps/cron_tick_routes.py's cloud
+# cron-tick handler imports from it too — so SQLAlchemy is a real runtime
+# dependency in BOTH modes already, pre-dating and unrelated to Alembic.
+# requirements-migrations.txt deliberately does not re-list SQLAlchemy: Alembic
+# resolves its own compatible version transitively, and pinning a second,
+# different SQLAlchemy version constraint there would just fight the one
+# above when a job (like cloud-tests) installs both files.
+
 # discord.py / python-telegram-bot moved to requirements-local.txt: both are
 # needed ONLY by the local long-polling/gateway adapters
 # (apps/channels/discord_gateway.py, apps/channels/telegram_gateway.py),

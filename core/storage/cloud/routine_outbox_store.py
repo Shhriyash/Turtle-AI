@@ -28,6 +28,21 @@ CREATE TABLE IF NOT EXISTS routine_outbox (
 
 _initialized = False
 
+# Ledger 3.6(e): both load/save below already degrade gracefully (never
+# raise -- see each docstring), but the failure was only ever a `print()`,
+# with nothing counting how often it happens. This is an in-process counter
+# only; there is no metrics module yet (core/telemetry.py's emit_once is a
+# funnel-event dedup helper, not a general counter), so it does not reach a
+# dashboard until Phase 4 wires real metrics export. It still gives a single
+# process visibility into "how degraded am I right now" and is cheap to
+# assert against in tests.
+_METRICS = {"load_failures": 0, "save_failures": 0}
+
+
+def get_outbox_failure_counts() -> dict[str, int]:
+    """Snapshot of this process's outbox degrade counters (see _METRICS)."""
+    return dict(_METRICS)
+
 
 def _ensure_init() -> Any:
     global _initialized
@@ -55,6 +70,7 @@ def load_outbox_pg(user_id: str) -> Optional[list[dict[str, Any]]]:
         frames = frames if isinstance(frames, list) else json.loads(frames or "[]")
         return [f for f in frames if isinstance(f, dict)]
     except Exception as e:
+        _METRICS["load_failures"] += 1
         print(f"LOG: routine_outbox (postgres) load failed user={user_id}: {e}")
         return None
 
@@ -76,4 +92,5 @@ def save_outbox_pg(user_id: str, frames: list[dict[str, Any]], *, max_frames: in
                 (user_id, json.dumps(capped)),
             )
     except Exception as e:
+        _METRICS["save_failures"] += 1
         print(f"LOG: routine_outbox (postgres) save failed user={user_id}: {e}")
