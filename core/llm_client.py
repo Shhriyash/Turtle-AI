@@ -694,6 +694,9 @@ async def run_agent_with_fallbacks(primary_agent: Any, fallback_agents: list[Any
         kwargs["message_history"] = _sanitize_message_history(kwargs["message_history"])
 
     agents = [primary_agent] + (fallback_agents or [])
+    # One MGET for the whole cascade (cloud only, fails open) so a cold instance
+    # sees bucket cooldowns a warm one already set.
+    await health_tracker.refresh_shared(agents)
     eligible = [a for a in agents if not health_tracker.is_cooling(a)]
     if not eligible:
         # Every model is cooling — bypass cooldowns rather than fail outright,
@@ -848,6 +851,9 @@ async def stream_agent_text_with_fallbacks(
         kwargs["message_history"] = _sanitize_message_history(kwargs["message_history"])
 
     agents = [primary_agent] + (fallback_agents or [])
+    # One MGET for the whole cascade (cloud only, fails open) so a cold instance
+    # sees bucket cooldowns a warm one already set.
+    await health_tracker.refresh_shared(agents)
     eligible = [a for a in agents if not health_tracker.is_cooling(a)]
     if not eligible:
         print("LOG: all agents in cooldown; bypassing health tracker for this stream")
@@ -955,6 +961,9 @@ def run_agent_sync_with_fallbacks(primary_agent: Any, fallback_agents: list[Any]
         kwargs["message_history"] = _sanitize_message_history(kwargs["message_history"])
 
     agents = [primary_agent] + (fallback_agents or [])
+    # One MGET for the whole cascade (cloud only, fails open) so a cold instance
+    # sees bucket cooldowns a warm one already set.
+    health_tracker.refresh_shared_sync(agents)
     eligible = [a for a in agents if not health_tracker.is_cooling(a)]
     if not eligible:
         print("LOG: all agents in cooldown; bypassing health tracker for this call")
