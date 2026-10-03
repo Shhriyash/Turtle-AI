@@ -119,21 +119,30 @@ async def _synthesize_sentence_async(
 ) -> bytes:
     """Synthesise one sentence and return a complete WAV as bytes.
 
-    Delegates to ``synthesize_speech_bytes`` (Deepgram REST primary, Groq
-    fallback, WS opt-in), run in a thread executor so the blocking provider call
-    never stalls the event loop. Each returned blob is a self-describing RIFF/WAV
-    the browser can hand straight to ``decodeAudioData`` — no temp file, and none
-    of the WebSocket idle-drain wait that used to gate first audio.
+    Delegates to ``synthesize_speech_bytes_async`` (Deepgram REST primary, Groq
+    fallback) over async HTTP, so cancelling the task awaiting this coroutine
+    cancels the in-flight request. (It used to hop to a thread executor, which
+    cannot be cancelled: a dropped turn left the request running.) Each returned
+    blob is a self-describing RIFF/WAV the browser can hand straight to
+    ``decodeAudioData`` — no temp file, and none of the WebSocket idle-drain wait
+    that used to gate first audio.
     """
-    from functools import partial
+    from core.openrouter_tts import synthesize_speech_bytes_async
 
-    from core.openrouter_tts import synthesize_speech_bytes
+    return await synthesize_speech_bytes_async(text, model=model, speed=speed)
 
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None,
-        partial(synthesize_speech_bytes, text, model=model, speed=speed),
-    )
+
+async def _cancel_and_reap(tasks: "list[asyncio.Task]") -> None:
+    """Cancel every still-running task and wait for them to unwind.
+
+    Called from ``finally`` so it also runs when the turn itself is cancelled
+    (``CancelledError`` is a ``BaseException``; it skips ``except Exception``).
+    """
+    live = [t for t in tasks if not t.done()]
+    for t in live:
+        t.cancel()
+    if live:
+        await asyncio.gather(*live, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -166,28 +175,30 @@ async def stream_tts_from_text(
         return
 
     # Fire sentences concurrently via a task queue; yield in order.
-    tasks: list[asyncio.Task] = []
-    for sentence in sentences:
-        task = asyncio.create_task(
-            _synthesize_sentence_async(sentence, model=model, speed=speed)
-        )
-        tasks.append((sentence, task))
-
-    for sentence, task in tasks:
-        try:
-            audio_bytes = await asyncio.wait_for(
-                asyncio.shield(task),
-                timeout=tts_timeout_s,
+    tasks: list[tuple[str, asyncio.Task]] = []
+    try:
+        for sentence in sentences:
+            task = asyncio.create_task(
+                _synthesize_sentence_async(sentence, model=model, speed=speed)
             )
-            yield sentence, audio_bytes
-        except asyncio.TimeoutError:
-            print(f"LOG: TTS sentence timeout ({tts_timeout_s:.0f} s) for: {sentence[:40]!r}")
-            task.cancel()
-            continue
-        except Exception as exc:
-            print(f"LOG: TTS sentence error for {sentence[:40]!r}: {exc}")
-            task.cancel()
-            continue
+            tasks.append((sentence, task))
+
+        for sentence, task in tasks:
+            try:
+                # No shield: wait_for cancels the synth task on timeout, and a
+                # cancelled turn propagates into the task (and its HTTP request).
+                audio_bytes = await asyncio.wait_for(task, timeout=tts_timeout_s)
+                yield sentence, audio_bytes
+            except asyncio.TimeoutError:
+                print(f"LOG: TTS sentence timeout ({tts_timeout_s:.0f} s) for: {sentence[:40]!r}")
+                continue
+            except Exception as exc:
+                print(f"LOG: TTS sentence error for {sentence[:40]!r}: {exc}")
+                continue
+    finally:
+        # Turn cancelled, consumer gone (aclose), or normal exit: no sibling
+        # synth task may outlive this generator.
+        await _cancel_and_reap([t for _, t in tasks])
 
 
 async def stream_tts_from_token_stream(
@@ -222,6 +233,9 @@ async def stream_tts_from_token_stream(
     # boundary is detected) but MUST be yielded strictly in sentence order, or
     # playback plays them scrambled. We only ever release from the front.
     pending_tasks: list[tuple[str, asyncio.Task]] = []
+    # Every task ever spawned (pending_tasks shrinks as sentences are released),
+    # so the finally below can cancel whatever is still running.
+    spawned: list[asyncio.Task] = []
 
     def _spawn(raw_sentence: str) -> None:
         spoken = clean_fn(raw_sentence) if clean_fn else raw_sentence
@@ -231,35 +245,42 @@ async def stream_tts_from_token_stream(
             _synthesize_sentence_async(spoken, model=model, speed=speed)
         )
         pending_tasks.append((spoken, task))
+        spawned.append(task)
 
-    async for token in token_iterator:
-        for sentence in accumulator.feed(token):
+    try:
+        async for token in token_iterator:
+            for sentence in accumulator.feed(token):
+                _spawn(sentence)
+
+            # Non-blocking release of any FRONT tasks already finished — never skip
+            # ahead to a later sentence that happens to finish first.
+            while pending_tasks and pending_tasks[0][1].done():
+                sentence, task = pending_tasks.pop(0)
+                try:
+                    yield sentence, task.result()
+                except Exception as exc:
+                    print(f"LOG: TTS sentence error: {exc}")
+
+        # Flush the final partial sentence after the token stream ends.
+        for sentence in accumulator.flush():
             _spawn(sentence)
 
-        # Non-blocking release of any FRONT tasks already finished — never skip
-        # ahead to a later sentence that happens to finish first.
-        while pending_tasks and pending_tasks[0][1].done():
+        # Drain the rest in strict order, awaiting each front task in turn.
+        # No shield: wait_for cancels the synth task on timeout, and a cancelled
+        # turn propagates into the task (and its HTTP request).
+        while pending_tasks:
             sentence, task = pending_tasks.pop(0)
             try:
-                yield sentence, task.result()
+                audio_bytes = await asyncio.wait_for(task, timeout=tts_timeout_s)
+                yield sentence, audio_bytes
+            except asyncio.TimeoutError:
+                print(f"LOG: TTS sentence timeout for: {sentence[:40]!r}")
             except Exception as exc:
                 print(f"LOG: TTS sentence error: {exc}")
-
-    # Flush the final partial sentence after the token stream ends.
-    for sentence in accumulator.flush():
-        _spawn(sentence)
-
-    # Drain the rest in strict order, awaiting each front task in turn.
-    for sentence, task in pending_tasks:
-        try:
-            audio_bytes = await asyncio.wait_for(asyncio.shield(task), timeout=tts_timeout_s)
-            yield sentence, audio_bytes
-        except asyncio.TimeoutError:
-            print(f"LOG: TTS sentence timeout for: {sentence[:40]!r}")
-            task.cancel()
-        except Exception as exc:
-            print(f"LOG: TTS sentence error: {exc}")
-            task.cancel()
+    finally:
+        # Turn cancelled, consumer gone (aclose), or normal exit: no spawned
+        # synth task may outlive this generator.
+        await _cancel_and_reap(spawned)
 
 
 # ---------------------------------------------------------------------------

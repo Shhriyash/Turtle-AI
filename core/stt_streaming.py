@@ -127,9 +127,17 @@ class FluxStreamingSTT:
         self._session_thread.start()
 
         # Wait (off the event loop) until the socket is connected or errored.
-        ready = await self._loop.run_in_executor(
-            None, self._conn_ready.wait, connect_timeout
-        )
+        # If the caller is cancelled mid-connect, tell the worker to stop so it
+        # does not finish connecting and park two daemon threads for a session
+        # nobody owns (the executor wait itself ends at connect_timeout).
+        try:
+            ready = await self._loop.run_in_executor(
+                None, self._conn_ready.wait, connect_timeout
+            )
+        except BaseException:
+            self._stop.set()
+            self._send_q.put(_STOP)
+            raise
         if not ready:
             self._stop.set()
             raise RuntimeError("Flux STT connect timed out")

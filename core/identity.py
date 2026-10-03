@@ -114,6 +114,9 @@ class IdentityManager:
 
     async def init_db(self):
         async with aiosqlite.connect(self.db_path) as db:
+            # journal_mode=WAL is persisted in the db file, so setting it once
+            # here covers every later per-operation connection.
+            await db.execute("PRAGMA journal_mode=WAL")
             await db.execute(
                 '''CREATE TABLE IF NOT EXISTS users (
                     user_id TEXT PRIMARY KEY,

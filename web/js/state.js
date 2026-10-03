@@ -11,6 +11,34 @@ const AppState = {
     /** Connection flags */
     isConnected: false,
     isThinking: false,
+    /**
+     * P6-B1 (ledger 6.1): a message sent while a turn is still running. The
+     * server queues it one deep (a newer one replaces it), so the client holds
+     * exactly one: { text, el }. null when nothing is pending.
+     */
+    pendingTurn: null,
+
+    /**
+     * P6-B2 (ledger 6.8 / 6.4): resume protocol state.
+     * clientId   -- per-tab id (sessionStorage), sent as ?cid= so a reconnecting
+     *               tab is recognised by the server's session lease.
+     * sessionId  -- the server session this tab is in (ready/restored/resumed).
+     * lastTurnId -- the last `done.turn_id` of THAT session, sent in `resume`.
+     * reconnectDelayMs -- next backoff step: 1 s doubling to 30 s, reset on open.
+     * plannedReconnect -- the server announced `status: reconnect` (a deliberate
+     *               1012 cut): no "Disconnected" banner for it.
+     * resendQueue -- messages the server refused to start (`unstarted`), resent
+     *               after the next resume frame.
+     */
+    clientId: null,
+    sessionId: null,
+    lastTurnId: null,
+    hasConnected: false,
+    reconnectDelayMs: 1000,
+    reconnectTimer: null,
+    plannedReconnect: false,
+    resendQueue: [],
+
     isRecording: false,
     voiceMode: 'ptt',
     pttSpaceHeld: false,

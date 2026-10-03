@@ -173,8 +173,8 @@ async def _extract_with_llm(
 
     try:
         from core.config import settings as _cfg
-        from groq import AsyncGroq
-        client = AsyncGroq(api_key=api_key)
+        from tools.tts.client import get_async_groq_client
+        client = get_async_groq_client(api_key)
         response = await asyncio.wait_for(
             client.chat.completions.create(
                 model=_cfg.personal_memory_turn_extractor_model,

@@ -5,14 +5,18 @@ G2: High-level SessionStore wrapper around the new storage abstraction.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import re
+import time
 from datetime import UTC, datetime
 from typing import Any
 
 from pydantic_ai import ModelMessagesTypeAdapter
 from pydantic_ai.messages import ModelMessage
 
+from core.config import settings
 from core.storage import Session, SessionStoreProtocol
 from core.storage.factory import get_session_store_backend
 
@@ -94,6 +98,11 @@ class SessionStore:
         self._pending_calendar_updated_at: str = ""
         self.current_status: str | None = None
         self.rolling_summary: list[dict[str, Any]] = []
+        # Highest turn number handed out in this session (ledger 6.8). Persisted
+        # in the session blob so a RESUMED session continues the numbering
+        # instead of restarting at 1 and overwriting the buffered results of
+        # the turns before the cut (turtle:turn_result:{session_id}:{turn_id}).
+        self.turn_counter: int = 0
 
     async def init_backend(self) -> None:
         if hasattr(self.backend, "init_db"):
@@ -136,6 +145,7 @@ class SessionStore:
             "pending_calendar": self.pending_calendar,
             "pending_calendar_updated_at": self._pending_calendar_updated_at,
             "summary": self.rolling_summary,
+            "turn_counter": self.turn_counter,
             "updated_at": _utc_now()
         }
         await self.backend.put(Session(session_id=self.session_id, data=data))
@@ -149,6 +159,10 @@ class SessionStore:
         self._pending_calendar_updated_at = session.data.get("pending_calendar_updated_at", "")
         summary = session.data.get("summary", [])
         self.rolling_summary = summary if isinstance(summary, list) else []
+        try:
+            self.turn_counter = max(0, int(session.data.get("turn_counter", 0) or 0))
+        except (TypeError, ValueError):
+            self.turn_counter = 0
         raw_messages = session.data.get("messages", [])
         try:
             self.message_history = ModelMessagesTypeAdapter.validate_python(raw_messages)
@@ -194,8 +208,21 @@ class SessionStore:
         return [s for s in sessions if s.data.get("user_id", "") == self.user_id]
 
     async def start_or_restore(
-        self, mode: str = "strict_new", resume_window_seconds: int = 1800
+        self,
+        mode: str = "strict_new",
+        resume_window_seconds: int = 1800,
+        lease: Any = None,
     ) -> SessionRestoreResult:
+        """Resume the user's latest session or start a new one.
+
+        ``lease`` (ledger 6.4, a ``core.turn_lock.SessionLease``) is passed only
+        by the WebSocket endpoint. With it, a session leased by ANOTHER client
+        is never resumed, demoted to pending_finalization (which the connect
+        sweep would then finalise and compact under its live owner), or
+        otherwise touched; the session that is returned is claimed for this
+        connection. Without it (channels, tests, scripts) behaviour is exactly
+        what it was.
+        """
         await self.init_backend()
 
         if mode == "resume_if_active":
@@ -206,13 +233,18 @@ class SessionStore:
                 active_sessions = await self._list_sessions_for_user("active")
                 if active_sessions:
                     active_sessions.sort(key=lambda s: s.data.get("updated_at", ""), reverse=True)
-                    latest = active_sessions[0]
-                    age = self._seconds_since(latest.data.get("updated_at", ""))
-                    if age <= resume_window_seconds:
-                        return self._restore_from_session(latest)
+                    for candidate in active_sessions:
+                        age = self._seconds_since(candidate.data.get("updated_at", ""))
+                        if age > resume_window_seconds:
+                            break  # newest-first: everything after is staler
+                        if lease is None or await lease.claim(candidate.session_id):
+                            return self._restore_from_session(candidate)
+                        # Leased by another live client: leave it strictly alone.
 
                     for session in active_sessions:
                         if self._seconds_since(session.data.get("updated_at", "")) > resume_window_seconds:
+                            if lease is not None and await lease.held_by_other(session.session_id):
+                                continue
                             # A crash-orphaned "active" from weeks ago must never be
                             # resumed as today's conversation; production had a
                             # 47-day-old one waiting.
@@ -227,9 +259,12 @@ class SessionStore:
                 pending = await self._list_sessions_for_user("pending_finalization")
                 if pending:
                     pending.sort(key=lambda s: s.data.get("updated_at", ""), reverse=True)
-                    latest = pending[0]
-                    age = self._seconds_since(latest.data.get("updated_at", ""))
-                    if age <= resume_window_seconds:
+                    for latest in pending:
+                        age = self._seconds_since(latest.data.get("updated_at", ""))
+                        if age > resume_window_seconds:
+                            break
+                        if lease is not None and not await lease.claim(latest.session_id):
+                            continue
                         result = self._restore_from_session(latest)
                         # Persist the active flip so the finalization loop and
                         # any other connection no longer treat it as pending.
@@ -240,6 +275,11 @@ class SessionStore:
         if hasattr(self.backend, "list_sessions"):
             active_sessions = await self._list_sessions_for_user("active")
             for session in active_sessions:
+                # A session leased by another live client is NOT ours to demote:
+                # the connect-time sweep would finalise and compact it under its
+                # owner (ledger 6.4).
+                if lease is not None and await lease.held_by_other(session.session_id):
+                    continue
                 session.data["status"] = "pending_finalization"
                 await self.backend.put(session)
                 previous_session_id = session.session_id
@@ -249,7 +289,10 @@ class SessionStore:
         self.pending_email = self._default_pending_email()
         self.pending_calendar = self._default_pending_calendar()
         self.rolling_summary = []
+        self.turn_counter = 0
         self.current_status = "active"
+        if lease is not None:
+            await lease.claim(self.session_id)
         await self._sync_to_backend()
         
         return SessionRestoreResult(
@@ -469,3 +512,130 @@ class SessionStore:
         if max_entries > 0 and len(self.rolling_summary) > max_entries:
             self.rolling_summary = self.rolling_summary[-max_entries:]
         await self._sync_to_backend()
+
+
+# ---------------------------------------------------------------------------
+# Completed-turn result buffer (ledger 6.8)
+# ---------------------------------------------------------------------------
+# After a planned (or unplanned) cut, the client reconnects and sends
+# {"type":"resume","session_id","last_turn_id"}. Every completed turn's `done`
+# frame is buffered here for 120 s so the server can replay what the client
+# never received. Audio is NOT stored: a voice turn records its spoken text and
+# the replay re-synthesises it.
+TURN_RESULT_KEY_PREFIX = "turtle:turn_result:"
+TURN_RESULT_TTL_S = 120
+# Turn numbers advance for turns that never finish too (error, interrupt), so a
+# replay scan tolerates a run of gaps before concluding there is nothing more.
+_TURN_RESULT_GAP_TOLERANCE = 5
+_TURN_RESULT_SCAN_CAP = 200
+_TURN_NUMBER_RE = re.compile(r"_turn_(\d+)$")
+
+
+def turn_result_key(session_id: str, turn_id: str) -> str:
+    return f"{TURN_RESULT_KEY_PREFIX}{session_id}:{turn_id}"
+
+
+def turn_number(turn_id: str | None) -> int:
+    """The numeric suffix of ``{session_id}_turn_{n}``; 0 when absent/unparseable."""
+    if not turn_id:
+        return 0
+    m = _TURN_NUMBER_RE.search(str(turn_id))
+    return int(m.group(1)) if m else 0
+
+
+class _InProcessResultBackend:
+    """Local mode / tests: dict with expiry (single-threaded event loop)."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, tuple[str, float]] = {}
+
+    async def set(self, key: str, value: str, ttl_s: int) -> None:
+        now = time.monotonic()
+        for k in [k for k, (_, exp) in self._data.items() if exp <= now]:
+            del self._data[k]
+        self._data[key] = (value, now + ttl_s)
+
+    async def get(self, key: str) -> str | None:
+        cur = self._data.get(key)
+        if cur is None or cur[1] <= time.monotonic():
+            return None
+        return cur[0]
+
+
+class _RedisResultBackend:
+    async def _client(self) -> Any:
+        from core.storage.cloud import get_redis_client
+
+        return await get_redis_client()
+
+    async def set(self, key: str, value: str, ttl_s: int) -> None:
+        client = await self._client()
+        await client.set(key, value, ex=ttl_s)
+
+    async def get(self, key: str) -> str | None:
+        client = await self._client()
+        value = await client.get(key)
+        if value is None:
+            return None
+        return value.decode() if isinstance(value, (bytes, bytearray)) else str(value)
+
+
+_in_process_results = _InProcessResultBackend()
+_redis_results = _RedisResultBackend()
+
+
+class TurnResultBuffer:
+    """``turtle:turn_result:{session_id}:{turn_id}`` -> JSON record, 120 s TTL."""
+
+    def __init__(self, backend: Any = None, *, ttl_s: int = TURN_RESULT_TTL_S) -> None:
+        self._backend = backend
+        self.ttl_s = ttl_s
+
+    def _be(self) -> Any:
+        if self._backend is not None:
+            return self._backend
+        return _redis_results if settings.is_cloud else _in_process_results
+
+    async def put(self, session_id: str, turn_id: str, record: dict[str, Any]) -> None:
+        await asyncio.wait_for(
+            self._be().set(
+                turn_result_key(session_id, turn_id),
+                json.dumps(record, ensure_ascii=False),
+                self.ttl_s,
+            ),
+            timeout=2.0,
+        )
+
+    async def after(self, session_id: str, last_turn_id: str | None) -> list[dict[str, Any]]:
+        """Buffered records for turns numbered above ``last_turn_id``, in order.
+
+        Fails open (returns what it has) on a backend error: a replay is a
+        convenience on top of the durable session, never a reason to refuse a
+        resume.
+        """
+        out: list[dict[str, Any]] = []
+        n = turn_number(last_turn_id)
+        misses = 0
+        try:
+            for _ in range(_TURN_RESULT_SCAN_CAP):
+                n += 1
+                raw = await asyncio.wait_for(
+                    self._be().get(turn_result_key(session_id, f"{session_id}_turn_{n}")),
+                    timeout=2.0,
+                )
+                if raw is None:
+                    misses += 1
+                    if misses >= _TURN_RESULT_GAP_TOLERANCE:
+                        break
+                    continue
+                misses = 0
+                try:
+                    out.append(json.loads(raw))
+                except ValueError:
+                    continue
+        except Exception as exc:  # noqa: BLE001 - fail open
+            print(f"LOG: turn result replay scan failed: {type(exc).__name__}: {exc}")
+        return out
+
+
+turn_results = TurnResultBuffer()

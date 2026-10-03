@@ -7,7 +7,7 @@
 
 import AppState from './state.js';
 import { setStatus, showToast } from './utils.js';
-import { setBubbleState, hideThinking } from './chat.js';
+import { setBubbleState, hideThinking, clearPendingTurn } from './chat.js';
 
 const PROCESSOR_PATH = '/static/audio/pcm-processor.js';
 const AUTO_VAD_RMS_THRESHOLD = 350;
@@ -190,6 +190,8 @@ export function interruptReply() {
     if (AppState.ws && AppState.ws.readyState === WebSocket.OPEN) {
         AppState.ws.send(JSON.stringify({ type: 'interrupt' }));
     }
+    // The server drops its queued message on interrupt; drop our pending one.
+    clearPendingTurn();
     if (wasSpeaking) showToast('Interrupted');
 }
 
@@ -198,6 +200,7 @@ export function interruptReply() {
  * it). Stop local playback so audio doesn't keep playing from buffered chunks.
  */
 export function handleServerInterrupt() {
+    clearPendingTurn();
     stopTtsPlayback({ resetUi: true });
 }
 

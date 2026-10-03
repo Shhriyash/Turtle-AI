@@ -14,6 +14,7 @@ from typing import Any, Dict, List
 import faiss
 import numpy as np
 
+from core.io_atomic import atomic_write_bytes, atomic_write_json
 from core.paths import personal_memory_dir
 from core.storage import Hit, VectorStore
 from rag.embedder.embedding_model import get_embedding_model
@@ -92,8 +93,11 @@ class FAISSVectorStore(VectorStore):
 
         if index_path.exists() and meta_path.exists():
             try:
-                self._indices[user_id] = faiss.read_index(str(index_path))
-                self._metadata[user_id] = json.loads(meta_path.read_text(encoding="utf-8"))
+                index = faiss.read_index(str(index_path))
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+                index, metadata = self._reconcile(index, metadata)
+                self._indices[user_id] = index
+                self._metadata[user_id] = metadata
             except Exception:
                 self._indices[user_id] = faiss.IndexFlatIP(self.embedding_dimension)
                 self._metadata[user_id] = []
@@ -101,13 +105,47 @@ class FAISSVectorStore(VectorStore):
             self._indices[user_id] = faiss.IndexFlatIP(self.embedding_dimension)
             self._metadata[user_id] = []
 
+    def _reconcile(self, index: faiss.Index, metadata: List[Dict[str, Any]]):
+        """Restore the last committed (index, metadata) pair after a crash.
+
+        _save_tenant writes index.bin first and metadata.json second, so
+        metadata.json is the commit point. A crash between the two leaves an
+        index with MORE vectors than metadata entries; the extra vectors belong
+        to a save that never committed. Search maps vector position -> metadata
+        position, so leaving them in would silently misalign every later
+        upsert. Drop them (the index is append-only, so the first len(metadata)
+        vectors are exactly the committed ones).
+        """
+        n_meta = len(metadata)
+        if index.ntotal > n_meta:
+            kept = faiss.IndexFlatIP(self.embedding_dimension)
+            if n_meta:
+                kept.add(index.reconstruct_n(0, n_meta))
+            return kept, metadata
+        if index.ntotal < n_meta:
+            # Not producible by our write order; legacy/torn pair. Keep only
+            # entries that still have a vector so positions stay aligned.
+            return index, metadata[: index.ntotal]
+        return index, metadata
+
     def _save_tenant(self, user_id: str) -> None:
+        """Persist index then metadata, each atomically (temp + fsync + replace).
+
+        Guarantee: neither file can ever be observed half-written, and a crash
+        at any point recovers (see _reconcile) to the last fully committed
+        state, because metadata.json is written LAST and is the commit point.
+        NOT guaranteed: that the two files change as one atomic unit on disk --
+        between the two replaces they briefly disagree; recovery happens at
+        load time, not by the filesystem. A new document whose save crashed
+        before the metadata commit is lost (the caller saw the exception).
+        """
         tdir = self._get_tenant_dir(user_id)
         index_path = tdir / "index.bin"
         meta_path = tdir / "metadata.json"
 
-        faiss.write_index(self._indices[user_id], str(index_path))
-        meta_path.write_text(json.dumps(self._metadata[user_id], ensure_ascii=False))
+        blob = faiss.serialize_index(self._indices[user_id])
+        atomic_write_bytes(index_path, blob.tobytes())
+        atomic_write_json(meta_path, self._metadata[user_id], indent=None, ensure_ascii=False)
 
     def _normalize(self, v: np.ndarray) -> np.ndarray:
         if v.ndim == 1:

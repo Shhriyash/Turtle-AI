@@ -284,6 +284,18 @@ class TurtleSettings(BaseSettings):
     ws_messages_per_day: int = Field(
         default=1000, alias="TURTLE_WS_MESSAGES_PER_DAY"
     )
+    # Ledger 6.8: wall-clock ceiling of ONE WebSocket connection, in seconds.
+    # Mirrors vercel.json functions maxDuration (300), which the platform
+    # enforces by killing the socket. The server uses it to refuse starting a
+    # turn that cannot finish before the cut (apps/turtle_server.py
+    # _ConnectionBudget) and to cut deliberately with close code 1012 so the
+    # client reconnects and resumes losslessly. Enforced in cloud mode, and in
+    # local mode ONLY when this variable is set explicitly (a local server has
+    # no platform cut, so a silent 5-minute reconnect would be a behaviour
+    # change). 0 disables.
+    ws_max_duration_s: int = Field(
+        default=300, alias="TURTLE_WS_MAX_DURATION_S"
+    )
     # Per-user daily cap on Google Places/Routes API calls (find_place +
     # place_details + get_directions combined), enforced by
     # tools/places_guardrails.py under its own turtle:places_cap: key

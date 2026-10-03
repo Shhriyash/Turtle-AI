@@ -6,20 +6,38 @@ from typing import Tuple
 import wave
 
 import numpy as np
-from groq import Groq
+from groq import AsyncGroq
+
+from tools.tts.client import get_async_groq_client
 
 
 class FastRTCSTT:
     """Simple STT adapter used by the voice app.
 
     Accepts `(sample_rate, np.ndarray)` audio tuples and returns Whisper text.
+
+    Transcription is async (``AsyncGroq``) so cancelling the awaiting task closes
+    the HTTP request. It used to be a sync call parked in an executor thread,
+    which cannot be cancelled. With no injected client the process-wide
+    per-loop ``AsyncGroq`` from ``tools.tts.client`` is used (built once, with
+    explicit timeouts) instead of constructing a client per instance.
     """
 
-    def __init__(self, groq_client: Groq | None = None, model: str | None = None) -> None:
-        self.client = groq_client or Groq(api_key=os.getenv("GROQ_API_KEY") or os.getenv("GROQ_API_KEY2"))
+    def __init__(
+        self,
+        groq_client: AsyncGroq | None = None,
+        model: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        self._client = groq_client
+        self._api_key = api_key
         self.model = model or os.getenv("STT_MODEL", "whisper-large-v3-turbo")
 
-    def transcribe_from_audio(self, audio: Tuple[int, np.ndarray]) -> str:
+    @property
+    def client(self) -> AsyncGroq:
+        return self._client or get_async_groq_client(self._api_key)
+
+    async def transcribe_from_audio(self, audio: Tuple[int, np.ndarray]) -> str:
         sample_rate, audio_array = audio
         if audio_array is None or len(audio_array) == 0:
             return ""
@@ -35,7 +53,7 @@ class FastRTCSTT:
             wav_file.setframerate(valid_rate)
             wav_file.writeframes(audio_data.tobytes())
 
-        transcription = self.client.audio.transcriptions.create(
+        transcription = await self.client.audio.transcriptions.create(
             file=("input.wav", wav_buffer.getvalue()),
             model=self.model,
             response_format="verbose_json",
