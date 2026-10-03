@@ -10,9 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # No portaudio19-dev here (Vercel migration, Phase 5): pyaudio moved to
 # requirements-local.txt (rtc_vad/'s standalone local-mic tooling — never
 # imported by the server, and a headless container has no microphone to
-# capture from anyway). sounddevice stays in requirements.txt and installs
-# fine without system PortAudio headers (its wheel bundles the library); the
-# web server never plays audio server-side and imports it lazily regardless.
+# capture from anyway). sounddevice and scipy are likewise in
+# requirements-local.txt (ledger 5.6): the web server never plays audio
+# server-side, so this image installs neither.
 
 COPY requirements.txt .
 

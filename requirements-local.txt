@@ -16,6 +16,15 @@ pyaudio==0.2.14
 fastrtc==0.0.34
 keyboard==0.13.5
 
+# Local audio. Moved out of requirements.txt (ledger 5.6): neither is imported
+# on the cloud/server import chain.
+#   sounddevice: server-side playback in tools/tts/tts.py::stream_tts (local
+#                CLI voice path only; imported lazily and raises a clear error
+#                if missing).
+#   scipy:       WAV writing in rtc_vad/ (bundle-excluded standalone tooling).
+sounddevice==0.5.5
+scipy==1.17.1
+
 # Discord/Telegram gateway (natural DM/@mention bot mode) — optional, local
 # dev only. The webhook adapters (apps/channels/discord.py,
 # apps/channels/telegram_webhook.py) need neither package.

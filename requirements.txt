@@ -51,8 +51,10 @@ lxml==6.0.2
 groq==1.0.0
 deepgram-sdk==6.0.1
 pydub==0.25.1
-sounddevice==0.5.5
-scipy==1.17.1
+# sounddevice/scipy moved to requirements-local.txt (ledger 5.6): neither is
+# imported on the server's import chain (sounddevice only lazily inside
+# tools/tts/tts.py::stream_tts, scipy only in rtc_vad/). See
+# test/local_only_deps_test.py, which guards that.
 # stdlib `audioop` was removed in Python 3.13; twilio_voice transcodes μ-law
 # through it, so pull the back-port on 3.13+ (no-op on older interpreters).
 audioop-lts==0.2.2; python_version >= "3.13"
@@ -63,6 +65,16 @@ audioop-lts==0.2.2; python_version >= "3.13"
 # for local dev (or CI, which apt-installs portaudio19-dev) but Vercel's
 # Python build has no apt access, so this file staying installable there
 # matters. See requirements-local.txt for local voice-hardware tooling.
+
+# Timezone database for stdlib `zoneinfo`. LOAD-BEARING for routine scheduling:
+# core/routine_cron_tick.py resolves each routine's timezone with
+# ZoneInfo(name). On a runtime with no system tz data (Windows always; slim
+# Linux images possibly) that raises, and the scheduler's handler converts the
+# error into "not due" -- so EVERY routine for EVERY user silently stops firing
+# with nothing surfaced. Today pandas/psycopg/tzlocal happen to pull tzdata in
+# transitively; pinned explicitly so removing one of those cannot silently
+# disable scheduling.
+tzdata>=2025.1
 
 # Web server
 fastapi>=0.115.0

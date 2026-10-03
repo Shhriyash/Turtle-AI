@@ -31,7 +31,15 @@ def stream_tts(
     idle_timeout: float = 1.0,
     start_timeout: float = 3.0,
 ) -> bool:
-    import sounddevice as sd  # lazy: PortAudio only needed for local playback
+    try:
+        import sounddevice as sd  # lazy: PortAudio only needed for local playback
+    except ImportError as exc:
+        raise ImportError(
+            "stream_tts() needs the 'sounddevice' package for local audio "
+            "playback, but it is not installed. sounddevice is a local-only "
+            "dependency (not installed by the cloud/server build): run "
+            "`pip install -r requirements-local.txt`."
+        ) from exc
 
     audio_queue: queue.Queue[np.ndarray] = queue.Queue()
     done_event = threading.Event()
