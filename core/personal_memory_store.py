@@ -18,6 +18,9 @@ from core.personal_memory_schema import (
 )
 
 
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -383,6 +386,8 @@ class PersonalMemoryStore:
             "working_style": {"notes": []},
             "communication_style": {"notes": []},
             "decision_style": {"notes": []},
+            "contacts": {"entries": {}, "emails": [], "frequent_recipients": []},
+            "relations": {},
         }
 
         identity = self.load_topic("identity")
@@ -435,20 +440,51 @@ class PersonalMemoryStore:
                     routines.append(parsed)
         profile["workflow"]["routines"] = routines
 
+        # CONTACTS / RELATIONS. This used to read the contacts topic only for
+        # `Frequent recipient:` lines and drop everything else on the floor,
+        # and it never opened the relations topic at all -- so a store holding
+        # `- Best Friend: Aarav` or `- Shriyash Gmail Com: shriyash@example.com`
+        # produced a snapshot with no trace of either. Both topics are written
+        # by the memory pipeline as rendered `Label: value` lines (see
+        # core/memory_schema.render_topic_line), so parse them that way and
+        # expose them under their own top-level keys.
         contacts = self.load_topic("contacts")
         recipients: list[str] = []
+        contact_entries: dict[str, str] = {}
         for line in contacts.lines:
             content = self._strip_bullet(line)
             lowered = content.lower()
-            if not lowered.startswith("frequent recipient:"):
+            if lowered.startswith("frequent recipient:"):
+                value = content.split(":", 1)[1].strip()
+                if " (count:" in value:
+                    value = value.split(" (count:", 1)[0].strip()
+                normalized = value.lower()
+                if normalized and normalized not in recipients:
+                    recipients.append(normalized)
                 continue
-            value = content.split(":", 1)[1].strip()
-            if " (count:" in value:
-                value = value.split(" (count:", 1)[0].strip()
-            normalized = value.lower()
-            if normalized and normalized not in recipients:
-                recipients.append(normalized)
+            label, value = self._split_labelled_line(content)
+            if label and value and label not in contact_entries:
+                contact_entries[label] = value
         profile["workflow"]["common_recipients"] = recipients
+
+        contact_emails: list[str] = []
+        for value in list(contact_entries.values()) + recipients:
+            for match in _EMAIL_RE.findall(value):
+                normalized_email = match.lower()
+                if normalized_email not in contact_emails:
+                    contact_emails.append(normalized_email)
+        profile["contacts"] = {
+            "entries": contact_entries,
+            "emails": contact_emails,
+            "frequent_recipients": recipients,
+        }
+
+        relations: dict[str, str] = {}
+        for line in self.load_topic("relations").lines:
+            label, value = self._split_labelled_line(self._strip_bullet(line))
+            if label and value and label not in relations:
+                relations[label] = value
+        profile["relations"] = relations
 
         for topic_key in ("working_style", "communication_style", "decision_style"):
             doc = self.load_topic(topic_key)
@@ -473,6 +509,22 @@ class PersonalMemoryStore:
         profile["tool_preferences"]["tools"] = tools
 
         return profile
+
+    @classmethod
+    def _split_labelled_line(cls, content: str) -> tuple[str, str]:
+        """Split a rendered `Label: value` topic line into (key, value).
+
+        `core.memory_schema.render_topic_line` writes these lines by
+        title-casing the schema key, so normalizing the label back the same
+        way recovers it: `Best Friend: Aarav` -> `("best_friend", "Aarav")`.
+        Only the FIRST colon splits, so URLs in the value survive intact.
+        Returns ("", "") for a line that carries no label.
+        """
+        if ":" not in content:
+            return "", ""
+        label, _, value = content.partition(":")
+        key = cls._normalize_topic_name(label)
+        return key, value.strip()
 
     @staticmethod
     def _parse_routine_line(content: str) -> dict[str, Any] | None:
