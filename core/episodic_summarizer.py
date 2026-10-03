@@ -165,9 +165,9 @@ async def summarize_rolling_window(
     )
 
     try:
-        from groq import AsyncGroq
+        from tools.tts.client import get_async_groq_client
 
-        client = AsyncGroq(api_key=api_key)
+        client = get_async_groq_client(api_key)
         response = await client.chat.completions.create(
             model=model or "llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
@@ -237,9 +237,9 @@ async def summarize_window(
     )
 
     try:
-        from groq import AsyncGroq
+        from tools.tts.client import get_async_groq_client
 
-        client = AsyncGroq(api_key=api_key)
+        client = get_async_groq_client(api_key)
         response = await client.chat.completions.create(
             model=model or "llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],

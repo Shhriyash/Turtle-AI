@@ -4,7 +4,12 @@ import os
 import threading
 import time
 from pathlib import Path
-from tools.tts.client import get_deepgram_client, get_groq_client
+from tools.tts.client import (
+    get_async_deepgram_client,
+    get_async_groq_client,
+    get_deepgram_client,
+    get_groq_client,
+)
 
 DEEPGRAM_TTS_DEFAULT_MODEL = "aura-2-orion-en"
 DEEPGRAM_TTS_DEFAULT_ENCODING = "linear16"
@@ -257,6 +262,56 @@ def _synthesize_deepgram_rest_bytes(
     raise RuntimeError("Deepgram TTS returned unsupported response type.")
 
 
+async def _synthesize_deepgram_rest_bytes_async(
+    text: str,
+    *,
+    model: str | None = None,
+    speed: float | None = None,
+) -> bytes:
+    """Async twin of ``_synthesize_deepgram_rest_bytes`` (ledger 6.2).
+
+    Uses the SDK's native async REST client (``AsyncDeepgramClient``), which
+    rides on ``httpx.AsyncClient``: cancelling the awaiting task cancels the
+    in-flight request and closes the socket. The sync client in an executor
+    thread cannot be cancelled at all. The native client is preferred over
+    hand-rolled ``httpx`` calls so auth, base URL, the ``speed`` query parameter
+    and error types stay the SDK's own.
+
+    ``AsyncAudioClient.generate`` is an async *generator* (not awaitable), so it
+    is consumed with ``async for``.
+    """
+    if not text or not text.strip():
+        raise RuntimeError("TTS text is empty.")
+    client = get_async_deepgram_client()
+    model_name = _deepgram_rest_model_name(model)
+    encoding = os.getenv("DEEPGRAM_TTS_ENCODING", DEEPGRAM_TTS_DEFAULT_ENCODING)
+    container = os.getenv("DEEPGRAM_TTS_CONTAINER", DEEPGRAM_TTS_DEFAULT_CONTAINER)
+    sample_rate = int(os.getenv("DEEPGRAM_TTS_SAMPLE_RATE", DEEPGRAM_TTS_DEFAULT_SAMPLE_RATE))
+    speed_value = _coerce_speed(speed)
+
+    request_kwargs = {
+        "text": text,
+        "model": model_name,
+        "encoding": encoding,
+        "container": container,
+        "sample_rate": sample_rate,
+    }
+    try:
+        from deepgram.core.request_options import RequestOptions
+
+        request_kwargs["request_options"] = RequestOptions(
+            additional_query_parameters={"speed": f"{speed_value:.2f}"},
+        )
+    except Exception:
+        pass
+
+    chunks = [chunk async for chunk in client.speak.v1.audio.generate(**request_kwargs) if chunk]
+    audio = b"".join(chunks)
+    if not audio:
+        raise RuntimeError("Deepgram TTS returned no audio data.")
+    return audio
+
+
 def _synthesize_deepgram_rest(
     text: str,
     output_path: Path,
@@ -331,6 +386,27 @@ def _synthesize_groq_bytes(
                     pass
 
 
+async def _synthesize_groq_bytes_async(
+    text: str,
+    *,
+    model: str | None = None,
+    voice: str | None = None,
+    audio_format: str | None = None,
+) -> bytes:
+    """Async Groq synthesis returning audio bytes (no temp file, cancellable)."""
+    client = get_async_groq_client()
+    model_name = model or os.getenv("GROQ_TTS_MODEL", GROQ_TTS_DEFAULT_MODEL)
+    voice_name = voice or os.getenv("GROQ_TTS_VOICE", GROQ_TTS_DEFAULT_VOICE)
+    response_format = audio_format or os.getenv("GROQ_TTS_FORMAT", GROQ_TTS_DEFAULT_FORMAT)
+    response = await client.audio.speech.create(
+        model=model_name,
+        voice=voice_name,
+        input=text,
+        response_format=response_format,
+    )
+    return await response.read()
+
+
 def synthesize_speech_bytes(
     text: str,
     *,
@@ -384,6 +460,78 @@ def synthesize_speech_bytes(
 
     try:
         return _synthesize_groq_bytes(
+            text, model=model, voice=voice, audio_format=audio_format
+        )
+    except Exception as exc:
+        errors.append(("groq", exc))
+        if tts_debug:
+            print(f"TTS debug: Groq bytes error: {exc!r}")
+
+    last_exc = errors[-1][1] if errors else RuntimeError("no TTS provider ran")
+    if any(_is_rate_limit_error(exc) for _, exc in errors):
+        raise RuntimeError("All TTS providers rate-limited or unavailable.") from last_exc
+    raise RuntimeError(
+        f"All TTS providers failed: {[name for name, _ in errors]}"
+    ) from last_exc
+
+
+async def synthesize_speech_bytes_async(
+    text: str,
+    *,
+    model: str | None = None,
+    voice: str | None = None,
+    audio_format: str | None = None,
+    speed: float | None = None,
+) -> bytes:
+    """Cancellable twin of ``synthesize_speech_bytes`` (same provider order).
+
+    Deepgram REST then Groq, both over async HTTP, so cancelling the awaiting
+    task closes the request. ``CancelledError`` is a ``BaseException`` and so
+    escapes the ``except Exception`` fallbacks below by design: a cancelled turn
+    must not fall through to the next provider.
+
+    The opt-in WebSocket path (``TTS_STREAM_USE_WS=1``) is the sync, thread-based
+    SDK and is NOT cancellable; it still runs in a worker thread here.
+    """
+    if not text or not text.strip():
+        raise RuntimeError("TTS text is empty.")
+
+    tts_debug = os.getenv("TTS_DEBUG") == "1"
+    errors: list[tuple[str, Exception]] = []
+
+    if os.getenv("TTS_STREAM_USE_WS", "0") == "1":
+        import asyncio
+        import tempfile
+
+        def _ws_attempt() -> bytes:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+                tmp_path = Path(handle.name)
+            try:
+                return _synthesize_deepgram_ws(text, tmp_path, model=model, speed=speed).read_bytes()
+            finally:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        try:
+            data = await asyncio.to_thread(_ws_attempt)
+            if data:
+                return data
+        except Exception as exc:
+            errors.append(("deepgram_ws", exc))
+            if tts_debug:
+                print(f"TTS debug: Deepgram WS bytes error: {exc!r}")
+
+    try:
+        return await _synthesize_deepgram_rest_bytes_async(text, model=model, speed=speed)
+    except Exception as exc:
+        errors.append(("deepgram_rest", exc))
+        if tts_debug:
+            print(f"TTS debug: Deepgram REST bytes error: {exc!r}")
+
+    try:
+        return await _synthesize_groq_bytes_async(
             text, model=model, voice=voice, audio_format=audio_format
         )
     except Exception as exc:

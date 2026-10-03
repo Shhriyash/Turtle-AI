@@ -59,7 +59,14 @@ load_env()
 load_env(override=True)
 
 # Core imports — identical to turtle_voice.py
-from groq import Groq
+# aclosing: deterministic close of the TTS async generators so their
+# task-reaping `finally` runs on cancellation rather than at GC (ledger 6.2).
+from contextlib import aclosing
+
+# NOTE: the module-level `from groq import Groq` that used to live here is gone.
+# Ledger 6.2 moved STT to the async client (core/stt_fastrtc.py builds its own
+# AsyncGroq via tools/tts/client.py's per-process cache), which removed the last
+# use of the sync class in this module.
 from pydantic_ai import Agent, RunContext, ModelMessagesTypeAdapter
 from dataclasses import replace as _dc_replace
 from pydantic_ai.messages import (
@@ -418,7 +425,9 @@ PERSONAL_MEMORY_MAX_TOPIC_FILES = settings.personal_memory_max_topic_files
 TOOL_OUTPUT_MAX_CHARS = settings.tool_output_max_chars
 
 _groq_key = settings.groq_api_key.get_secret_value() if settings.groq_api_key else (settings.groq_api_key2.get_secret_value() if settings.groq_api_key2 else None)
-groq_client = Groq(api_key=_groq_key)
+# STT uses the process-wide per-loop AsyncGroq from tools.tts.client (see
+# FastRTCSTT); the former module-level sync Groq client is gone so STT is
+# cancellable. _groq_key is passed to FastRTCSTT so the settings-resolved key wins.
 
 
 # ---------------------------------------------------------------------------
@@ -1918,7 +1927,7 @@ class AgentManager:
         # still keeping the worst-case daily-budget overshoot from one turn
         # to a tenth of a day's allowance rather than unbounded.
         self.usage_limits = UsageLimits(request_limit=30, total_tokens_limit=100_000)
-        self.stt = FastRTCSTT(groq_client=groq_client)
+        self.stt = FastRTCSTT(api_key=_groq_key)
         self.rebuild(config)  # stt rebuilt inside rebuild()
 
     def rebuild(self, cfg: dict[str, Any]) -> None:
@@ -1931,7 +1940,7 @@ class AgentManager:
 
         # Update STT model on every rebuild
         stt_model = cfg.get("STT_MODEL", "whisper-large-v3-turbo")
-        self.stt = FastRTCSTT(groq_client=groq_client, model=stt_model)
+        self.stt = FastRTCSTT(api_key=_groq_key, model=stt_model)
 
         # Model pools — one model object per provider API key. Each pool is
         # ordered so the first element is the preferred entry-point, and a pool
@@ -5662,18 +5671,27 @@ async def _execute_turn_streaming(
             channel=channel,
             streamed=True,
         ):
-            async for _sentence, audio_bytes in stream_tts_from_token_stream(
-                _token_source(),
-                speed=float(config.get("TURTLE_TTS_SPEED", 1.2)),
-                tts_timeout_s=budgets.TOOL_S,
-                clean_fn=clean_text_for_tts,
-            ):
-                if not first_audio_sent:
-                    timings["tts_first_byte_ms"] = round((time.time() - tts_start) * 1000)
-                    check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
-                    first_audio_sent = True
-                await ws.send_bytes(audio_bytes)
-                chunks_sent += 1
+            # aclosing, not a bare `async for` (ledger 6.2): the generator reaps
+            # its outstanding synth tasks in a `finally`, which only runs when the
+            # generator is CLOSED. Cancel this turn while we are awaiting
+            # ws.send_bytes below and a bare loop leaves closing to the asyncgen
+            # GC hook, so the synth tasks outlive the cancelled turn -- exactly the
+            # orphaning 6.2 exists to stop. aclosing makes the cleanup deterministic.
+            async with aclosing(
+                stream_tts_from_token_stream(
+                    _token_source(),
+                    speed=float(config.get("TURTLE_TTS_SPEED", 1.2)),
+                    tts_timeout_s=budgets.TOOL_S,
+                    clean_fn=clean_text_for_tts,
+                )
+            ) as _tts_stream:
+                async for _sentence, audio_bytes in _tts_stream:
+                    if not first_audio_sent:
+                        timings["tts_first_byte_ms"] = round((time.time() - tts_start) * 1000)
+                        check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
+                        first_audio_sent = True
+                    await ws.send_bytes(audio_bytes)
+                    chunks_sent += 1
     except Exception as exc:
         # Nothing spoken yet → the batch path can still serve this turn cleanly.
         if not first_audio_sent:
@@ -5765,13 +5783,11 @@ async def _handle_audio_message(
         stt_start = time.time()
         print(f"LOG: STT transcribing {len(audio_array)} samples @ {sample_rate}Hz")
         try:
-            # STT is a blocking network+CPU call; running it inline would freeze
-            # the whole event loop (every other session's pings/turns stall) for
-            # its full duration. Offload to a thread so the loop stays responsive.
-            loop = asyncio.get_event_loop()
-            transcription = await loop.run_in_executor(
-                None,
-                agents_mgr.stt.transcribe_from_audio,
+            # STT is an awaited async HTTP request (AsyncGroq), so it does not
+            # block the event loop AND cancelling this turn (WS drop, barge-in)
+            # cancels the request. It used to run the sync client in an executor
+            # thread, which cannot be cancelled.
+            transcription = await agents_mgr.stt.transcribe_from_audio(
                 (sample_rate, audio_array),
             )
             timings["stt_ms"] = round((time.time() - stt_start) * 1000)
@@ -5862,19 +5878,26 @@ async def _reply_and_speak(
     chunks_sent = 0
 
     try:
-        async for sentence_text, audio_bytes in stream_tts_from_text(
-            tts_text,
-            speed=float(config.get("TURTLE_TTS_SPEED", 1.2)),
-            tts_timeout_s=budgets.TOOL_S,
-        ):
-            if not first_chunk_sent:
-                first_byte_ms = round((time.time() - tts_start) * 1000)
-                timings["tts_first_byte_ms"] = first_byte_ms
-                check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
-                print(f"LOG: TTS first chunk in {first_byte_ms}ms ({len(audio_bytes)} bytes)")
-                first_chunk_sent = True
-            await ws.send_bytes(audio_bytes)
-            chunks_sent += 1
+        # aclosing, not a bare `async for` — see the matching comment on the
+        # streaming path: the generator's task-reaping `finally` only runs on
+        # close, so a cancel while awaiting ws.send_bytes would otherwise leave
+        # the synth tasks to the asyncgen GC hook.
+        async with aclosing(
+            stream_tts_from_text(
+                tts_text,
+                speed=float(config.get("TURTLE_TTS_SPEED", 1.2)),
+                tts_timeout_s=budgets.TOOL_S,
+            )
+        ) as _tts_stream:
+            async for sentence_text, audio_bytes in _tts_stream:
+                if not first_chunk_sent:
+                    first_byte_ms = round((time.time() - tts_start) * 1000)
+                    timings["tts_first_byte_ms"] = first_byte_ms
+                    check_sla("tts_first_byte", tts_start, budgets.TTS_FIRST_BYTE_MAX_MS)
+                    print(f"LOG: TTS first chunk in {first_byte_ms}ms ({len(audio_bytes)} bytes)")
+                    first_chunk_sent = True
+                await ws.send_bytes(audio_bytes)
+                chunks_sent += 1
 
         timings["tts_ms"] = round((time.time() - tts_start) * 1000)
         if chunks_sent:
@@ -6170,6 +6193,13 @@ async def _finalize_mic_session(session: "_MicStreamSession") -> None:
         # The consumer exits after the final turn (finishing is set). Cap it so a
         # stuck turn can't leak the session.
         try:
+            # Deliberately shielded (P6-A1 reviewed this, unlike the two in
+            # streaming_tts.py): on timeout or if this finaliser is cancelled,
+            # the finally below closes the STT socket FIRST and only then
+            # cancels the consumer, in that order. Dropping the shield would
+            # make wait_for cancel the consumer before the socket is closed.
+            # The consumer is always cancelled and awaited below, so nothing
+            # is orphaned.
             await asyncio.wait_for(asyncio.shield(session.consumer_task), timeout=60)
         except asyncio.TimeoutError:
             pass
