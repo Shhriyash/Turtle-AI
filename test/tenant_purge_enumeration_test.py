@@ -26,7 +26,15 @@ _TABLE_PATTERN = re.compile(r"CREATE TABLE IF NOT EXISTS\s+(\w+)\s*\(")
 # core/tenant_purge.py's enumeration: it IS the erasure audit trail (ledger
 # 2.4), content-free by construction (only a SHA-256 of the user_id, never
 # the plaintext id) — a purge must never delete its own proof that it ran.
-_INTENTIONALLY_UNPURGED_TABLES = {"purge_log"}
+_INTENTIONALLY_UNPURGED_TABLES = {
+    # purge_log is the erasure audit trail (ledger 2.4): deleting it on erasure
+    # would destroy the proof that the erasure happened.
+    "purge_log",
+    # cron_state (ledger 5.7) is the scheduler's single-row global tick
+    # watermark. It has no user_id column and holds no user data, so there is
+    # nothing per-tenant to purge.
+    "cron_state",
+}
 
 
 def _tables_in_ddl() -> set[str]:
