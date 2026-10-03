@@ -147,6 +147,8 @@ class LinkCodeStore:
 
     def _ensure_schema(self) -> None:
         with self._connect() as conn:
+            # Persisted in the db file; covers every later short-lived connection.
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {_TABLE} (

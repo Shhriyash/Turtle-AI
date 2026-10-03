@@ -37,6 +37,7 @@ class TaskHistoryIndex:
         # user, so tier 4 of the retrieval broker could splice one user's task
         # text into another user's memory context. It is UNINDEXED (we filter on
         # it, never full-text search it).
+        self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.executescript(
             f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS {_FTS_TABLE}

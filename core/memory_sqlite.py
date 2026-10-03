@@ -11,7 +11,9 @@ path is already synchronous). WAL mode + ``synchronous=NORMAL``.
 from __future__ import annotations
 
 import json
+import functools
 import sqlite3
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -251,6 +253,28 @@ def _build_event_row(row: sqlite3.Row, *, rank: float = 0.0) -> MemoryEventRow:
     )
 
 
+def _serialized(method):
+    """Run a MemorySQLiteIndex method while holding the connection lock.
+
+    The one sqlite3 connection is opened with check_same_thread=False so the
+    memory write funnel may call into it from worker threads
+    (asyncio.to_thread). That flag only DISABLES sqlite3's own guard; it adds no
+    safety. This lock is what makes sharing the connection correct: it
+    serialises execute/commit/fetch so one thread's commit can never land in the
+    middle of another's multi-statement write, and a cursor is never consumed
+    while another thread issues a statement on the same connection. It is an
+    RLock because public methods call each other (backfill_from_journal ->
+    index_event, close -> checkpoint).
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class MemorySQLiteIndex:
     def __init__(self, user_id: str = "default", *, db_path: Path | None = None) -> None:
         self.user_id = user_id
@@ -258,7 +282,8 @@ class MemorySQLiteIndex:
             db_path = personal_memory_dir(user_id) / "memory.sqlite"
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         # Set when a write-through (index_event / mark_rejected) fails after the
         # journal write succeeded — from that point the read model may be missing
@@ -325,6 +350,7 @@ class MemorySQLiteIndex:
                 f"memory.sqlite read-model migration incomplete; missing columns: {missing}"
             )
 
+    @_serialized
     def index_event(self, event: MemoryEvent) -> None:
         """Write-through, idempotent on event_id. Never raises on duplicate.
 
@@ -379,6 +405,7 @@ class MemorySQLiteIndex:
         )
         self._conn.commit()
 
+    @_serialized
     def search(
         self,
         query: str,
@@ -488,6 +515,7 @@ class MemorySQLiteIndex:
             )
         return results
 
+    @_serialized
     def backfill_from_journal(self, journal_store: "JournalStore") -> int:
         """One-shot, idempotent. Returns the number of new rows inserted."""
         existing = self._conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"]
@@ -524,6 +552,7 @@ class MemorySQLiteIndex:
         total = self._conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"]
         return max(0, total - existing)
 
+    @_serialized
     def mark_rejected(self, event_id: str) -> None:
         """Flag one event rejected in the index (pair with a journal tombstone
         via JournalStore.append_rejection so rebuilds stay consistent)."""
@@ -543,6 +572,7 @@ class MemorySQLiteIndex:
     # (autopsy DELTA-07). Indexed lookups over the derived projection.
     # ------------------------------------------------------------------
 
+    @_serialized
     def event_exists(self, event_id: str) -> bool:
         """True if an event with this id has been indexed (primary-key lookup)."""
         row = self._conn.execute(
@@ -550,6 +580,7 @@ class MemorySQLiteIndex:
         ).fetchone()
         return row is not None
 
+    @_serialized
     def get_event(self, event_id: str) -> MemoryEventRow | None:
         """Fetch a single event by id, or None if it isn't indexed."""
         row = self._conn.execute(
@@ -560,6 +591,7 @@ class MemorySQLiteIndex:
             return None
         return _build_event_row(row)
 
+    @_serialized
     def latest_for_key(self, topic: str, key: str) -> MemoryEventRow | None:
         """Current served value for a (topic, key): the newest applied event
         that is neither rejected nor superseded. None when nothing qualifies."""
@@ -581,6 +613,7 @@ class MemorySQLiteIndex:
             return None
         return built
 
+    @_serialized
     def events_for_key(
         self, topic: str, key: str, *, limit: int | None = None
     ) -> list[MemoryEventRow]:
@@ -609,9 +642,11 @@ class MemorySQLiteIndex:
             for row in self._conn.execute(sql, params).fetchall()
         ]
 
+    @_serialized
     def count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"])
 
+    @_serialized
     def checkpoint(self) -> None:
         """Fold the WAL into the main database file (TRUNCATE mode).
 
@@ -625,6 +660,7 @@ class MemorySQLiteIndex:
         except Exception:
             pass
 
+    @_serialized
     def close(self) -> None:
         self.checkpoint()
         try:

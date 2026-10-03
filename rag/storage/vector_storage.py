@@ -25,7 +25,7 @@ from pathlib import Path
 from datetime import datetime
 from core.config import settings
 from core.paths import rag_vector_dir, ensure_dirs
-from core.io_atomic import atomic_write_json
+from core.io_atomic import atomic_write_bytes, atomic_write_json
 
 
 class VectorStorage:
@@ -63,6 +63,7 @@ class VectorStorage:
         self.hnsw_ef_search = max(8, int(os.getenv("RAG_FAISS_HNSW_EF_SEARCH", "64")))
         self.faiss_index = None
         self.chunk_metadata = []
+        self._save_lock = threading.Lock()
         
         # File paths
         self.index_path = self.storage_dir / "faiss_index.bin"
@@ -199,9 +200,15 @@ class VectorStorage:
         if self.faiss_index:
             import faiss
 
-            temp_path = self.storage_dir / f".{self.index_path.name}.tmp"
-            faiss.write_index(self.faiss_index, str(temp_path))
-            os.replace(temp_path, self.index_path)
+            # Unique temp name + fsync + os.replace via the shared helper. The
+            # old fixed ".faiss_index.bin.tmp" meant two concurrent saves wrote
+            # the same file and the loser's os.replace raised FileNotFoundError.
+            # The lock also matters on Windows: two simultaneous os.replace calls
+            # onto the same destination raise PermissionError (observed).
+            with self._save_lock:
+                atomic_write_bytes(
+                    self.index_path, faiss.serialize_index(self.faiss_index).tobytes()
+                )
     
     def _save_metadata(self):
         """Save chunk metadata to file"""

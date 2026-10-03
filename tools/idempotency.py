@@ -116,6 +116,8 @@ def _ensure_db() -> sqlite3.Connection:
     global _DB_INITIALIZED
     conn = sqlite3.connect(str(_get_db_path()), timeout=5)
     if not _DB_INITIALIZED:
+        # Persisted in the db file; later connections inherit it.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS tool_invocations (
                 idempotency_key TEXT PRIMARY KEY,
