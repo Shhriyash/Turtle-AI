@@ -48,7 +48,35 @@ jobs:
         # Phase 2 W5 made test/evals genuinely offline — no ignore needed.
         # Boot smoke (app imports + /healthz + /api/config + /) rides the suite
         # via test/smoke_boot_test.py, so no separate CI boot job is needed.
+        # Note this is the LOCAL-mode pass (no TURTLE_DEPLOY set); the step
+        # below re-runs the boot smoke alone in cloud mode.
         run: python -m pytest test -q
+
+      - name: Run boot smoke in cloud mode
+        # The suite above runs entirely in LOCAL mode, so until this step the
+        # one test meant to catch a broken boot never ran in the configuration
+        # that actually ships to production — the app on Vercel runs with
+        # TURTLE_DEPLOY=cloud. test/smoke_boot_test.py is now mode-aware
+        # (local: GET /api/config is open and 200; cloud: 401 unauthenticated
+        # per ledger 1a.2, 200 with a valid admin token), so running it twice
+        # checks both ends of that control instead of one.
+        #
+        # This file ONLY, not the whole suite in cloud mode: a full cloud-mode
+        # run needs a live Postgres + Redis (that is what the `cloud-tests` job
+        # below provisions, with DATABASE_URL/REDIS_URL). The boot smoke needs
+        # neither — it imports the app and hits three routes that touch no
+        # storage backend, verified locally with both vars unset. Adding them
+        # here would be cargo cult.
+        #
+        # A step in this job rather than a separate job: it reuses the pip
+        # install above (a new job would re-install the full requirements set
+        # to run three tests), and it inherits the same gating — a broken cloud
+        # boot now fails `tests`, which is what deploy-vercel.yml's
+        # `workflow_run` conclusion keys off, so it blocks the deploy it would
+        # otherwise have broken. That is the intent, same as secrets-scan.
+        env:
+          TURTLE_DEPLOY: cloud
+        run: python -m pytest test/smoke_boot_test.py -q
 
   secrets-scan:
     # ledger 1b.6 (item 3): there was no secret scanning, linting, or static
