@@ -3244,6 +3244,14 @@ def _evict_stale_channel_states(now: float) -> None:
     journals and persists through its stores before returning, so an evicted
     state is simply rebuilt (with a fresh age-capped start_or_restore) on the
     user's next event."""
+    if settings.is_cloud and len(_CHANNEL_STATE_LOCKS) > _CHANNEL_STATE_CAP:
+        # P6-B3: cloud keeps no cached states, so nothing below ever evicts a
+        # lock and a public webhook could mint unbounded sender ids. The
+        # in-process lock is only a same-instance hint there (the Redis turn
+        # lock is the real serialisation), so dropping idle ones is safe.
+        for key in [k for k, lk in _CHANNEL_STATE_LOCKS.items() if not lk.locked()]:
+            _CHANNEL_STATE_LOCKS.pop(key, None)
+
     def _evict(key: tuple[str, str]) -> None:
         lock = _CHANNEL_STATE_LOCKS.get(key)
         if lock is not None and lock.locked():
@@ -3261,6 +3269,50 @@ def _evict_stale_channel_states(now: float) -> None:
         by_age = sorted(_CHANNEL_STATES.items(), key=lambda kv: kv[1][1])
         for key, _ in by_age[: len(_CHANNEL_STATES) - _CHANNEL_STATE_CAP]:
             _evict(key)
+
+
+class _DurableTurnReflector(PeriodicReflector):
+    """PeriodicReflector for a SharedState that is rebuilt on every request.
+
+    The base class keeps its turn counter and watermark in memory on the state
+    object. With a fresh state per channel message that counter is 1 on every
+    request, so ``turn_counter - last_reflected_turn >= reflect_every_turns``
+    is never true and periodic reflection (Stage B extraction + the rolling
+    summary) would silently stop for every cloud channel user.
+
+    The session store already persists ``turn_counter`` with the session blob
+    (``_new_turn_id`` bumps it, ``replace_messages`` writes it, resume restores
+    it), so the counter is DERIVED from that before each ``on_turn`` and the
+    watermark is the last multiple of the interval: reflection fires on every
+    ``reflect_every_turns``-th turn of the session, whichever instance serves it.
+
+    Not carried over: the idle-gap trigger (needs the previous request's
+    timestamp, which a per-request object does not have) and the failure
+    backoff / in-flight guard. Those only bound retries within one process.
+    """
+
+    async def on_turn(self, state, *, session_id, message_history) -> None:
+        n = getattr(getattr(state, "session_store", None), "turn_counter", 0)
+        if isinstance(n, int) and n > 0 and session_id:
+            sess = self._get(session_id)
+            sess.turn_counter = n - 1  # the base class adds this turn's 1
+            sess.last_reflected_turn = ((n - 1) // self.every_turns) * self.every_turns
+        await super().on_turn(
+            state, session_id=session_id, message_history=message_history
+        )
+
+
+class _AlreadyHeld:
+    """Hand back a turn lock the caller already acquired (no second acquire)."""
+
+    def __init__(self, lock) -> None:
+        self._lock = lock
+
+    async def __aenter__(self):
+        return self._lock
+
+    async def __aexit__(self, *exc) -> None:
+        return None
 
 
 async def _build_channel_state(user_id: str, channel: str) -> SharedState:
@@ -3368,19 +3420,45 @@ async def _build_channel_state(user_id: str, channel: str) -> SharedState:
         rag_system=rag_system,
         sqlite_index=sqlite_index,
         retrieval_broker=retrieval_broker,
-        reflector=PeriodicReflector(),
+        # Cloud rebuilds this state per request (ledger 6.6), so the in-memory
+        # turn counter cannot be trusted there -- see _DurableTurnReflector.
+        reflector=_DurableTurnReflector() if settings.is_cloud else PeriodicReflector(),
         user_id=user_id,
     )
     try:
         await rag_system.start_session(session_id=restore_result.session_id)
     except Exception as exc:
         print(f"LOG: Channel rag start_session failed for {user_id}: {exc}")
-    # Register for graceful-shutdown journal flush / index checkpoint.
+    # Register for graceful-shutdown journal flush / index checkpoint. In cloud
+    # the state lives for ONE request, so _channel_dispatch_handler unregisters
+    # it when the request ends (the WS path pairs this in its own finally).
     _register_shutdown_state(state)
     return state
 
 
 async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
+    """Run one channel event. See ``_channel_dispatch_impl``.
+
+    P6-B3 (ledger 6.6): in cloud the SharedState is built per request, so this
+    wrapper owns its cleanup -- every state registered for shutdown flush is
+    unregistered and the per-user turn lock (taken before the build, so the
+    history is read after any holder finished) is released, on every exit path
+    including cancellation.
+    """
+    from contextlib import AsyncExitStack
+
+    owned: list[SharedState] = []
+    try:
+        async with AsyncExitStack() as stack:
+            return await _channel_dispatch_impl(event, stack, owned)
+    finally:
+        for st in owned:
+            _unregister_shutdown_state(st)
+
+
+async def _channel_dispatch_impl(
+    event: TurtleEvent, stack: Any, owned: list[SharedState]
+) -> TurtleResponse:
     """Channel-agnostic dispatch — every adapter funnels through the ONE
     canonical turn pipeline (_execute_turn) with a full per-(user, channel)
     SharedState.
@@ -3476,11 +3554,37 @@ async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
                 )
 
         key = (event.user_id, event.channel)
-        cached = _CHANNEL_STATES.get(key)
-        state = cached[0] if cached is not None else None
-        if state is None:
+        pre_lock = None
+        if settings.is_cloud:
+            # P6-B3 (ledger 6.6): no per-instance cache. Two serverless
+            # instances each hold their own copy of any module-level cache and
+            # of the asyncio.Lock above, which excludes only coroutines on one
+            # event loop, so a cached state is stale the moment another
+            # instance serves the user. Serialisation is the Redis per-user
+            # turn lock (6.3). Take it BEFORE building so the session history
+            # is read after any holder finished; the build then restores it
+            # fresh from the session backend.
+            pre_lock = await stack.enter_async_context(
+                turn_lock(event.user_id, f"channel:{event.channel}")
+            )
+            if pre_lock.busy:
+                return TurtleResponse(
+                    content=TURN_BUSY_MESSAGE,
+                    channel=event.channel,
+                    user_id=event.user_id,
+                    message_id=event.message_id,
+                    thread_id=event.thread_id,
+                )
             state = await _build_channel_state(event.user_id, event.channel)
-        _CHANNEL_STATES[key] = (state, now)
+            owned.append(state)
+        else:
+            # Local is one process: the cache is a real latency win and has no
+            # cross-instance problem, so it stays exactly as it was.
+            cached = _CHANNEL_STATES.get(key)
+            state = cached[0] if cached is not None else None
+            if state is None:
+                state = await _build_channel_state(event.user_id, event.channel)
+            _CHANNEL_STATES[key] = (state, now)
 
         # Bind the platform-side identity for this turn so the link_account tool
         # can issue a claim code for the right channel identity.
@@ -3531,7 +3635,11 @@ async def _channel_dispatch_handler(event: TurtleEvent) -> TurtleResponse:
         # Ledger 6.3: one user's web and channel turns never interleave. The
         # lock is taken BEFORE the history is read so a turn that waited for a
         # web turn builds on that turn's result, not a stale copy.
-        async with turn_lock(event.user_id, f"channel:{event.channel}") as _tlock:
+        async with (
+            _AlreadyHeld(pre_lock)
+            if pre_lock is not None
+            else turn_lock(event.user_id, f"channel:{event.channel}")
+        ) as _tlock:
             if _tlock.busy:
                 return TurtleResponse(
                     content=TURN_BUSY_MESSAGE,
@@ -4172,8 +4280,22 @@ async def link_account_redeem(request: Request):
     # user waits behind us — and on the other side of the lock, it re-resolves
     # user_id and picks up the NEW mapping. If we locked on the old user_id
     # instead, a queued turn resolving after our re-point could enter concurrently.
+    #
+    # P6-B3: that lock is per-process, so it cannot see a turn for the same
+    # user running on ANOTHER serverless instance. The source user's Redis turn
+    # lock (6.3) -- the one every channel/web turn holds while it runs -- is
+    # taken as well. Same acquisition order as the dispatch handler (channel
+    # lock, then turn lock), so the two cannot deadlock. If a turn is still
+    # running after the bounded wait the link is refused (503, reservation
+    # released) rather than merging under it; the user simply retries.
     source_lock = _channel_state_lock((claim.channel, claim.channel_user_id))
-    async with source_lock:
+    async with source_lock, turn_lock(claim.source_user_id, "link") as _src_turn:
+        if _src_turn.busy:
+            await asyncio.to_thread(release_reservation, store, code, user_id)
+            return JSONResponse(
+                {"error": "Your channel account is busy right now — please try again in a moment"},
+                status_code=503,
+            )
         # Drain detached writers (per-turn extraction, reflector Stage-B +
         # rolling summary, embed jobs) that started under the source user_id.
         # They outlive _channel_dispatch_handler and would otherwise append
